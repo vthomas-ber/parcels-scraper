@@ -242,14 +242,55 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
     4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
+    5b. TAXONOMY FIRST-PRINCIPLES (INTENDED USE RULE): Before mapping to the taxonomy, determine the product's primary intended use from its name, category keywords, and ingredients:
+        - If the product is a LIQUID, SYRUP, CONCENTRATE, or MIXER of any kind → it MUST be classified under Drinks (L1).
+        - If the product is a SYRUP specifically (e.g. flavoured syrups for coffee/cocktails like Monin, Torani) → Drinks > Soft Drinks > Adult > Mixers.
+        - For POWDERS and other ambiguous formats, do NOT default to any L1. Instead, determine intended use from the product name and context:
+            * "Protein Powder / Shake Powder / Weight Gainer" → Drinks > Soft Drinks > ...
+            * "Cocoa Powder / Baking Powder / Flour" → Food > Pantry > ...
+            * "Protein Supplement / Creatine / Pre-workout" → Food > Health > ...
+            * "Powdered Drink Mix / Instant Drink" → Drinks > ...
+            When in doubt for powders, ask: "Is this product's primary purpose to be consumed as a drink, used as a cooking ingredient, or taken as a supplement?" Let that answer determine L1.
+        - Solid food items, snacks, and meals → Food.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
     8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site. Explain your choice in the reliability_reasoning field.
-    9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. For example, if a product is 'Vegan', you MUST also explicitly evaluate and assign 'Vegetarian' and 'Dairy Free' if they apply. Treat this as a mandatory True/False checklist for every single word in these lists to ensure maximum consistency across outputs.
-       - DIETARY TAGS: Vegetarian, Vegan, Organic, Halal, Kosher, Dairy Free, Nut Free, Low Sugar, High protein, Gluten-free, Low Fat.
-       - OCCASION TAGS: Breakfast, Lunchbox, BBQ, Party, Christmas, Ramadan, Meal prep, Quick dinner, Kids snack.
-       - SEASONAL TAGS: Christmas, Easter, Back to School, Valentines Day, Mothers Day, Halloween, Other.
-
+    9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. Treat this as a mandatory True/False checklist for every single tag to ensure maximum consistency across outputs.
+        EU REGULATORY TAG DEFINITIONS — apply tags ONLY when the product meets these thresholds:
+        DIETARY TAGS (EU Regulation 1169/2011 & Regulation 432/2012):
+        - "Vegetarian": ONLY if no meat, fish, or seafood ingredients present. Dairy and eggs are permitted.
+        - "Vegan": ONLY if zero animal-derived ingredients AND no cross-contamination advisory with animal products (or product carries a certified vegan label).
+        - "Organic": ONLY if the product carries an EU Organic logo or equivalent national certification (e.g. DE-ÖKO-001, FR-BIO-01). Do NOT infer from ingredients alone.
+        - "Halal": ONLY if the product carries a recognised Halal certification mark on pack.
+        - "Kosher": ONLY if the product carries a recognised Kosher certification mark on pack.
+        - "Dairy Free": ONLY if no milk or milk-derived ingredients listed AND no "contains milk" allergen declaration.
+        - "Nut Free": ONLY if no tree nuts or peanuts in ingredients AND no "contains nuts/peanuts" allergen declaration.
+        - "Low Sugar": ONLY if ≤5g sugars per 100g (solid) or ≤2.5g sugars per 100ml (liquid) — EU Regulation 1924/2006.
+        - "High protein": ONLY if protein contributes >20% of the product's total energy value — EU Regulation 1924/2006.
+        - "Gluten-free": ONLY if labelled gluten-free on pack OR all ingredients are gluten-free AND gluten content is <20 mg/kg — EU Regulation 828/2014.
+        - "Low Fat": ONLY if ≤3g fat per 100g (solid) or ≤1.5g fat per 100ml (liquid) — EU Regulation 1924/2006.
+    
+        OCCASION TAGS — apply based on product type and primary usage context. Do NOT over-assign:
+        - "Breakfast": Cereals, porridge, breakfast biscuits, morning drinks, pastries.
+        - "Lunchbox": Individually portioned snacks, sandwich accompaniments, small-format items.
+        - "BBQ": Condiments, marinades, grillable meats, charcoal, disposable BBQ accessories.
+        - "Party": Multi-serve sharing formats, party snack packs, celebration cakes, mixers/soft drinks in large format.
+        - "Christmas": Only if the product is explicitly Christmas-themed or a recognised Christmas food/drink tradition (e.g. mince pies, mulled wine spice).
+        - "Ramadan": Only if product is specifically marketed for Ramadan or is a traditional Ramadan food (e.g. dates, harira).
+        - "Meal prep": Bulk staples, dry goods in large quantities, ingredient-focused products.
+        - "Quick dinner": Ready meals, instant noodles, stir-in sauces, products with <15 min prep.
+        - "Kids snack": Products explicitly marketed at children OR inherently child-targeted by format/size/packaging.
+    
+        SEASONAL TAGS — apply ONLY if the SKU is specifically marketed or packaged for that season. Default is empty:
+        - "Christmas": Limited-edition Christmas packaging or an explicitly seasonal SKU.
+        - "Easter": Limited-edition Easter packaging.
+        - "Back to School": Explicitly back-to-school themed products.
+        - "Valentines Day": Explicitly Valentine's Day themed.
+        - "Mothers Day": Explicitly Mother's Day themed.
+        - "Halloween": Limited-edition Halloween packaging.
+        - "Other": A seasonal angle exists but fits none of the above.
+        - If NONE of the above apply, return "" (empty string) for seasonal_tags. Do NOT default to "Other".
+        
     --- START TAXONOMY REFERENCE (CSV FORMAT) ---
     {taxonomy_text}
     --- END TAXONOMY REFERENCE ---
@@ -1131,20 +1172,3 @@ if st.button("🚀 Start Deep Research", type="primary"):
                 width='stretch',
                 hide_index=True
             )
-
-            st.subheader("🔬 Image Diagnostics (per product)")
-            st.caption("Expand any product to see why specific image candidates were accepted or rejected.")
-
-            for diag in all_diags:
-                with st.expander(f"EAN {diag.ean} — {diag.summary_string()}"):
-                    if diag.image_2_failure:
-                        st.warning(f"**Image #2 outcome:** {diag.image_2_failure}")
-                    st.markdown("**Pipeline log:**")
-                    for line in diag.text_log:
-                        st.text(line)
-                    if diag.candidates:
-                        st.markdown("**Candidate images evaluated:**")
-                        candidates_df = pd.DataFrame(diag.to_dict_list())
-                        st.dataframe(candidates_df, width='stretch', hide_index=True)
-                    else:
-                        st.info("No image candidates collected.")
