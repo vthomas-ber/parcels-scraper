@@ -1,544 +1,544 @@
-BUD26 Name,Level 1,Level 2,Level 3,Level 4,Level 5,Level 6
-,Drinks,Hot Drinks,Tea,Tea Bags (Black),Black,
-,Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Green,
-,Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Herbal,
-,Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Fruit,
-,Drinks,Hot Drinks,Tea,Loose Leaf Tea,Black,
-,Drinks,Hot Drinks,Tea,Loose Leaf Tea,Green,
-,Drinks,Hot Drinks,Coffee,Coffee Pods,Standard,
-,Drinks,Hot Drinks,Coffee,Coffee Pods,Flavoured,
-,Drinks,Hot Drinks,Coffee,Instant Coffee,Standard,
-,Drinks,Hot Drinks,Coffee,Instant Coffee,Flavoured,
-,Drinks,Hot Drinks,Coffee,Ground Coffee Bags,Standard,
-,Drinks,Hot Drinks,Coffee,Coffee Beans Bags,Standard,
-,Drinks,Hot Drinks,Hot Chocolate/ Other,Chocolate Powder,Chocolate,
-,Drinks,Hot Drinks,Hot Chocolate/ Other,Chocolate Powder,Flavoured Chocolate,
-,Drinks,Hot Drinks,Hot Chocolate/ Other,Malted Drinks,Malted,
-,Drinks,Soft Drinks,Carbonated,Cola,Standard,
-,Drinks,Soft Drinks,Carbonated,Cola,Diet,
-,Drinks,Soft Drinks,Carbonated,Cola,Zero,
-,Drinks,Soft Drinks,Carbonated,Cola,Flavoured,
-,Drinks,Soft Drinks,Carbonated,Fizzy,Lemon/ lime,
-,Drinks,Soft Drinks,Carbonated,Fizzy,Orange,
-,Drinks,Soft Drinks,Carbonated,Fizzy,Ginger Beer,
-,Drinks,Soft Drinks,Carbonated,Fizzy,Other Flavoured,
-,Drinks,Soft Drinks,Juice/ Cordials,Juice,Orange,
-,Drinks,Soft Drinks,Juice/ Cordials,Juice,Apple,
-,Drinks,Soft Drinks,Juice/ Cordials,Juice,Tropical,
-,Drinks,Soft Drinks,Juice/ Cordials,Juice,Coconut,
-,Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Berry,
-,Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Tropical,
-,Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Other  ,
-,Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Orange,
-,Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Berries,
-,Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Tropical,
-,Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Other,
-,Drinks,Soft Drinks,Iced,Iced Tea,Peach,
-,Drinks,Soft Drinks,Iced,Iced Tea,Lemon ,
-,Drinks,Soft Drinks,Iced,Iced Tea,Other,
-,Drinks,Soft Drinks,Iced,Iced Coffee,Standard,
-,Drinks,Soft Drinks,Iced,Iced Coffee,Flavoured,
-,Drinks,Soft Drinks,Adult,Mixers ,Tonic,
-,Drinks,Soft Drinks,Adult,Mixers ,Soda Water,
-,Drinks,Soft Drinks,Adult,Mixers ,Other,
-,Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Wine,
-,Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Beer,
-,Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Spirits,
-,Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Whole,
-,Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Semi skimmed,
-,Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Skimmed,
-,Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Oat,
-,Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Soya,
-,Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Almond,
-,Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Other,
-,Drinks,Soft Drinks,Milks/ Alternatives,Shakes,RTD,
-,Drinks,Soft Drinks,Milks/ Alternatives,Shakes,Powders,
-,Drinks,Soft Drinks,Water,Plain,Still,
-,Drinks,Soft Drinks,Water,Plain,Sparkling,
-,Drinks,Soft Drinks,Water,Flavoured,Still,
-,Drinks,Soft Drinks,Water,Flavoured,Sparkling,
-,Food,Breakfast,Cereals,Everyday,Everyday,Cornflakes
-,Food,Breakfast,Cereals,Everyday,Everyday,Chocolate
-,Food,Breakfast,Cereals,Everyday,Everyday,Wheat
-,Food,Breakfast,Cereals,Everyday,Everyday,Hoops
-,Food,Breakfast,Cereals,Everyday,Everyday,Other flake
-,Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Fruit Granola
-,Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Chocolate Granola
-,Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Nut Granola
-,Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Muesli
-,Food,Breakfast,Cereals,Porridge,Porridge,Oats
-,Food,Breakfast,Cereals,Porridge,Porridge,Sachets
-,Food,Breakfast,On The Go,On The Go,On The Go,Pots
-,Food,Breakfast,On The Go,On The Go,On The Go,Breakfast Biscuits
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Salted
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Paprika
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Cheese
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Salt & Vinegar
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Sour Cream
-,Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Other  
-,Food,Snacks,Chips & Savoury Snacks,Chips,Tortilla Chips,Salted
-,Food,Snacks,Chips & Savoury Snacks,Chips,Tortilla Chips,Flavoured
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Salted
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Paprika
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Cheese
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Salt & Vinegar
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Sour Cream
-,Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Other  
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Sweet
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Salty
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Sweet & Salty
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Flavoured
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Microwave
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Crackers,Plain
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Crackers,Flavoured
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Jerky/ Biltong
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Meat
-,Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Pork Scratchings
-,Food,Snacks,Fruit & Nut,Fruit,Raisins,
-,Food,Snacks,Fruit & Nut,Fruit,Mango,
-,Food,Snacks,Fruit & Nut,Fruit,Pineapple,
-,Food,Snacks,Fruit & Nut,Fruit,Other,
-,Food,Snacks,Fruit & Nut,Nuts,Almonds,
-,Food,Snacks,Fruit & Nut,Nuts,Cashews,
-,Food,Snacks,Fruit & Nut,Nuts,Pistachio,
-,Food,Snacks,Fruit & Nut,Nuts,Walnut,
-,Food,Snacks,Fruit & Nut,Nuts,Peanut,
-,Food,Snacks,Fruit & Nut,Nuts,Mixed Nuts,
-,Food,Snacks,Fruit & Nut,Mixed/ Trail,Mixed Fruit & Nut,
-,Food,Snacks,Fruit & Nut,Mixed/ Trail,Trail Mix,
-,Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Plain
-,Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Chocolate
-,Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Wafers
-,Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Shortbread
-,Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Assorted
-,Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Treat Bars
-,Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Healthy Bars
-,Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Diet Bars
-,Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Fruit Bars
-,Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Nut Bars
-,Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Fuit & Nut mix
-,Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Swiss Roll
-,Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Loaf Cakes
-,Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Other
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Pies
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Tarts
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Cupcakes
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Muffins
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Mini cakes
-,Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Madeleines
-,Food,Snacks,Biscuits & Cakes,Cakes,Flapjacks,
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Milk
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,White
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Dark
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Flavoured
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Boxes/ Gifting,
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Pouches,
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Milk
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,White
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Dark
-,Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Flavoured
-,Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Licquorice
-,Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Fruit
-,Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Sour
-,Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Mochi
-,Food,Snacks,Chocolate & Sweets,Sweets,Hard Boiled,Toffees
-,Food,Snacks,Chocolate & Sweets,Sweets,Hard Boiled,Fruit
-,Food,Snacks,Chocolate & Sweets,Sweets,Gum/ Mints,Chewing Gum
-,Food,Snacks,Chocolate & Sweets,Sweets,Gum/ Mints,Mints
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Strawberry
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Raspberry
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Other Fruit
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Marmalade,
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Peanut Crunchy
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Peanut Smooth
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Almond Crunchy
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Almond Smooth
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Cashew Crunchy
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Cashew Smooth
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Other
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Chocolate Spread,Standard
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Chocolate Spread,Flavoured
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Honey
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Maple Syrup
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Golden Syrup
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Other
-,Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Yeast Extracts,Yeast
-,Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Banana
-,Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Apple
-,Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Pear
-,Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Berry
-,Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Other
-,Food,Pantry,Spreads & Desserts,Desserts,Rice Pudding,
-,Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Ice Cream Sauce
-,Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Wafers
-,Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Cones
-,Food,Pantry,Spreads & Desserts,Desserts,Jelly,RTE
-,Food,Pantry,Spreads & Desserts,Desserts,Jelly,Powder/ Cubes
-,Food,Pantry,Baking,Baking Ingredients,Flour,Plain
-,Food,Pantry,Baking,Baking Ingredients,Flour,Self Raising
-,Food,Pantry,Baking,Baking Ingredients,Flour,Other
-,Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,Brown
-,Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,White
-,Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,Sweetener
-,Food,Pantry,Baking,Baking Ingredients,Baking Aids,Baking Powder
-,Food,Pantry,Baking,Baking Ingredients,Baking Aids,Bicarbonate of Soda
-,Food,Pantry,Baking,Baking Ingredients,Baking Aids,Other
-,Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Raisins
-,Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Citrus Peel
-,Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Cherries
-,Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Other/ Mixed
-,Food,Pantry,Baking,Baking Ingredients,Decoration ,Icing 
-,Food,Pantry,Baking,Baking Ingredients,Decoration ,Sprinkles/ Decs
-,Food,Pantry,Baking,Baking Mixes,Cake Mixes,Sponge Cake
-,Food,Pantry,Baking,Baking Mixes,Cake Mixes,Brownie Mix
-,Food,Pantry,Baking,Baking Mixes,Cake Mixes,Cooke Mix
-,Food,Pantry,Baking,Baking Mixes,Cake Mixes,Other
-,Food,Pantry,Baking,Baking Mixes,Dessert Mixes,Cheesecake
-,Food,Pantry,Baking,Baking Mixes,Dessert Mixes,Other
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Chicken
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Beef
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Vegetable
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Other
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Gravy,Powder 
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Gravy,Liquid
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,BBQ
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Peri Peri
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Chinese
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Paprika
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Other
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Cream,Bechamel
-,Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Cream,Cream
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Herbs,Single Blend
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Herbs,Mixed
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Salt
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Pepper
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Chilli
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Mixed
-,Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Other
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Bolognese
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Arrabiata
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Pesto
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Vegetable
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Creamy
-,Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Other
-,Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Korma
-,Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Tikka Masala
-,Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Jalfrezi
-,Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Other
-,Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Sweet & Sour
-,Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Black Bean
-,Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Chinese Curry
-,Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Other
-,Food,Pantry,Cooking Sauces,Ready to Pour,Thai,Red
-,Food,Pantry,Cooking Sauces,Ready to Pour,Thai,Green
-,Food,Pantry,Cooking Sauces,Ready to Pour,Mexican,
-,Food,Pantry,Cooking Sauces,Ready to Pour,Other,
-,Food,Pantry,Cooking Sauces,Pastes,Thai,Red
-,Food,Pantry,Cooking Sauces,Pastes,Thai,Green
-,Food,Pantry,Cooking Sauces,Pastes,Indian,Korma
-,Food,Pantry,Cooking Sauces,Pastes,Indian,Tikka Masala
-,Food,Pantry,Cooking Sauces,Pastes,Indian,Jalfrezi
-,Food,Pantry,Cooking Sauces,Pastes,Indian,Other
-,Food,Pantry,Cooking Sauces,Pastes,Other Cuisines,
-,Food,Pantry,Meal Kits,Meal Kits,Mexican,
-,Food,Pantry,Meal Kits,Meal Kits,Chinese,
-,Food,Pantry,Meal Kits,Meal Kits,Japanese,
-,Food,Pantry,Meal Kits,Meal Kits,Thai,
-,Food,Pantry,Meal Kits,Meal Kits,Indian,
-,Food,Pantry,Meal Kits,Meal Kits,Other Cuisines,
-,Food,Pantry,Table Sauces & Condiments,Ketchup,Standard,
-,Food,Pantry,Table Sauces & Condiments,Ketchup,Flavoured,
-,Food,Pantry,Table Sauces & Condiments,Mayonnaise,Standard,
-,Food,Pantry,Table Sauces & Condiments,Mayonnaise,Flavoured,
-,Food,Pantry,Table Sauces & Condiments,Salad Cream,Standard,
-,Food,Pantry,Table Sauces & Condiments,Salad Cream,Flavoured,
-,Food,Pantry,Table Sauces & Condiments,Brown Sauces,Worcestershire,
-,Food,Pantry,Table Sauces & Condiments,Brown Sauces,Brown,
-,Food,Pantry,Table Sauces & Condiments,Chilli,Chilli,
-,Food,Pantry,Table Sauces & Condiments,Chilli,Sweet Chilli,
-,Food,Pantry,Table Sauces & Condiments,Mustard,English,
-,Food,Pantry,Table Sauces & Condiments,Mustard,French,
-,Food,Pantry,Table Sauces & Condiments,Mustard,American,
-,Food,Pantry,Table Sauces & Condiments,Mustard,Wholegrain,
-,Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Hummus,
-,Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Tapenade,
-,Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Guacamole,
-,Food,Pantry,Table Sauces & Condiments,Soy Sauce,,
-,Food,Pantry,Table Sauces & Condiments,Salsa,,
-,Food,Pantry,Table Sauces & Condiments,BBQ,,
-,Food,Pantry,Table Sauces & Condiments,Apple,,
-,Food,Pantry,Table Sauces & Condiments,Cranberry,,
-,Food,Pantry,Table Sauces & Condiments,Chutney,Mango,
-,Food,Pantry,Table Sauces & Condiments,Chutney,Other,
-,Food,Pantry,Table Sauces & Condiments,Other,,
-,Food,Pantry,Pickles & Olives,Olives,Green,
-,Food,Pantry,Pickles & Olives,Olives,Black,
-,Food,Pantry,Pickles & Olives,Olives,Flavoured,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Gherkins,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Cornichons,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Cabbage,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Peppers,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Sun Dried Tomatoes,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Onions,
-,Food,Pantry,Pickles & Olives,Pickles/ Veg,Other,
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Oil,Olive
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Oil,Other
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Malt
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Apple Cider
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Red Wine
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Balsamic
-,Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Other
-,Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Passata
-,Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Chopped
-,Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Plum
-,Food,Pantry,Canned & Packet,Vegetables,Sweetcorn,
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Carrots
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Mushrooms
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Peas
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Potatoes
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Green Beans
-,Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Other
-,Food,Pantry,Canned & Packet,Vegetables,Baked Beans,Standard
-,Food,Pantry,Canned & Packet,Vegetables,Baked Beans,Flavoured
-,Food,Pantry,Canned & Packet,Vegetables,Baked Beans,No Added Sugar
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Kidney Beans
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Back Beans
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Chickpeas
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Lentils
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Mixed
-,Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Other
-,Food,Pantry,Canned & Packet,Fruit,Cocktail/ Mixed,Syrup
-,Food,Pantry,Canned & Packet,Fruit,Cocktail/ Mixed,Juice
-,Food,Pantry,Canned & Packet,Fruit,Pineapple,Syrup
-,Food,Pantry,Canned & Packet,Fruit,Pineapple,Juice
-,Food,Pantry,Canned & Packet,Fruit,Peach/ Apricot,Syrup
-,Food,Pantry,Canned & Packet,Fruit,Peach/ Apricot,Juice
-,Food,Pantry,Canned & Packet,Fruit,Pear,Syrup
-,Food,Pantry,Canned & Packet,Fruit,Pear,Juice
-,Food,Pantry,Canned & Packet,Fruit,Other,Syrup
-,Food,Pantry,Canned & Packet,Fruit,Other,Juice
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Ham,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Hot Dogs,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Corned Beef,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Pate,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Charcuterie,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Other Meat,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Oil
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Water
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Brine
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Salmon,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Other Fish,
-,Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tofu,
-,Food,Pantry,Canned & Packet,Pasta,Spaghetti Hoops,
-,Food,Pantry,Canned & Packet,Pasta,Character Shaped,
-,Food,Pantry,Canned & Packet,Pasta,Ravioli,
-,Food,Pantry,Canned & Packet,Pasta,Macaroni Cheese,
-,Food,Pantry,Canned & Packet,Pasta,Other,
-,Food,Pantry,Canned & Packet,Soup,Canned Soup,Tomato
-,Food,Pantry,Canned & Packet,Soup,Canned Soup,Chicken
-,Food,Pantry,Canned & Packet,Soup,Canned Soup,Vegetable
-,Food,Pantry,Canned & Packet,Soup,Canned Soup,Other
-,Food,Pantry,Canned & Packet,Soup,Soup Mix,Tomato
-,Food,Pantry,Canned & Packet,Soup,Soup Mix,Chicken
-,Food,Pantry,Canned & Packet,Soup,Soup Mix,Vegetable
-,Food,Pantry,Canned & Packet,Soup,Soup Mix,Other
-,Food,Pantry,Canned & Packet,Soup,Cup Soup,Tomato
-,Food,Pantry,Canned & Packet,Soup,Cup Soup,Chicken
-,Food,Pantry,Canned & Packet,Soup,Cup Soup,Vegetable
-,Food,Pantry,Canned & Packet,Soup,Cup Soup,Other
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Basmati
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Wholegrain
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Jasmine
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Wild/ Brown
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Other
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Pudding
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,White
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,Wholegrain
-,Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,Mixed/ Flavoured
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Pasta Shapes,Wholewheat
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Pasta Shapes,Wheat
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Spaghetti,Wholewheat
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Spaghetti,Wheat
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Lasagne,Wholewheat
-,Food,Pantry,"Rice, Pasta & Grains",Pasta,Lasagne,Wheat
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Udon
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Egg
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Rice
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Egg
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Rice
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Wholewheat
-,Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Other
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Cous cous,Wheat
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Cous cous,Wholewheat
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Quinoa,
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Lentils,Green/ Puy
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Lentils,Red
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Other Grains,
-,Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Beans,
-,Food,Pantry,Instant Meals,Instant Noodles,Packets,Chicken
-,Food,Pantry,Instant Meals,Instant Noodles,Packets,Vegetable
-,Food,Pantry,Instant Meals,Instant Noodles,Packets,Other
-,Food,Pantry,Instant Meals,Instant Noodles,Pots,Chicken
-,Food,Pantry,Instant Meals,Instant Noodles,Pots,Vegetable
-,Food,Pantry,Instant Meals,Instant Noodles,Pots,Other
-,Food,Pantry,Instant Meals, Instant Grain/ Lentils,Lentil Based Meals,
-,Food,Pantry,Instant Meals, Instant Grain/ Lentils,Grain Based Meals,
-,Food,Pantry,Instant Meals, Instant Grain/ Lentils,Bean Based Meals,
-,Food,Pantry,Instant Meals,Instant Pasta,Packet/ Dehydrated,
-,Food,Pantry,Instant Meals,Instant Pasta,Microwave/ Pots,
-,Food,Pantry,Bakery & Bread,Bread,Toast Bread,Wholemeal
-,Food,Pantry,Bakery & Bread,Bread,Toast Bread,White
-,Food,Pantry,Bakery & Bread,Bread,Wraps,Wholemeal
-,Food,Pantry,Bakery & Bread,Bread,Wraps,White
-,Food,Pantry,Bakery & Bread,Bread,Sweet Bread,Pannetone
-,Food,Pantry,Bakery & Bread,Bread,Sweet Bread,Brioche
-,Food,Pantry,Bakery & Bread,Bread,Rolls,Wholemeal
-,Food,Pantry,Bakery & Bread,Bread,Rolls,White
-,Food,Pantry,Bakery & Bread,Bread,Pizza Bases,
-,Food,Pantry,Bakery & Bread,Sweet Pastry,Pastries,
-,Food,Pantry,Bakery & Bread,Sweet Pastry,Waffles,
-,Food,Pantry,Bakery & Bread,Sweet Pastry,Other,
-,Food,Health  ,Vitamins,Kids,,
-,Food,Health  ,Vitamins,Female Specific,,
-,Food,Health  ,Vitamins,Sleep,,
-,Food,Health  ,Vitamins,Other,,
-,Food,Health  ,Protein,Powder,,
-,Food,Health  ,Protein,Shakes,,
-,Food,Health  ,Protein,Bars,,
-,Food,Health  ,Hemp,,,
-,Food,Health  ,Sports/ Energy,Drinks,,
-,Food,Health  ,Sports/ Energy,Gels/ Capsules,,
-,Food,Health  ,Sports/ Energy,Other,,
-,Pet Food,Pet Food,Cat Food,Dry Food,Kitten,
-,Pet Food,Pet Food,Cat Food,Dry Food,Adult,
-,Pet Food,Pet Food,Cat Food,Dry Food,Senior,
-,Pet Food,Pet Food,Cat Food,Dry Food,Dietary,
-,Pet Food,Pet Food,Cat Food,Wet Food,Kitten,
-,Pet Food,Pet Food,Cat Food,Wet Food,Adult,
-,Pet Food,Pet Food,Cat Food,Wet Food,Senior,
-,Pet Food,Pet Food,Cat Food,Wet Food,Dietary,
-,Pet Food,Pet Food,Cat Food,Treats,Dental,
-,Pet Food,Pet Food,Cat Food,Treats,Training,
-,Pet Food,Pet Food,Dog Food,Dry Food,Puppy,
-,Pet Food,Pet Food,Dog Food,Dry Food,Adult,
-,Pet Food,Pet Food,Dog Food,Dry Food,Senior,
-,Pet Food,Pet Food,Dog Food,Dry Food,Dietary,
-,Pet Food,Pet Food,Dog Food,Wet Food,Puppy,
-,Pet Food,Pet Food,Dog Food,Wet Food,Adult,
-,Pet Food,Pet Food,Dog Food,Wet Food,Senior,
-,Pet Food,Pet Food,Dog Food,Wet Food,Dietary,
-,Pet Food,Pet Food,Dog Food,Treats,Dental,
-,Pet Food,Pet Food,Dog Food,Treats,Training,
-,Food,Baby & Toddler,Milk,,,
-,Food,Baby & Toddler,Drinks,,,
-,Food,Baby & Toddler,Food,<1year food,Meals,6m+
-,Food,Baby & Toddler,Food,<1year food,Meals,10m+
-,Food,Baby & Toddler,Food,>1 year food,Meals,12m+
-,Food,Baby & Toddler,Food,>1 year food,Snacks,12m+
-,Non Food,Household Essentials,Cleaning Supplies,Kitchen,All Purpose Spray,
-,Non Food,Household Essentials,Cleaning Supplies,Kitchen,Hob/ Oven Cleaer,
-,Non Food,Household Essentials,Cleaning Supplies,Kitchen,Dishwasher,
-,Non Food,Household Essentials,Cleaning Supplies,Kitchen,Floor Cleaner,
-,Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Bathroom Cleaners,
-,Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Toilet ,
-,Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Limescale Remover,
-,Non Food,Household Essentials,Cleaning Supplies,Tools,Washing Up Brushes,
-,Non Food,Household Essentials,Cleaning Supplies,Tools,Sponges/ Scourers,
-,Non Food,Household Essentials,Cleaning Supplies,Tools,Dustpan & Brush,
-,Non Food,Household Essentials,Cleaning Supplies,Tools,Cloths,
-,Non Food,Household Essentials,Laundry  ,Detergent,Capsules/ Pods,Bio
-,Non Food,Household Essentials,Laundry  ,Detergent,Capsules/ Pods,Non Bio
-,Non Food,Household Essentials,Laundry  ,Detergent,Powder,Bio
-,Non Food,Household Essentials,Laundry  ,Detergent,Powder,Non Bio
-,Non Food,Household Essentials,Laundry  ,Detergent,Gel,Bio
-,Non Food,Household Essentials,Laundry  ,Detergent,Gel,Non Bio
-,Non Food,Household Essentials,Laundry  ,Additives,Additives,Fabric Conditioner
-,Non Food,Household Essentials,Laundry  ,Additives,Additives,Scent Boosters
-,Non Food,Household Essentials,Laundry  ,Additives,Additives,Stain Remover
-,Non Food,Household Essentials,Laundry  ,Additives,Additives,Tumble Dryer Sheets
-,Non Food,Household Essentials,Air Care,Candles,,
-,Non Food,Household Essentials,Air Care,Diffusers/ Incense,,
-,Non Food,Household Essentials,Air Care,Plug in/ Refills,,
-,Non Food,Household Essentials,Air Care,Gel/ Blocks,Car,
-,Non Food,Household Essentials,Air Care,Gel/ Blocks,House,
-,Non Food,Household Essentials,Air Care,Aerosols,Bathroom,
-,Non Food,Household Essentials,Air Care,Aerosols,Odour Control,
-,Non Food,Household Essentials,Air Care,Aerosols,Other,
-,Non Food,Household Essentials,Paper,Kitchen Roll,Kitchen Roll,
-,Non Food,Household Essentials,Paper,Toilet Roll,Toilet Roll,
-,Non Food,Household Essentials,Paper,Tissues,Tissue Boxes,
-,Non Food,Household Essentials,Paper,Tissues,Pocket Tissues,
-,Non Food,Household Essentials,Paper,Wipes,Hand Wipes,
-,Non Food,Household Essentials,Storage & Disposables,Trash Bags,Trash Bags,
-,Non Food,Household Essentials,Storage & Disposables,Food Storage,Food Storage Bags,
-,Non Food,Household Essentials,Storage & Disposables,Food Storage,Food Storage Containers,
-,Non Food,Baby Essentials,Diapers,"Size 0, 1 & 2",,
-,Non Food,Baby Essentials,Diapers,Size 3-5,,
-,Non Food,Baby Essentials,Diapers,Size 6+,,
-,Non Food,Baby Essentials,Wipes,Fragranced,,
-,Non Food,Baby Essentials,Wipes,Non Fragranced,,
-,Non Food,Personal Hygiene,Body Wash,Shower Gel,,
-,Non Food,Personal Hygiene,Body Wash,Bath Foam ,,
-,Non Food,Personal Hygiene,Female Hygiene,Sanitary napkins and liners,,
-,Non Food,Personal Hygiene,Female Hygiene,Tampons,,
-,Non Food,Personal Hygiene,Hand Wash,Liquid Hand Wash,,
-,Non Food,Personal Hygiene,Hand Wash,Soap,,
-,Non Food,Personal Hygiene,Deodorant,Roll On,Male,
-,Non Food,Personal Hygiene,Deodorant,Roll On,Female,
-,Non Food,Personal Hygiene,Deodorant,Roll On,Unisex,
-,Non Food,Personal Hygiene,Deodorant,Spray,Male,
-,Non Food,Personal Hygiene,Deodorant,Spray,Female,
-,Non Food,Personal Hygiene,Deodorant,Spray,Unisex,
-,Non Food,Personal Hygiene,Deodorant,Stick,Male,
-,Non Food,Personal Hygiene,Deodorant,Stick,Female,
-,Non Food,Personal Hygiene,Deodorant,Stick,Unisex,
-,Non Food,Personal Hygiene,Oral care,Toothpaste,Kids,
-,Non Food,Personal Hygiene,Oral care,Toothpaste,Adult,
-,Non Food,Personal Hygiene,Oral care,Toothbrushes,Kids,
-,Non Food,Personal Hygiene,Oral care,Toothbrushes,Adult,
-,Non Food,Personal Hygiene,Oral care,Mouthwash,,
-,Non Food,Personal Hygiene,Oral care,Floss,,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Normal,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Dry/ Damaged,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Colour Care,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Curly,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Kids,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Mens,
-,Non Food,Personal Hygiene,Hair care,Shampoo,Dandruff,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Normal,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Dry/ Damaged,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Colour Care,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Curly,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Kids,
-,Non Food,Personal Hygiene,Hair care,Conditioner,Mens,
-,Non Food,Personal Hygiene,Hair care,Treatments & Oils,,
-,Non Food,Personal Hygiene,First aid,Band Aids,,
-,Non Food,Skin Care,Facial cleansers & toners,Cleansers,,
-,Non Food,Skin Care,Facial cleansers & toners,Toners,,
-,Non Food,Skin Care,Facial cleansers & toners,Wipes,,
-,Non Food,Skin Care,Moisturizers & creams,Body Lotion,,
-,Non Food,Skin Care,Moisturizers & creams,Hand Lotion,,
-,Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,SPF30,
-,Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,SPF50,
-,Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,Kids/ Sensitive,
-,Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,Other,
-,Non Food,Skin Care,Specialised,Acne/ Blemish Care,,
-,Non Food,Skin Care,Specialised,Anti- Aging,,
-,Non Food,Beauty,Beauty tools,Brushes,,
-,Non Food,Beauty,Beauty tools,Sponges,,
-,Non Food,Beauty,Beauty tools,Mirrors,,
-,Non Food,Beauty,Eyes,Eyebrow,,
-,Non Food,Beauty,Eyes,Eyeliner,,
-,Non Food,Beauty,Eyes,Eyelashes,,
-,Non Food,Beauty,Eyes,Other,,
-,Non Food,Beauty,Lips,Lip Balm,,
-,Non Food,Beauty,Lips,Lipstick,,
-,Non Food,Beauty,Lips,Lip Gloss,,
-,Non Food,Beauty,Face,Foundation,,
-,Non Food,Beauty,Face,Concealer,,
-,Non Food,Beauty,Face,Primer,,
-,Non Food,Beauty,Face,Other,,
-,Non Food,Beauty,Nails,Nail Varnish,,
-,Non Food,Beauty,Nails,Nail Varnish Remover,,
-,Non Food,Fragrance,Mens,,,
-,Non Food,Fragrance,Womens,,,
+Level 1,Level 2,Level 3,Level 4,Level 5,Level 6
+Drinks,Hot Drinks,Tea,Tea Bags (Black),Black,
+Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Green,
+Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Herbal,
+Drinks,Hot Drinks,Tea,Tea Bags (Green/ herbal/ Fruit),Fruit,
+Drinks,Hot Drinks,Tea,Loose Leaf Tea,Black,
+Drinks,Hot Drinks,Tea,Loose Leaf Tea,Green,
+Drinks,Hot Drinks,Coffee,Coffee Pods,Standard,
+Drinks,Hot Drinks,Coffee,Coffee Pods,Flavoured,
+Drinks,Hot Drinks,Coffee,Instant Coffee,Standard,
+Drinks,Hot Drinks,Coffee,Instant Coffee,Flavoured,
+Drinks,Hot Drinks,Coffee,Ground Coffee Bags,Standard,
+Drinks,Hot Drinks,Coffee,Coffee Beans Bags,Standard,
+Drinks,Hot Drinks,Hot Chocolate/ Other,Chocolate Powder,Chocolate,
+Drinks,Hot Drinks,Hot Chocolate/ Other,Chocolate Powder,Flavoured Chocolate,
+Drinks,Hot Drinks,Hot Chocolate/ Other,Malted Drinks,Malted,
+Drinks,Soft Drinks,Carbonated,Cola,Standard,
+Drinks,Soft Drinks,Carbonated,Cola,Diet,
+Drinks,Soft Drinks,Carbonated,Cola,Zero,
+Drinks,Soft Drinks,Carbonated,Cola,Flavoured,
+Drinks,Soft Drinks,Carbonated,Fizzy,Lemon/ lime,
+Drinks,Soft Drinks,Carbonated,Fizzy,Orange,
+Drinks,Soft Drinks,Carbonated,Fizzy,Ginger Beer,
+Drinks,Soft Drinks,Carbonated,Fizzy,Other Flavoured,
+Drinks,Soft Drinks,Juice/ Cordials,Juice,Orange,
+Drinks,Soft Drinks,Juice/ Cordials,Juice,Apple,
+Drinks,Soft Drinks,Juice/ Cordials,Juice,Tropical,
+Drinks,Soft Drinks,Juice/ Cordials,Juice,Coconut,
+Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Berry,
+Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Tropical,
+Drinks,Soft Drinks,Juice/ Cordials,Smoothies,Other  ,
+Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Orange,
+Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Berries,
+Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Tropical,
+Drinks,Soft Drinks,Juice/ Cordials,Squash/ Cordials,Other,
+Drinks,Soft Drinks,Iced,Iced Tea,Peach,
+Drinks,Soft Drinks,Iced,Iced Tea,Lemon ,
+Drinks,Soft Drinks,Iced,Iced Tea,Other,
+Drinks,Soft Drinks,Iced,Iced Coffee,Standard,
+Drinks,Soft Drinks,Iced,Iced Coffee,Flavoured,
+Drinks,Soft Drinks,Adult,Mixers ,Tonic,
+Drinks,Soft Drinks,Adult,Mixers ,Soda Water,
+Drinks,Soft Drinks,Adult,Mixers ,Other,
+Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Wine,
+Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Beer,
+Drinks,Soft Drinks,Adult,Alcohol Free,Alcohol Free Spirits,
+Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Whole,
+Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Semi skimmed,
+Drinks,Soft Drinks,Milks/ Alternatives,Ambient Dairy Milk,Skimmed,
+Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Oat,
+Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Soya,
+Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Almond,
+Drinks,Soft Drinks,Milks/ Alternatives,Plant Based Milks/ Drinks,Other,
+Drinks,Soft Drinks,Milks/ Alternatives,Shakes,RTD,
+Drinks,Soft Drinks,Milks/ Alternatives,Shakes,Powders,
+Drinks,Soft Drinks,Water,Plain,Still,
+Drinks,Soft Drinks,Water,Plain,Sparkling,
+Drinks,Soft Drinks,Water,Flavoured,Still,
+Drinks,Soft Drinks,Water,Flavoured,Sparkling,
+Food,Breakfast,Cereals,Everyday,Everyday,Cornflakes
+Food,Breakfast,Cereals,Everyday,Everyday,Chocolate
+Food,Breakfast,Cereals,Everyday,Everyday,Wheat
+Food,Breakfast,Cereals,Everyday,Everyday,Hoops
+Food,Breakfast,Cereals,Everyday,Everyday,Other flake
+Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Fruit Granola
+Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Chocolate Granola
+Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Nut Granola
+Food,Breakfast,Cereals,Granola/ Muesli,Granola/ Muesli,Muesli
+Food,Breakfast,Cereals,Porridge,Porridge,Oats
+Food,Breakfast,Cereals,Porridge,Porridge,Sachets
+Food,Breakfast,On The Go,On The Go,On The Go,Pots
+Food,Breakfast,On The Go,On The Go,On The Go,Breakfast Biscuits
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Salted
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Paprika
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Cheese
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Salt & Vinegar
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Sour Cream
+Food,Snacks,Chips & Savoury Snacks,Chips,Potato Chips,Other  
+Food,Snacks,Chips & Savoury Snacks,Chips,Tortilla Chips,Salted
+Food,Snacks,Chips & Savoury Snacks,Chips,Tortilla Chips,Flavoured
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Salted
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Paprika
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Cheese
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Salt & Vinegar
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Sour Cream
+Food,Snacks,Chips & Savoury Snacks,Chips,Maize/ Corn snacks,Other  
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Sweet
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Salty
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Sweet & Salty
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Flavoured
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Popcorn,Microwave
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Crackers,Plain
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Crackers,Flavoured
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Jerky/ Biltong
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Meat
+Food,Snacks,Chips & Savoury Snacks,Other Savoury Snacks,Jerky/ Meat Snacks,Pork Scratchings
+Food,Snacks,Fruit & Nut,Fruit,Raisins,
+Food,Snacks,Fruit & Nut,Fruit,Mango,
+Food,Snacks,Fruit & Nut,Fruit,Pineapple,
+Food,Snacks,Fruit & Nut,Fruit,Other,
+Food,Snacks,Fruit & Nut,Nuts,Almonds,
+Food,Snacks,Fruit & Nut,Nuts,Cashews,
+Food,Snacks,Fruit & Nut,Nuts,Pistachio,
+Food,Snacks,Fruit & Nut,Nuts,Walnut,
+Food,Snacks,Fruit & Nut,Nuts,Peanut,
+Food,Snacks,Fruit & Nut,Nuts,Mixed Nuts,
+Food,Snacks,Fruit & Nut,Mixed/ Trail,Mixed Fruit & Nut,
+Food,Snacks,Fruit & Nut,Mixed/ Trail,Trail Mix,
+Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Plain
+Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Chocolate
+Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Wafers
+Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Shortbread
+Food,Snacks,Biscuits & Cakes,Biscuits,Sweet Biscuits,Assorted
+Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Treat Bars
+Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Healthy Bars
+Food,Snacks,Biscuits & Cakes,Biscuits,Cereal Bars,Diet Bars
+Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Fruit Bars
+Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Nut Bars
+Food,Snacks,Biscuits & Cakes,Biscuits,Fruit & Nut Bars,Fuit & Nut mix
+Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Swiss Roll
+Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Loaf Cakes
+Food,Snacks,Biscuits & Cakes,Cakes,Whole Cakes,Other
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Pies
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Tarts
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Cupcakes
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Muffins
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Mini cakes
+Food,Snacks,Biscuits & Cakes,Cakes,Cake Slices/ Small Cakes,Madeleines
+Food,Snacks,Biscuits & Cakes,Cakes,Flapjacks,
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Milk
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,White
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Dark
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Blocks,Flavoured
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Boxes/ Gifting,
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Pouches,
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Milk
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,White
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Dark
+Food,Snacks,Chocolate & Sweets,Chocolate,Chocolate Singles,Flavoured
+Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Licquorice
+Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Fruit
+Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Sour
+Food,Snacks,Chocolate & Sweets,Sweets,Gummy Candies,Mochi
+Food,Snacks,Chocolate & Sweets,Sweets,Hard Boiled,Toffees
+Food,Snacks,Chocolate & Sweets,Sweets,Hard Boiled,Fruit
+Food,Snacks,Chocolate & Sweets,Sweets,Gum/ Mints,Chewing Gum
+Food,Snacks,Chocolate & Sweets,Sweets,Gum/ Mints,Mints
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Strawberry
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Raspberry
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Jam,Other Fruit
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Marmalade,
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Peanut Crunchy
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Peanut Smooth
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Almond Crunchy
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Almond Smooth
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Cashew Crunchy
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Cashew Smooth
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Nut Butter,Other
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Chocolate Spread,Standard
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Chocolate Spread,Flavoured
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Honey
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Maple Syrup
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Golden Syrup
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Honey/ Syrup,Other
+Food,Pantry,Spreads & Desserts,Conserves/ Spreads,Yeast Extracts,Yeast
+Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Banana
+Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Apple
+Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Pear
+Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Berry
+Food,Pantry,Spreads & Desserts,Desserts,Compote/ Fruit Puree,Other
+Food,Pantry,Spreads & Desserts,Desserts,Rice Pudding,
+Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Ice Cream Sauce
+Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Wafers
+Food,Pantry,Spreads & Desserts,Desserts,Ice Cream Accompaniments,Cones
+Food,Pantry,Spreads & Desserts,Desserts,Jelly,RTE
+Food,Pantry,Spreads & Desserts,Desserts,Jelly,Powder/ Cubes
+Food,Pantry,Baking,Baking Ingredients,Flour,Plain
+Food,Pantry,Baking,Baking Ingredients,Flour,Self Raising
+Food,Pantry,Baking,Baking Ingredients,Flour,Other
+Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,Brown
+Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,White
+Food,Pantry,Baking,Baking Ingredients,Sugar/ Sweeteners,Sweetener
+Food,Pantry,Baking,Baking Ingredients,Baking Aids,Baking Powder
+Food,Pantry,Baking,Baking Ingredients,Baking Aids,Bicarbonate of Soda
+Food,Pantry,Baking,Baking Ingredients,Baking Aids,Other
+Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Raisins
+Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Citrus Peel
+Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Cherries
+Food,Pantry,Baking,Baking Ingredients,Dried Fruit,Other/ Mixed
+Food,Pantry,Baking,Baking Ingredients,Decoration ,Icing 
+Food,Pantry,Baking,Baking Ingredients,Decoration ,Sprinkles/ Decs
+Food,Pantry,Baking,Baking Mixes,Cake Mixes,Sponge Cake
+Food,Pantry,Baking,Baking Mixes,Cake Mixes,Brownie Mix
+Food,Pantry,Baking,Baking Mixes,Cake Mixes,Cooke Mix
+Food,Pantry,Baking,Baking Mixes,Cake Mixes,Other
+Food,Pantry,Baking,Baking Mixes,Dessert Mixes,Cheesecake
+Food,Pantry,Baking,Baking Mixes,Dessert Mixes,Other
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Chicken
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Beef
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Vegetable
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Stock Cubes/ Powder,Other
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Gravy,Powder 
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Gravy,Liquid
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,BBQ
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Peri Peri
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Chinese
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Paprika
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Marinades,Other
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Cream,Bechamel
+Food,Pantry,Cooking Ingredients,Stock/ Marinades/ Gravy,Cream,Cream
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Herbs,Single Blend
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Herbs,Mixed
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Salt
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Pepper
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Chilli
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Mixed
+Food,Pantry,Cooking Ingredients,Herbs/ Spices,Spices,Other
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Bolognese
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Arrabiata
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Pesto
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Vegetable
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Creamy
+Food,Pantry,Cooking Sauces,Ready to Pour,Pasta Sauce/ Italian,Other
+Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Korma
+Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Tikka Masala
+Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Jalfrezi
+Food,Pantry,Cooking Sauces,Ready to Pour,Indian,Other
+Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Sweet & Sour
+Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Black Bean
+Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Chinese Curry
+Food,Pantry,Cooking Sauces,Ready to Pour,Chinese,Other
+Food,Pantry,Cooking Sauces,Ready to Pour,Thai,Red
+Food,Pantry,Cooking Sauces,Ready to Pour,Thai,Green
+Food,Pantry,Cooking Sauces,Ready to Pour,Mexican,
+Food,Pantry,Cooking Sauces,Ready to Pour,Other,
+Food,Pantry,Cooking Sauces,Pastes,Thai,Red
+Food,Pantry,Cooking Sauces,Pastes,Thai,Green
+Food,Pantry,Cooking Sauces,Pastes,Indian,Korma
+Food,Pantry,Cooking Sauces,Pastes,Indian,Tikka Masala
+Food,Pantry,Cooking Sauces,Pastes,Indian,Jalfrezi
+Food,Pantry,Cooking Sauces,Pastes,Indian,Other
+Food,Pantry,Cooking Sauces,Pastes,Other Cuisines,
+Food,Pantry,Meal Kits,Meal Kits,Mexican,
+Food,Pantry,Meal Kits,Meal Kits,Chinese,
+Food,Pantry,Meal Kits,Meal Kits,Japanese,
+Food,Pantry,Meal Kits,Meal Kits,Thai,
+Food,Pantry,Meal Kits,Meal Kits,Indian,
+Food,Pantry,Meal Kits,Meal Kits,Other Cuisines,
+Food,Pantry,Table Sauces & Condiments,Ketchup,Standard,
+Food,Pantry,Table Sauces & Condiments,Ketchup,Flavoured,
+Food,Pantry,Table Sauces & Condiments,Mayonnaise,Standard,
+Food,Pantry,Table Sauces & Condiments,Mayonnaise,Flavoured,
+Food,Pantry,Table Sauces & Condiments,Salad Cream,Standard,
+Food,Pantry,Table Sauces & Condiments,Salad Cream,Flavoured,
+Food,Pantry,Table Sauces & Condiments,Brown Sauces,Worcestershire,
+Food,Pantry,Table Sauces & Condiments,Brown Sauces,Brown,
+Food,Pantry,Table Sauces & Condiments,Chilli,Chilli,
+Food,Pantry,Table Sauces & Condiments,Chilli,Sweet Chilli,
+Food,Pantry,Table Sauces & Condiments,Mustard,English,
+Food,Pantry,Table Sauces & Condiments,Mustard,French,
+Food,Pantry,Table Sauces & Condiments,Mustard,American,
+Food,Pantry,Table Sauces & Condiments,Mustard,Wholegrain,
+Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Hummus,
+Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Tapenade,
+Food,Pantry,Table Sauces & Condiments,Hummus/ Tapenade,Guacamole,
+Food,Pantry,Table Sauces & Condiments,Soy Sauce,,
+Food,Pantry,Table Sauces & Condiments,Salsa,,
+Food,Pantry,Table Sauces & Condiments,BBQ,,
+Food,Pantry,Table Sauces & Condiments,Apple,,
+Food,Pantry,Table Sauces & Condiments,Cranberry,,
+Food,Pantry,Table Sauces & Condiments,Chutney,Mango,
+Food,Pantry,Table Sauces & Condiments,Chutney,Other,
+Food,Pantry,Table Sauces & Condiments,Other,,
+Food,Pantry,Pickles & Olives,Olives,Green,
+Food,Pantry,Pickles & Olives,Olives,Black,
+Food,Pantry,Pickles & Olives,Olives,Flavoured,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Gherkins,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Cornichons,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Cabbage,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Peppers,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Sun Dried Tomatoes,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Onions,
+Food,Pantry,Pickles & Olives,Pickles/ Veg,Other,
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Oil,Olive
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Oil,Other
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Malt
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Apple Cider
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Red Wine
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Balsamic
+Food,Pantry,Oils & Vinegars,Oils & Vinegars,Vinegar,Other
+Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Passata
+Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Chopped
+Food,Pantry,Canned & Packet,Vegetables,Tomatoes,Plum
+Food,Pantry,Canned & Packet,Vegetables,Sweetcorn,
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Carrots
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Mushrooms
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Peas
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Potatoes
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Green Beans
+Food,Pantry,Canned & Packet,Vegetables,Other Vegetables,Other
+Food,Pantry,Canned & Packet,Vegetables,Baked Beans,Standard
+Food,Pantry,Canned & Packet,Vegetables,Baked Beans,Flavoured
+Food,Pantry,Canned & Packet,Vegetables,Baked Beans,No Added Sugar
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Kidney Beans
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Back Beans
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Chickpeas
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Lentils
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Mixed
+Food,Pantry,Canned & Packet,Vegetables,Beans/ Pulses,Other
+Food,Pantry,Canned & Packet,Fruit,Cocktail/ Mixed,Syrup
+Food,Pantry,Canned & Packet,Fruit,Cocktail/ Mixed,Juice
+Food,Pantry,Canned & Packet,Fruit,Pineapple,Syrup
+Food,Pantry,Canned & Packet,Fruit,Pineapple,Juice
+Food,Pantry,Canned & Packet,Fruit,Peach/ Apricot,Syrup
+Food,Pantry,Canned & Packet,Fruit,Peach/ Apricot,Juice
+Food,Pantry,Canned & Packet,Fruit,Pear,Syrup
+Food,Pantry,Canned & Packet,Fruit,Pear,Juice
+Food,Pantry,Canned & Packet,Fruit,Other,Syrup
+Food,Pantry,Canned & Packet,Fruit,Other,Juice
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Ham,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Hot Dogs,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Corned Beef,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Pate,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Charcuterie,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Other Meat,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Oil
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Water
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tuna,Brine
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Salmon,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Other Fish,
+Food,Pantry,Canned & Packet,Meat/ Fish/ Alternatives,Tofu,
+Food,Pantry,Canned & Packet,Pasta,Spaghetti Hoops,
+Food,Pantry,Canned & Packet,Pasta,Character Shaped,
+Food,Pantry,Canned & Packet,Pasta,Ravioli,
+Food,Pantry,Canned & Packet,Pasta,Macaroni Cheese,
+Food,Pantry,Canned & Packet,Pasta,Other,
+Food,Pantry,Canned & Packet,Soup,Canned Soup,Tomato
+Food,Pantry,Canned & Packet,Soup,Canned Soup,Chicken
+Food,Pantry,Canned & Packet,Soup,Canned Soup,Vegetable
+Food,Pantry,Canned & Packet,Soup,Canned Soup,Other
+Food,Pantry,Canned & Packet,Soup,Soup Mix,Tomato
+Food,Pantry,Canned & Packet,Soup,Soup Mix,Chicken
+Food,Pantry,Canned & Packet,Soup,Soup Mix,Vegetable
+Food,Pantry,Canned & Packet,Soup,Soup Mix,Other
+Food,Pantry,Canned & Packet,Soup,Cup Soup,Tomato
+Food,Pantry,Canned & Packet,Soup,Cup Soup,Chicken
+Food,Pantry,Canned & Packet,Soup,Cup Soup,Vegetable
+Food,Pantry,Canned & Packet,Soup,Cup Soup,Other
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Basmati
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Wholegrain
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Jasmine
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Wild/ Brown
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Other
+Food,Pantry,"Rice, Pasta & Grains",Rice,Cooking Rice,Pudding
+Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,White
+Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,Wholegrain
+Food,Pantry,"Rice, Pasta & Grains",Rice,Microwave,Mixed/ Flavoured
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Pasta Shapes,Wholewheat
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Pasta Shapes,Wheat
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Spaghetti,Wholewheat
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Spaghetti,Wheat
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Lasagne,Wholewheat
+Food,Pantry,"Rice, Pasta & Grains",Pasta,Lasagne,Wheat
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Udon
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Egg
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Straight to Wok,Rice
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Egg
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Rice
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Wholewheat
+Food,Pantry,"Rice, Pasta & Grains",Noodles,Dried Noodles,Other
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Cous cous,Wheat
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Cous cous,Wholewheat
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Quinoa,
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Lentils,Green/ Puy
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Lentils,Red
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Other Grains,
+Food,Pantry,"Rice, Pasta & Grains",Grains/ Pulses,Beans,
+Food,Pantry,Instant Meals,Instant Noodles,Packets,Chicken
+Food,Pantry,Instant Meals,Instant Noodles,Packets,Vegetable
+Food,Pantry,Instant Meals,Instant Noodles,Packets,Other
+Food,Pantry,Instant Meals,Instant Noodles,Pots,Chicken
+Food,Pantry,Instant Meals,Instant Noodles,Pots,Vegetable
+Food,Pantry,Instant Meals,Instant Noodles,Pots,Other
+Food,Pantry,Instant Meals, Instant Grain/ Lentils,Lentil Based Meals,
+Food,Pantry,Instant Meals, Instant Grain/ Lentils,Grain Based Meals,
+Food,Pantry,Instant Meals, Instant Grain/ Lentils,Bean Based Meals,
+Food,Pantry,Instant Meals,Instant Pasta,Packet/ Dehydrated,
+Food,Pantry,Instant Meals,Instant Pasta,Microwave/ Pots,
+Food,Pantry,Bakery & Bread,Bread,Toast Bread,Wholemeal
+Food,Pantry,Bakery & Bread,Bread,Toast Bread,White
+Food,Pantry,Bakery & Bread,Bread,Wraps,Wholemeal
+Food,Pantry,Bakery & Bread,Bread,Wraps,White
+Food,Pantry,Bakery & Bread,Bread,Sweet Bread,Pannetone
+Food,Pantry,Bakery & Bread,Bread,Sweet Bread,Brioche
+Food,Pantry,Bakery & Bread,Bread,Rolls,Wholemeal
+Food,Pantry,Bakery & Bread,Bread,Rolls,White
+Food,Pantry,Bakery & Bread,Bread,Pizza Bases,
+Food,Pantry,Bakery & Bread,Sweet Pastry,Pastries,
+Food,Pantry,Bakery & Bread,Sweet Pastry,Waffles,
+Food,Pantry,Bakery & Bread,Sweet Pastry,Other,
+Food,Health  ,Vitamins,Kids,,
+Food,Health  ,Vitamins,Female Specific,,
+Food,Health  ,Vitamins,Sleep,,
+Food,Health  ,Vitamins,Other,,
+Food,Health  ,Protein,Powder,,
+Food,Health  ,Protein,Shakes,,
+Food,Health  ,Protein,Bars,,
+Food,Health  ,Hemp,,,
+Food,Health  ,Sports/ Energy,Drinks,,
+Food,Health  ,Sports/ Energy,Gels/ Capsules,,
+Food,Health  ,Sports/ Energy,Other,,
+Pet Food,Pet Food,Cat Food,Dry Food,Kitten,
+Pet Food,Pet Food,Cat Food,Dry Food,Adult,
+Pet Food,Pet Food,Cat Food,Dry Food,Senior,
+Pet Food,Pet Food,Cat Food,Dry Food,Dietary,
+Pet Food,Pet Food,Cat Food,Wet Food,Kitten,
+Pet Food,Pet Food,Cat Food,Wet Food,Adult,
+Pet Food,Pet Food,Cat Food,Wet Food,Senior,
+Pet Food,Pet Food,Cat Food,Wet Food,Dietary,
+Pet Food,Pet Food,Cat Food,Treats,Dental,
+Pet Food,Pet Food,Cat Food,Treats,Training,
+Pet Food,Pet Food,Dog Food,Dry Food,Puppy,
+Pet Food,Pet Food,Dog Food,Dry Food,Adult,
+Pet Food,Pet Food,Dog Food,Dry Food,Senior,
+Pet Food,Pet Food,Dog Food,Dry Food,Dietary,
+Pet Food,Pet Food,Dog Food,Wet Food,Puppy,
+Pet Food,Pet Food,Dog Food,Wet Food,Adult,
+Pet Food,Pet Food,Dog Food,Wet Food,Senior,
+Pet Food,Pet Food,Dog Food,Wet Food,Dietary,
+Pet Food,Pet Food,Dog Food,Treats,Dental,
+Pet Food,Pet Food,Dog Food,Treats,Training,
+Food,Baby & Toddler,Milk,,,
+Food,Baby & Toddler,Drinks,,,
+Food,Baby & Toddler,Food,<1year food,Meals,6m+
+Food,Baby & Toddler,Food,<1year food,Meals,10m+
+Food,Baby & Toddler,Food,>1 year food,Meals,12m+
+Food,Baby & Toddler,Food,>1 year food,Snacks,12m+
+Non Food,Household Essentials,Cleaning Supplies,Kitchen,All Purpose Spray,
+Non Food,Household Essentials,Cleaning Supplies,Kitchen,Hob/ Oven Cleaer,
+Non Food,Household Essentials,Cleaning Supplies,Kitchen,Dishwasher,
+Non Food,Household Essentials,Cleaning Supplies,Kitchen,Floor Cleaner,
+Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Bathroom Cleaners,
+Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Toilet ,
+Non Food,Household Essentials,Cleaning Supplies,Bathroom  ,Limescale Remover,
+Non Food,Household Essentials,Cleaning Supplies,Tools,Washing Up Brushes,
+Non Food,Household Essentials,Cleaning Supplies,Tools,Sponges/ Scourers,
+Non Food,Household Essentials,Cleaning Supplies,Tools,Dustpan & Brush,
+Non Food,Household Essentials,Cleaning Supplies,Tools,Cloths,
+Non Food,Household Essentials,Laundry  ,Detergent,Capsules/ Pods,Bio
+Non Food,Household Essentials,Laundry  ,Detergent,Capsules/ Pods,Non Bio
+Non Food,Household Essentials,Laundry  ,Detergent,Powder,Bio
+Non Food,Household Essentials,Laundry  ,Detergent,Powder,Non Bio
+Non Food,Household Essentials,Laundry  ,Detergent,Gel,Bio
+Non Food,Household Essentials,Laundry  ,Detergent,Gel,Non Bio
+Non Food,Household Essentials,Laundry  ,Additives,Additives,Fabric Conditioner
+Non Food,Household Essentials,Laundry  ,Additives,Additives,Scent Boosters
+Non Food,Household Essentials,Laundry  ,Additives,Additives,Stain Remover
+Non Food,Household Essentials,Laundry  ,Additives,Additives,Tumble Dryer Sheets
+Non Food,Household Essentials,Air Care,Candles,,
+Non Food,Household Essentials,Air Care,Diffusers/ Incense,,
+Non Food,Household Essentials,Air Care,Plug in/ Refills,,
+Non Food,Household Essentials,Air Care,Gel/ Blocks,Car,
+Non Food,Household Essentials,Air Care,Gel/ Blocks,House,
+Non Food,Household Essentials,Air Care,Aerosols,Bathroom,
+Non Food,Household Essentials,Air Care,Aerosols,Odour Control,
+Non Food,Household Essentials,Air Care,Aerosols,Other,
+Non Food,Household Essentials,Paper,Kitchen Roll,Kitchen Roll,
+Non Food,Household Essentials,Paper,Toilet Roll,Toilet Roll,
+Non Food,Household Essentials,Paper,Tissues,Tissue Boxes,
+Non Food,Household Essentials,Paper,Tissues,Pocket Tissues,
+Non Food,Household Essentials,Paper,Wipes,Hand Wipes,
+Non Food,Household Essentials,Storage & Disposables,Trash Bags,Trash Bags,
+Non Food,Household Essentials,Storage & Disposables,Food Storage,Food Storage Bags,
+Non Food,Household Essentials,Storage & Disposables,Food Storage,Food Storage Containers,
+Non Food,Baby Essentials,Diapers,"Size 0, 1 & 2",,
+Non Food,Baby Essentials,Diapers,Size 3-5,,
+Non Food,Baby Essentials,Diapers,Size 6+,,
+Non Food,Baby Essentials,Wipes,Fragranced,,
+Non Food,Baby Essentials,Wipes,Non Fragranced,,
+Non Food,Personal Hygiene,Body Wash,Shower Gel,,
+Non Food,Personal Hygiene,Body Wash,Bath Foam ,,
+Non Food,Personal Hygiene,Female Hygiene,Sanitary napkins and liners,,
+Non Food,Personal Hygiene,Female Hygiene,Tampons,,
+Non Food,Personal Hygiene,Hand Wash,Liquid Hand Wash,,
+Non Food,Personal Hygiene,Hand Wash,Soap,,
+Non Food,Personal Hygiene,Deodorant,Roll On,Male,
+Non Food,Personal Hygiene,Deodorant,Roll On,Female,
+Non Food,Personal Hygiene,Deodorant,Roll On,Unisex,
+Non Food,Personal Hygiene,Deodorant,Spray,Male,
+Non Food,Personal Hygiene,Deodorant,Spray,Female,
+Non Food,Personal Hygiene,Deodorant,Spray,Unisex,
+Non Food,Personal Hygiene,Deodorant,Stick,Male,
+Non Food,Personal Hygiene,Deodorant,Stick,Female,
+Non Food,Personal Hygiene,Deodorant,Stick,Unisex,
+Non Food,Personal Hygiene,Oral care,Toothpaste,Kids,
+Non Food,Personal Hygiene,Oral care,Toothpaste,Adult,
+Non Food,Personal Hygiene,Oral care,Toothbrushes,Kids,
+Non Food,Personal Hygiene,Oral care,Toothbrushes,Adult,
+Non Food,Personal Hygiene,Oral care,Mouthwash,,
+Non Food,Personal Hygiene,Oral care,Floss,,
+Non Food,Personal Hygiene,Hair care,Shampoo,Normal,
+Non Food,Personal Hygiene,Hair care,Shampoo,Dry/ Damaged,
+Non Food,Personal Hygiene,Hair care,Shampoo,Colour Care,
+Non Food,Personal Hygiene,Hair care,Shampoo,Curly,
+Non Food,Personal Hygiene,Hair care,Shampoo,Kids,
+Non Food,Personal Hygiene,Hair care,Shampoo,Mens,
+Non Food,Personal Hygiene,Hair care,Shampoo,Dandruff,
+Non Food,Personal Hygiene,Hair care,Conditioner,Normal,
+Non Food,Personal Hygiene,Hair care,Conditioner,Dry/ Damaged,
+Non Food,Personal Hygiene,Hair care,Conditioner,Colour Care,
+Non Food,Personal Hygiene,Hair care,Conditioner,Curly,
+Non Food,Personal Hygiene,Hair care,Conditioner,Kids,
+Non Food,Personal Hygiene,Hair care,Conditioner,Mens,
+Non Food,Personal Hygiene,Hair care,Treatments & Oils,,
+Non Food,Personal Hygiene,First aid,Band Aids,,
+Non Food,Skin Care,Facial cleansers & toners,Cleansers,,
+Non Food,Skin Care,Facial cleansers & toners,Toners,,
+Non Food,Skin Care,Facial cleansers & toners,Wipes,,
+Non Food,Skin Care,Moisturizers & creams,Body Lotion,,
+Non Food,Skin Care,Moisturizers & creams,Hand Lotion,,
+Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,SPF30,
+Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,SPF50,
+Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,Kids/ Sensitive,
+Non Food,Skin Care,Sunscreen & sun care,Sunscreen ,Other,
+Non Food,Skin Care,Specialised,Acne/ Blemish Care,,
+Non Food,Skin Care,Specialised,Anti- Aging,,
+Non Food,Beauty,Beauty tools,Brushes,,
+Non Food,Beauty,Beauty tools,Sponges,,
+Non Food,Beauty,Beauty tools,Mirrors,,
+Non Food,Beauty,Eyes,Eyebrow,,
+Non Food,Beauty,Eyes,Eyeliner,,
+Non Food,Beauty,Eyes,Eyelashes,,
+Non Food,Beauty,Eyes,Other,,
+Non Food,Beauty,Lips,Lip Balm,,
+Non Food,Beauty,Lips,Lipstick,,
+Non Food,Beauty,Lips,Lip Gloss,,
+Non Food,Beauty,Face,Foundation,,
+Non Food,Beauty,Face,Concealer,,
+Non Food,Beauty,Face,Primer,,
+Non Food,Beauty,Face,Other,,
+Non Food,Beauty,Nails,Nail Varnish,,
+Non Food,Beauty,Nails,Nail Varnish Remover,,
+Non Food,Fragrance,Mens,,,
+Non Food,Fragrance,Womens,,,
