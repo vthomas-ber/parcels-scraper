@@ -21,6 +21,63 @@ except ImportError:
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
 # ============================================================================
+# SQLITE CACHE
+# ============================================================================
+import sqlite3
+
+DB_PATH = os.environ.get("CACHE_DB_PATH", "cache.db")
+
+def init_cache():
+    con = sqlite3.connect(DB_PATH)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS ean_cache (
+            ean TEXT NOT NULL,
+            market TEXT NOT NULL,
+            result_json TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (ean, market)
+        )
+    """)
+    con.commit()
+    con.close()
+
+def cache_get(ean: str, market: str):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute(
+            "SELECT result_json FROM ean_cache WHERE ean=? AND market=?",
+            (ean, market)
+        ).fetchone()
+        con.close()
+        return json.loads(row[0]) if row else None
+    except Exception:
+        return None
+
+def cache_set(ean: str, market: str, result_dict: dict):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT OR REPLACE INTO ean_cache (ean, market, result_json) VALUES (?,?,?)",
+            (ean, market, json.dumps(result_dict))
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+def cache_delete(ean: str, market: str):
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "DELETE FROM ean_cache WHERE ean=? AND market=?",
+            (ean, market)
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
+
+# ============================================================================
 # SHARED CONSTANTS (used by both pipelines)
 # ============================================================================
 
@@ -947,9 +1004,24 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code):
 # MERGE: orchestrate Path A (food) + Path B (display images) in parallel
 # ============================================================================
 
-async def process_ean(sem, session, ean_dict, serp_key, gemini_key, ean_token, market, taxonomy_text):
-    ean = ean_dict["ean"]
-    ground_truth = ean_dict["ground_truth"]
+async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text):
+    ean = item["ean"]
+    ground_truth = item.get("ground_truth", "")
+    force_refresh = item.get("force_refresh", False)  # <-- new flag
+
+    # Cache check
+    if not force_refresh:
+        cached = cache_get(ean, market)
+        if cached:
+            empty_diag = ImageDiagnostics(ean)
+            empty_diag.log("✅ Loaded from cache.")
+            return {"row": cached, "image_diag": empty_diag, "food_diag": None}
+
+    # ... rest of the existing function unchanged ...
+    
+    # At the very end, before the final return, add:
+    cache_set(ean, market, result["row"])
+    return result
 
     async with sem:
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
@@ -1096,6 +1168,7 @@ GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
 EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "")
 
 taxonomy_text = load_taxonomy()
+init_cache()  # ensures table exists on every startup
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -1133,18 +1206,28 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
     parsed_inputs = []
     for line in ean_input.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        match = re.search(r'\b\d{8,14}\b', line)
-        if match:
-            ean = match.group(0)
-            ground_truth = line.replace(ean, "").strip()
-            ground_truth = re.sub(r'\s+', ' ', ground_truth)
-            parsed_inputs.append({"ean": ean, "ground_truth": ground_truth})
-        else:
-            st.warning(f"⚠️ No valid 8-14 digit EAN in line: '{line}' - Skipping.")
-
+    line = line.strip()
+    if not line:
+        continue
+    
+    # Check for REFRESH prefix
+    force_refresh = False
+    if line.upper().startswith("REFRESH"):
+        force_refresh = True
+        line = line[7:].strip()  # strip the REFRESH keyword
+    
+    match = re.search(r'\b\d{8,14}\b', line)
+    if match:
+        ean = match.group(0)
+        ground_truth = line.replace(ean, "").strip()
+        ground_truth = re.sub(r'\s+', ' ', ground_truth)
+        parsed_inputs.append({
+            "ean": ean, 
+            "ground_truth": ground_truth,
+            "force_refresh": force_refresh
+        })
+    else:
+        st.warning(f"⚠️ No valid 8-14 digit EAN in line: '{line}' - Skipping.")
     if parsed_inputs:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
