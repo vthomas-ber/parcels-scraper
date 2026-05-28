@@ -1205,28 +1205,28 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
     parsed_inputs = []
     for line in ean_input.split("\n"):
-    line = line.strip()
-    if not line:
-        continue
-    
-    # Check for REFRESH prefix
-    force_refresh = False
-    if line.upper().startswith("REFRESH"):
-        force_refresh = True
-        line = line[7:].strip()  # strip the REFRESH keyword
-    
-    match = re.search(r'\b\d{8,14}\b', line)
-    if match:
-        ean = match.group(0)
-        ground_truth = line.replace(ean, "").strip()
-        ground_truth = re.sub(r'\s+', ' ', ground_truth)
-        parsed_inputs.append({
-            "ean": ean, 
-            "ground_truth": ground_truth,
-            "force_refresh": force_refresh
-        })
-    else:
-        st.warning(f"⚠️ No valid 8-14 digit EAN in line: '{line}' - Skipping.")
+        line = line.strip()
+        if not line:
+            continue
+
+        force_refresh = False
+        if line.upper().startswith("REFRESH"):
+            force_refresh = True
+            line = line[7:].strip()
+
+        match = re.search(r'\b\d{8,14}\b', line)
+        if match:
+            ean = match.group(0)
+            ground_truth = line.replace(ean, "").strip()
+            ground_truth = re.sub(r'\s+', ' ', ground_truth)
+            parsed_inputs.append({
+                "ean": ean,
+                "ground_truth": ground_truth,
+                "force_refresh": force_refresh
+            })
+        else:
+            st.warning(f"⚠️ No valid 8-14 digit EAN in line: '{line}' - Skipping.")
+
     if parsed_inputs:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
