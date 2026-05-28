@@ -1234,71 +1234,73 @@ if st.button("🚀 Start Deep Research", type="primary"):
     if parsed_inputs:
         progress_bar = st.progress(0.0)
         status_text = st.empty()
-
         with st.spinner(f"Analyzing {len(parsed_inputs)} products concurrently..."):
             all_data, all_diags = asyncio.run(
                 run_main(parsed_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code,
                          taxonomy_text, progress_bar, status_text)
             )
 
-            df = pd.DataFrame(all_data)
+            st.session_state["results_df"] = pd.DataFrame(all_data)
 
-            # Ensure Cached column exists for all rows
-            if "Cached" not in df.columns:
-                df["Cached"] = "🔄 Fresh"
+if "results_df" in st.session_state:
+    df = st.session_state["results_df"].copy()
 
-            # Add Re-run checkbox column at the front
-            df.insert(0, "Re-run?", False)
+     # Ensure Cached column exists for all rows
+    if "Cached" not in df.columns:
+        df["Cached"] = "🔄 Fresh"
 
-            st.subheader("📊 Results")
-            edited_df = st.data_editor(
-                df,
-                column_config={
-                    "Re-run?": st.column_config.CheckboxColumn(
-                        "Re-run?",
-                        help="Tick to re-run this EAN and overwrite cached result",
-                        default=False,
-                    ),
-                    "Cached": st.column_config.TextColumn(
-                        "Source",
-                        help="Whether this result came from cache or was freshly scraped",
-                        disabled=True,
-                    ),
-                    "Image 1": st.column_config.ImageColumn(),
-                    "Image 2": st.column_config.ImageColumn(),
-                    "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
-                    "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
-                    "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
-                    "Source 4": st.column_config.LinkColumn(display_text="Link 4"),
-                    "Source 5": st.column_config.LinkColumn(display_text="Link 5"),
-                },
-                width='stretch',
-                hide_index=True
-            )
+        # Add Re-run checkbox column at the front
+    df.insert(0, "Re-run?", False)
 
-            # Re-run selected rows
-            rerun_eans = edited_df[edited_df["Re-run?"] == True]["GTIN / EAN"].tolist()
-            if rerun_eans:
-                if st.button(f"🔄 Re-run {len(rerun_eans)} selected EAN(s)", type="primary"):
-                    rerun_inputs = [
-                        {"ean": ean, "ground_truth": "", "force_refresh": True}
-                        for ean in rerun_eans
-                    ]
-                    rerun_progress = st.progress(0.0)
-                    rerun_status = st.empty()
-                    with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
-                        rerun_data, _ = asyncio.run(
-                            run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN,
-                                     market_code, taxonomy_text, rerun_progress, rerun_status)
-                        )
-                    # Merge rerun results back into the display
-                    rerun_df = pd.DataFrame(rerun_data)
-                    if "Cached" not in rerun_df.columns:
-                        rerun_df["Cached"] = "🔄 Fresh"
+    st.subheader("📊 Results")
+    edited_df = st.data_editor(
+        df,
+        column_config={
+            "Re-run?": st.column_config.CheckboxColumn(
+                "Re-run?",
+                help="Tick to re-run this EAN and overwrite cached result",
+                default=False,
+            ),
+            "Cached": st.column_config.TextColumn(
+                "Source",
+                help="Whether this result came from cache or was freshly scraped",
+                disabled=True,
+            ),
+            "Image 1": st.column_config.ImageColumn(),
+            "Image 2": st.column_config.ImageColumn(),
+            "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
+            "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
+            "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
+            "Source 4": st.column_config.LinkColumn(display_text="Link 4"),
+            "Source 5": st.column_config.LinkColumn(display_text="Link 5"),
+        },
+        width='stretch',
+        hide_index=True
+    )
+    
+    # Re-run selected rows
+    rerun_eans = edited_df[edited_df["Re-run?"] == True]["GTIN / EAN"].tolist()
+    if rerun_eans:
+        if st.button(f"🔄 Re-run {len(rerun_eans)} selected EAN(s)", type="primary"):
+            rerun_inputs = [
+                {"ean": ean, "ground_truth": "", "force_refresh": True}
+                for ean in rerun_eans
+            ]
+            rerun_progress = st.progress(0.0)
+            rerun_status = st.empty()
+            with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
+                rerun_data, _ = asyncio.run(
+                    run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN,
+                             market_code, taxonomy_text, rerun_progress, rerun_status)
+                )
+                # Merge rerun results back into the display
+                rerun_df = pd.DataFrame(rerun_data)
+                if "Cached" not in rerun_df.columns:
+                    rerun_df["Cached"] = "🔄 Fresh"
                     rerun_df.insert(0, "Re-run?", False)
                     for _, fresh_row in rerun_df.iterrows():
                         mask = df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
                         if mask.any():
                             df.loc[mask] = fresh_row.values
-                    st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
-                    st.rerun()
+                            st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
+                            st.rerun()
