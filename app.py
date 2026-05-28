@@ -1013,6 +1013,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
     if not force_refresh:
         cached = cache_get(ean, market)
         if cached:
+            cached["Cached"] = "✅ Cached"
             empty_diag = ImageDiagnostics(ean)
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
@@ -1039,7 +1040,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Image 2": imgs[1],
                 "GTIN / EAN": ean,
                 "User Input": ground_truth,
-                "Status": f"{data['error']}"
+                "Status": f"{data['error']}",
+                "Cached": "🔄 Fresh"
             }
             cache_set(ean, market, row)    # <-- here, inside the if block
             return {
@@ -1074,7 +1076,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Nutritional Info": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
                 "Energy (kJ)": "", "Fat (g)": "", "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "", "Of Which Sugars (g)": "",
                 "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
-                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4]
+                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4],
+                "Cached": "🔄 Fresh"
             }
             cache_set(ean, market, row)
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
@@ -1129,7 +1132,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             "Source 2": srcs[1],
             "Source 3": srcs[2],
             "Source 4": srcs[3],
-            "Source 5": srcs[4]
+            "Source 5": srcs[4],
+            "Cached": "🔄 Fresh"
         }
         cache_set(ean, market, row)
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
@@ -1239,10 +1243,27 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
             df = pd.DataFrame(all_data)
 
+            # Ensure Cached column exists for all rows
+            if "Cached" not in df.columns:
+                df["Cached"] = "🔄 Fresh"
+
+            # Add Re-run checkbox column at the front
+            df.insert(0, "Re-run?", False)
+
             st.subheader("📊 Results")
-            st.data_editor(
+            edited_df = st.data_editor(
                 df,
                 column_config={
+                    "Re-run?": st.column_config.CheckboxColumn(
+                        "Re-run?",
+                        help="Tick to re-run this EAN and overwrite cached result",
+                        default=False,
+                    ),
+                    "Cached": st.column_config.TextColumn(
+                        "Source",
+                        help="Whether this result came from cache or was freshly scraped",
+                        disabled=True,
+                    ),
                     "Image 1": st.column_config.ImageColumn(),
                     "Image 2": st.column_config.ImageColumn(),
                     "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
@@ -1254,3 +1275,30 @@ if st.button("🚀 Start Deep Research", type="primary"):
                 width='stretch',
                 hide_index=True
             )
+
+            # Re-run selected rows
+            rerun_eans = edited_df[edited_df["Re-run?"] == True]["GTIN / EAN"].tolist()
+            if rerun_eans:
+                if st.button(f"🔄 Re-run {len(rerun_eans)} selected EAN(s)", type="primary"):
+                    rerun_inputs = [
+                        {"ean": ean, "ground_truth": "", "force_refresh": True}
+                        for ean in rerun_eans
+                    ]
+                    rerun_progress = st.progress(0.0)
+                    rerun_status = st.empty()
+                    with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
+                        rerun_data, _ = asyncio.run(
+                            run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN,
+                                     market_code, taxonomy_text, rerun_progress, rerun_status)
+                        )
+                    # Merge rerun results back into the display
+                    rerun_df = pd.DataFrame(rerun_data)
+                    if "Cached" not in rerun_df.columns:
+                        rerun_df["Cached"] = "🔄 Fresh"
+                    rerun_df.insert(0, "Re-run?", False)
+                    for _, fresh_row in rerun_df.iterrows():
+                        mask = df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
+                        if mask.any():
+                            df.loc[mask] = fresh_row.values
+                    st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
+                    st.rerun()
