@@ -1182,8 +1182,7 @@ with st.sidebar:
         [
             "Belgium (BE)", "Denmark (DK)", "Germany (DE)", "Austria (AT)",
             "Netherlands (NL)", "France (FR)", "Italy (IT)", "Spain (ES)",
-            "United Kingdom (UK)", "Poland (PL)", "Sweden (SE)",
-            "Norway (NO)", "Finland (FI)"
+            "United Kingdom (UK)", "Poland (PL)"
         ]
     )
     market_code = market_selection.split("(")[1].replace(")", "")
@@ -1254,6 +1253,64 @@ if "results_df" in st.session_state:
 
         # Add Re-run checkbox column at the front
     df.insert(0, "Re-run?", False)
+
+    # Define preferred column order
+    column_order = [
+        "Re-run?",
+        "Cached",
+        "Image 1",
+        "Image 2",
+        "GTIN / EAN",
+        "User Input",
+        "Product Name",
+        "Brand",
+        "Status",
+        "Info Reliability",
+        "Reliability Reasoning",
+        "Chain of Thought",
+        "Category L1",
+        "Category L2",
+        "Category L3",
+        "Category L4",
+        "Category L5",
+        "Category L6",
+        "Categorization Diagnosis",
+        "Dietary Tags",
+        "Occasion Tags",
+        "Seasonal Tags",
+        "Tagging Reasoning",
+        "UoM",
+        "Fragile Item",
+        "Net Weight (g) / Volume",
+        "Gross Weight (g)",
+        "Organic Product",
+        "Net Weight/ Volume (Customer Facing)",
+        "Ingredients",
+        "Allergens",
+        "May Contain",
+        "Nutritional Info",
+        "Manufacturer Name",
+        "Manufacturer Address",
+        "Place of Origin",
+        "Organic Certification ID",
+        "Energy (kJ)",
+        "Fat (g)",
+        "Of Which Saturated Fatty Acids (g)",
+        "Carbohydrates (g)",
+        "Of Which Sugars (g)",
+        "Protein (g)",
+        "Fiber (g)",
+        "Salt (g)",
+        "Source 1",
+        "Source 2",
+        "Source 3",
+        "Source 4",
+        "Source 5",
+    ]
+
+    existing_ordered = [c for c in column_order if c in df.columns]
+    remaining = [c for c in df.columns if c not in column_order]
+    df = df[existing_ordered + remaining]
 
     st.subheader("📊 Results")
     edited_df = st.data_editor(
