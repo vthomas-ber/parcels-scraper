@@ -1017,11 +1017,6 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
 
-    # ... rest of the existing function unchanged ...
-    
-    # At the very end, before the final return, add:
-    cache_set(ean, market, result["row"])
-    return result
 
     async with sem:
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
@@ -1039,14 +1034,16 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
         imgs = (display_urls + ["", ""])[:2]
 
         if "error" in data:
+            row = {
+                "Image 1": imgs[0],
+                "Image 2": imgs[1],
+                "GTIN / EAN": ean,
+                "User Input": ground_truth,
+                "Status": f"{data['error']}"
+            }
+            cache_set(ean, market, row)    # <-- here, inside the if block
             return {
-                "row": {
-                    "Image 1": imgs[0],
-                    "Image 2": imgs[1],
-                    "GTIN / EAN": ean,
-                    "User Input": ground_truth,
-                    "Status": f"{data['error']}"
-                },
+                "row": row,
                 "image_diag": image_diag,
                 "food_diag": food_diag,
             }
@@ -1079,6 +1076,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
                 "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4]
             }
+            cache_set(ean, market, row)
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # Passed Validation - full populated row
@@ -1133,6 +1131,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             "Source 4": srcs[3],
             "Source 5": srcs[4]
         }
+        cache_set(ean, market, row)
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
 
