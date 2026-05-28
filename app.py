@@ -390,6 +390,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "allergens": "List as a single string (Translated to {market_code} language)",
         "may_contain": "List as a single string (Translated to {market_code} language)",
         "nutritional_info": "Context (e.g., per 100g or per serving) (Translated to {market_code} language)",
+        "manufacturer_name": "Legal name of the manufacturer company",
         "manufacturer_address": "Full address",
         "place_of_origin": "Country/Region of origin",
         "organic_certification_id": "e.g., DE-ÖKO-001 or null",
@@ -1073,7 +1074,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "", "Tagging Reasoning": "",
                 "Brand": "", "UoM": "", "Packaging": "", "Fragile Item": "", "Net Weight (g) / Volume": "", "Gross Weight (g)": "",
                 "Organic Product": "", "Net Weight/ Volume (Customer Facing)": "", "Ingredients": "", "Allergens": "", "May Contain": "",
-                "Nutritional Info": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
+                "Nutritional Info": "", "Manufacturer Name": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
                 "Energy (kJ)": "", "Fat (g)": "", "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "", "Of Which Sugars (g)": "",
                 "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
                 "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4],
@@ -1117,6 +1118,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             "Allergens": data.get("allergens", ""),
             "May Contain": data.get("may_contain", ""),
             "Nutritional Info": data.get("nutritional_info", ""),
+            "Manufacturer Name": data.get("manufacturer_name", ""),
             "Manufacturer Address": data.get("manufacturer_address", ""),
             "Place of Origin": data.get("place_of_origin", ""),
             "Organic Certification ID": data.get("organic_certification_id", ""),
@@ -1244,6 +1246,7 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
 if "results_df" in st.session_state:
     df = st.session_state["results_df"].copy()
+    df = df.drop(columns=["Image 2 Failure Reason", "Packaging"], errors="ignore")
 
      # Ensure Cached column exists for all rows
     if "Cached" not in df.columns:
