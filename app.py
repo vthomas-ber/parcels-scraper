@@ -1357,10 +1357,10 @@ if "results_df" in st.session_state:
                 rerun_df = pd.DataFrame(rerun_data)
                 if "Cached" not in rerun_df.columns:
                     rerun_df["Cached"] = "🔄 Fresh"
-                    rerun_df.insert(0, "Re-run?", False)
-                    for _, fresh_row in rerun_df.iterrows():
-                        mask = df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
-                        if mask.any():
-                            df.loc[mask] = fresh_row.values
-                            st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
-                            st.rerun()
+                rerun_df.insert(0, "Re-run?", False)
+                for _, fresh_row in rerun_df.iterrows():
+                    mask = df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
+                    if mask.any():
+                        df.loc[mask] = fresh_row.values
+                st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
+                st.rerun()
