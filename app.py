@@ -155,6 +155,38 @@ async def fetch_og_image(session, url):
         pass
     return None
 
+GEMINI_SUPPORTED_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+
+MAGIC_BYTES_MAP = [
+    (b"\xff\xd8\xff",       "image/jpeg"),
+    (b"\x89PNG\r\n\x1a\n", "image/png"),
+    (b"RIFF",               "image/webp"),   # needs extra check but good enough
+    (b"GIF87a",             "image/gif"),
+    (b"GIF89a",             "image/gif"),
+]
+
+def _sniff_mime(data: bytes) -> str | None:
+    """Detect image type from magic bytes. Returns None if unrecognised."""
+    for magic, mime in MAGIC_BYTES_MAP:
+        if data[:len(magic)] == magic:
+            return mime
+    return None
+
+def _safe_mime(raw_mime: str, data: bytes) -> str | None:
+    """
+    Return a Gemini-safe MIME type or None if the image should be skipped.
+    1. Strip content-type parameters (e.g. 'image/jpeg; charset=utf-8' → 'image/jpeg')
+    2. If the cleaned type is supported, use it.
+    3. If it's octet-stream / unknown, sniff from magic bytes.
+    4. If still unresolvable, return None so the caller can skip the image.
+    """
+    clean = raw_mime.split(";")[0].strip().lower() if raw_mime else ""
+    if clean in GEMINI_SUPPORTED_MIMES:
+        return clean
+    # Fall back to magic-byte sniffing
+    sniffed = _sniff_mime(data)
+    return sniffed  # may be None → caller should skip
+
 async def fetch_image_bytes_simple(session, url):
     """Original image fetcher used by the food extraction pipeline. Lenient by design."""
     try:
@@ -163,7 +195,10 @@ async def fetch_image_bytes_simple(session, url):
                 data = await resp.read()
                 if len(data) < 8000:
                     return None
-                mime = resp.headers.get("content-type", "image/jpeg")
+                raw_mime = resp.headers.get("content-type", "")
+                mime = _safe_mime(raw_mime, data)
+                if mime is None:
+                    return None  # skip — Gemini would reject this
                 return {"url": url, "mime": mime, "data": data}
     except Exception:
         pass
