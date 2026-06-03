@@ -1374,12 +1374,17 @@ if "results_df" in st.session_state:
     )
     
     # Re-run selected rows
-    rerun_eans = edited_df[edited_df["Re-run?"] == True]["GTIN / EAN"].tolist()
+    rerun_rows = edited_df[edited_df["Re-run?"] == True]
+    rerun_eans = rerun_rows["GTIN / EAN"].tolist()
     if rerun_eans:
         if st.button(f"🔄 Re-run {len(rerun_eans)} selected EAN(s)", type="primary"):
             rerun_inputs = [
-                {"ean": ean, "ground_truth": "", "force_refresh": True}
-                for ean in rerun_eans
+                {
+                    "ean": row["GTIN / EAN"],
+                    "ground_truth": str(row.get("User Input", "") or "").strip(),
+                    "force_refresh": True
+                }
+                for _, row in rerun_rows.iterrows()
             ]
             rerun_progress = st.progress(0.0)
             rerun_status = st.empty()
