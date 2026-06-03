@@ -1358,9 +1358,14 @@ if "results_df" in st.session_state:
                 if "Cached" not in rerun_df.columns:
                     rerun_df["Cached"] = "🔄 Fresh"
                 rerun_df.insert(0, "Re-run?", False)
+                base_df = st.session_state["results_df"].copy()
                 for _, fresh_row in rerun_df.iterrows():
-                    mask = df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
+                    mask = base_df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
                     if mask.any():
-                        df.loc[mask] = fresh_row.values
+                        idx = base_df.index[mask][0]
+                        for col in fresh_row.index:
+                            if col in base_df.columns:
+                                base_df.at[idx, col] = fresh_row[col]
+                st.session_state["results_df"] = base_df
                 st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
                 st.rerun()
