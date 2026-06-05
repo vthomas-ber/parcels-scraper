@@ -1178,21 +1178,24 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
 
 async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
     sem = asyncio.Semaphore(5)
+    total = len(parsed_inputs)
+    completed = 0
+
     async with aiohttp.ClientSession() as session:
-        tasks = [process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text) for item in parsed_inputs]
-
-        results = []
-        diagnostics = []
-        total = len(parsed_inputs)
-        completed = 0
-
-        for f in asyncio.as_completed(tasks):
-            res = await f
-            results.append(res["row"])
-            diagnostics.append(res["image_diag"])
+        # Wrap each task to update progress as each one completes,
+        # then gather with return_exceptions=True to preserve input order.
+        async def tracked(item):
+            nonlocal completed
+            res = await process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text)
             completed += 1
             progress_bar.progress(completed / total)
             status_text.text(f"Processed {completed}/{total} items...")
+            return res
+
+        all_results = await asyncio.gather(*[tracked(item) for item in parsed_inputs])
+
+        results     = [r["row"]        for r in all_results]
+        diagnostics = [r["image_diag"] for r in all_results]
 
         return results, diagnostics
 
