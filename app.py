@@ -237,9 +237,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
     if serp_key and user_ground_truth:
         # Extract a single-word brand candidate: first capitalised token in ground_truth
         import re as _re
-        brand_tokens = [t for t in user_ground_truth.split() if t[0].isupper() and len(t) > 2]
-        if brand_tokens:
-            brand_candidate = brand_tokens[0]
+        brand_candidate = _extract_brand(user_ground_truth)
+        if brand_candidate:
             diagnostic_log.append(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
                 async with session.get(serp_url, params={
@@ -1042,6 +1041,44 @@ def display_select(candidates, diag):
     return selected
 
 
+_BRAND_STOPWORDS = {
+    # Italian food words that appear capitalised in product names
+    "mandorle", "anacardi", "arachidi", "nocciole", "pistacchi", "noci",
+    "mix", "assortiti", "ricoperte", "tostate", "salate", "bio", "organic",
+    "cioccolato", "fondente", "bianco", "latte", "cocco", "yogurt", "limone",
+    "arancia", "fragola", "lampone", "vaniglia", "caramello", "miele",
+    "preparazione", "confezione", "formato", "gusto", "sapore",
+    # French
+    "preparation", "aromatisation", "saveur", "pour", "avec",
+    # Generic
+    "product", "item", "food", "snack", "pack", "bag", "box",
+    "gr", "kg", "ml", "cl", "da", "al", "di", "con", "per",
+}
+
+def _extract_brand(ground_truth: str) -> str:
+    """
+    Extract a brand token from ground_truth.
+    Skips common food/descriptive words and short tokens.
+    Returns the first capitalised token that looks like a brand name.
+    """
+    if not ground_truth:
+        return ""
+    tokens = ground_truth.split()
+    for token in tokens:
+        # Clean punctuation
+        clean = token.strip(".,;:()-/")
+        if len(clean) < 3:
+            continue
+        if not clean[0].isupper():
+            continue
+        if clean.lower() in _BRAND_STOPWORDS:
+            continue
+        # Skip tokens that are all numbers or EAN-like
+        if clean.replace(".", "").isdigit():
+            continue
+        return clean
+    return ""
+
 async def fetch_display_images(session, ean, serp_key, ean_token, market_code, ground_truth="", gemini_key=""):
     """
     NEW IMAGE PIPELINE - completely separate from food extraction.
@@ -1062,9 +1099,8 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     # If a brand is provided in ground_truth, search for brand.com/{ean} first.
     # Brand pages have highest-quality product images — prioritise them above everything.
     if serp_key and ground_truth:
-        brand_tokens = [t for t in ground_truth.split() if t[0].isupper() and len(t) > 2]
-        if brand_tokens:
-            brand_candidate = brand_tokens[0]
+        brand_candidate = _extract_brand(ground_truth)
+        if brand_candidate:
             diag.log(f"🔍 Brand-site image lookup for '{brand_candidate}'...")
             try:
                 async with session.get(serp_url, params={
@@ -1089,7 +1125,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                 diag.log(f"⚠️ Brand-site image lookup failed: {e}")
 
     # Derive brand label for vision verification
-    brand_for_verify = brand_tokens[0] if (ground_truth and [t for t in ground_truth.split() if t[0].isupper() and len(t) > 2]) else ""
+    brand_for_verify = _extract_brand(ground_truth) if ground_truth else ""
 
     # Stage 1: Name lookup
     if ean_token:
@@ -1297,6 +1333,9 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             empty_diag = ImageDiagnostics(ean)
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
+    else:
+        # force_refresh: delete the cache entry so a stale result isn't re-used
+        cache_delete(ean, market)
 
 
     async with sem:
