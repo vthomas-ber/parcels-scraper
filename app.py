@@ -1095,14 +1095,18 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     candidate_image_urls = []
     registry_image_url = None
 
-    # Stage 0: Brand-site lookup (mirrors fetch_basic_info logic)
-    # If a brand is provided in ground_truth, search for brand.com/{ean} first.
-    # Brand pages have highest-quality product images — prioritise them above everything.
+    # Stage 0: Brand-site image lookup via SerpAPI site: search
+    # When a brand is in ground_truth:
+    #   Step A — find the brand domain via text search
+    #   Step B — search Google Images restricted to that domain (bypasses 403 entirely)
+    #   Step C — also add the product page URL for the scraper to try
+    brand_domain_found = None
     if serp_key and ground_truth:
         brand_candidate = _extract_brand(ground_truth)
         if brand_candidate:
-            diag.log(f"🔍 Brand-site image lookup for '{brand_candidate}'...")
+            diag.log(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
+                # Step A: text search to find the brand domain
                 async with session.get(serp_url, params={
                     "q": f"{brand_candidate} {ean}",
                     "gl": gl, "api_key": serp_key
@@ -1115,14 +1119,43 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                             domain = link.split("/")[2] if link.startswith("http") else ""
                             if brand_candidate.lower() in domain.lower():
                                 if not product_name:
-                                    product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
+                                    product_name = res.get("title","").split("-")[0].split("|")[0].strip()
                                     diag.log(f"✅ Brand-site name: {product_name}")
                                 if link not in retailer_urls:
-                                    retailer_urls.insert(0, link)  # brand page first
-                                diag.log(f"✅ Brand domain for images: {domain}")
+                                    retailer_urls.insert(0, link)
+                                brand_domain_found = domain
+                                diag.log(f"✅ Brand domain: {domain}")
                                 break
             except Exception as e:
-                diag.log(f"⚠️ Brand-site image lookup failed: {e}")
+                diag.log(f"⚠️ Brand text search failed: {e}")
+
+            # Step B: Google Images restricted to brand domain — bypasses 403
+            if brand_domain_found and serp_key:
+                diag.log(f"🖼️ Image search on site:{brand_domain_found}...")
+                name_hint = " ".join((product_name or ground_truth).split()[:4])
+                site_img_query = f"site:{brand_domain_found} {name_hint}"
+                try:
+                    async with session.get(serp_url, params={
+                        "q": site_img_query, "tbm": "isch",
+                        "gl": gl, "api_key": serp_key
+                    }, timeout=10) as resp:
+                        if resp.status == 200:
+                            img_data = await resp.json()
+                            hits = 0
+                            for item in img_data.get("images_results", [])[:8]:
+                                original = item.get("original", "")
+                                thumbnail = item.get("thumbnail", "")
+                                title = item.get("title", "").lower()
+                                src_domain = item.get("source", "").lower()
+                                if original or thumbnail:
+                                    # Mark as jsonld_retailer priority — came from brand domain
+                                    candidate_image_urls.append(
+                                        ("jsonld_retailer", original, thumbnail, title, src_domain)
+                                    )
+                                    hits += 1
+                            diag.log(f"   Found {hits} brand-domain image candidates.")
+                except Exception as e:
+                    diag.log(f"⚠️ Brand domain image search failed: {e}")
 
     # Derive brand label for vision verification
     brand_for_verify = _extract_brand(ground_truth) if ground_truth else ""
@@ -1668,20 +1701,6 @@ if "results_df" in st.session_state:
         hide_index=True
     )
     
-    # ── Image Diagnostics Expander ──────────────────────────────────────────────
-    if "image_diags" in st.session_state and st.session_state["image_diags"]:
-        with st.expander("🔬 Image Pipeline Diagnostics (click to expand)", expanded=False):
-            for diag in st.session_state["image_diags"]:
-                if not diag or not hasattr(diag, "ean"):
-                    continue
-                st.markdown(f"**EAN {diag.ean}** — {diag.summary_string()}")
-                if diag.text_log:
-                    st.code("\n".join(diag.text_log), language=None)
-                if diag.candidates:
-                    cand_df = pd.DataFrame(diag.to_dict_list())
-                    st.dataframe(cand_df, use_container_width=True, hide_index=True)
-                st.markdown("---")
-
     # Re-run selected rows
     rerun_rows = edited_df[edited_df["Re-run?"] == True]
     rerun_eans = rerun_rows["GTIN / EAN"].tolist()
