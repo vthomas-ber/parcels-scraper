@@ -367,11 +367,17 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     MARKET: {market_code}
 
     CORE DIRECTIVES:
-    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it is empty, proceed normally. If it contains text (like a brand, name, or weight), compare it to the product data you found online for this EAN. They MUST be the exact same product. If the brand, weight, or specific flavor is clearly different (e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g'), you MUST set "is_exact_match" to false and return "null" for all other extraction fields. If it matches, or if no user info was provided, set "is_exact_match" to true and extract the data.
+    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it is empty, proceed normally. If it contains text (like a brand, name, or weight), compare it to the product data you found online for this EAN. They MUST be the same product — but allow for minor formatting differences such as abbreviations, capitalisation, punctuation, and language translation. Only set "is_exact_match" to false if there is a CLEAR, MEANINGFUL mismatch: e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g', or the brand is completely different, or the weight differs by more than 20%. Do NOT fail validation for cosmetic name differences (e.g. 'da 100 gr.' vs '100g', or 'al Cioccolato' vs 'Al Cioccolato Fondente'). If it matches or is a cosmetic difference, set "is_exact_match" to true and extract the data.
     1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers.
     2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
     3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
-    4. MISSING DATA: Do not guess. If specific data is completely missing from the web, use your internal baseline knowledge. If you still don't know, return "null". Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
+    4. MISSING DATA & SOURCE CASCADE: You MUST try to fill every field. Follow this cascade:
+        STEP 1 — Official brand website (highest priority). Extract everything available.
+        STEP 2 — If ANY field is still null after Step 1, search the Tier-1 retailers for {market_code}: {goldmine_sites}. Cross-reference and fill any remaining nulls.
+        STEP 3 — If ANY field is still null after Step 2, search global databases (barcodelookup.com, go-upc.com, Open Food Facts as last resort).
+        STEP 4 — If a field is genuinely not available anywhere after all 3 steps, return "null". Do NOT guess nutritional values. Do NOT invent ingredients.
+        IMPORTANT: A brand page that has ingredients but no nutrition table is NOT a complete source. Continue to Step 2 for the missing fields.
+        Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
     5b. TAXONOMY FIRST-PRINCIPLES (INTENDED USE RULE): Before mapping to the taxonomy, determine the product's primary intended use from its name, category keywords, and ingredients:
         - If the product is a LIQUID, SYRUP, CONCENTRATE, or MIXER of any kind → it MUST be classified under Drinks (L1).
@@ -910,7 +916,7 @@ def display_select(candidates, diag):
     return selected
 
 
-async def fetch_display_images(session, ean, serp_key, ean_token, market_code):
+async def fetch_display_images(session, ean, serp_key, ean_token, market_code, ground_truth=""):
     """
     NEW IMAGE PIPELINE - completely separate from food extraction.
     Returns: (display_images, diagnostics).
@@ -925,6 +931,36 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code):
     retailer_urls = []
     candidate_image_urls = []
     registry_image_url = None
+
+    # Stage 0: Brand-site lookup (mirrors fetch_basic_info logic)
+    # If a brand is provided in ground_truth, search for brand.com/{ean} first.
+    # Brand pages have highest-quality product images — prioritise them above everything.
+    if serp_key and ground_truth:
+        brand_tokens = [t for t in ground_truth.split() if t[0].isupper() and len(t) > 2]
+        if brand_tokens:
+            brand_candidate = brand_tokens[0]
+            diag.log(f"🔍 Brand-site image lookup for '{brand_candidate}'...")
+            try:
+                async with session.get(serp_url, params={
+                    "q": f"{brand_candidate} {ean}",
+                    "gl": gl, "api_key": serp_key
+                }, timeout=10) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        organic = data.get("organic_results", [])
+                        for res in organic[:5]:
+                            link = res.get("link", "")
+                            domain = link.split("/")[2] if link.startswith("http") else ""
+                            if brand_candidate.lower() in domain.lower():
+                                if not product_name:
+                                    product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
+                                    diag.log(f"✅ Brand-site name: {product_name}")
+                                if link not in retailer_urls:
+                                    retailer_urls.insert(0, link)  # brand page first
+                                diag.log(f"✅ Brand domain for images: {domain}")
+                                break
+            except Exception as e:
+                diag.log(f"⚠️ Brand-site image lookup failed: {e}")
 
     # Stage 1: Name lookup
     if ean_token:
@@ -1102,7 +1138,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
     async with sem:
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
         food_task = fetch_basic_info(session, ean, serp_key, ean_token, market, user_ground_truth=ground_truth)
-        image_task = fetch_display_images(session, ean, serp_key, ean_token, market)
+        image_task = fetch_display_images(session, ean, serp_key, ean_token, market, ground_truth=ground_truth)
         (name, gemini_images, food_diag), (display_images, image_diag) = await asyncio.gather(food_task, image_task)
 
         # PATH A continues: send Gemini the food-extraction images (original logic)
