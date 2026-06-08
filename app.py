@@ -938,13 +938,20 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
             diag.log_candidate(source, used_url, "rejected_vision",
                                f"Gemini: image does not match '{brand} {product_name}'",
                                width=inspection.get("width"), height=inspection.get("height"))
-            return None
+            # Return rejected candidate with display=False so the URL is preserved
+            # for the Image Source Link column (no displayed image but link still available)
+            return {
+                "url": used_url, "mime": safe_mime, "data": None,
+                "source": source, "inspection": inspection,
+                "phash": None, "display": False
+            }
         diag.log(f"   ✅ Vision verified: {used_url[:80]}")
 
     return {
         "url": used_url, "mime": safe_mime, "data": payload["data"],
         "source": source, "inspection": inspection,
         "phash": display_compute_phash(payload["data"]),
+        "display": True
     }
 
 
@@ -997,17 +1004,24 @@ def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, br
 
 
 def display_select(candidates, diag):
-    """Pick top MAX_DISPLAY_IMAGES, dedupe near-identical."""
+    """Pick top MAX_DISPLAY_IMAGES for rendering. Only display=True candidates shown."""
     if not candidates:
         diag.image_2_failure = "No candidate images survived quality checks."
         return []
+
+    # Split: displayable (verified) vs rejected (wrong content, link-only)
+    displayable = [c for c in candidates if c.get("display", True) and c.get("data")]
+    rejected_links = [c for c in candidates if not c.get("display", True)]
+
+    if rejected_links:
+        diag.log(f"   ℹ️ {len(rejected_links)} image(s) rejected by vision — URLs preserved for Image Source Link.")
 
     def score(c):
         base = DISPLAY_SOURCE_PRIORITY.get(c["source"], 30)
         long_edge = c["inspection"].get("long_edge") or 0
         return base + min(20, long_edge / 75)
 
-    sorted_cands = sorted(candidates, key=score, reverse=True)
+    sorted_cands = sorted(displayable, key=score, reverse=True)
 
     selected = []
     selected_hashes = []
@@ -1033,8 +1047,10 @@ def display_select(candidates, diag):
     diag.final_selected = [c["url"] for c in selected]
 
     if len(selected) < MAX_DISPLAY_IMAGES:
-        if len(candidates) > 1:
+        if len(displayable) > 1:
             diag.image_2_failure = "Multiple candidates found but only 1 unique image (rest were near-duplicates)."
+        elif len(displayable) == 0 and rejected_links:
+            diag.image_2_failure = "No displayable image found — see Image Source Link to access manually."
         else:
             diag.image_2_failure = "Only 1 candidate image survived quality checks."
 
@@ -1346,7 +1362,34 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     # Stage 6: Select top MAX_DISPLAY_IMAGES
     selected = display_select(valid_candidates, diag)
 
-    return selected, diag
+    # Collect source links — best candidate URLs even if image couldn't be rendered.
+    # Priority: brand-domain candidates first, then any other original URL found.
+    # These populate "Image Source Link" so the user can visit manually.
+    source_links = []
+    seen_link_domains = set()
+    # First pass: prefer brand domain originals
+    for entry in deduped:
+        src, original, thumbnail, title, src_domain = entry
+        if original and src in ("jsonld_retailer", "og_retailer", "serpapi_strict", "serpapi_barcode"):
+            dom = original.split("/")[2] if original.startswith("http") else ""
+            if dom and dom not in seen_link_domains:
+                source_links.append(original)
+                seen_link_domains.add(dom)
+        if len(source_links) >= 2:
+            break
+    # Second pass: fill remaining slots from any original URL
+    if len(source_links) < 2:
+        for entry in deduped:
+            src, original, thumbnail, title, src_domain = entry
+            if original:
+                dom = original.split("/")[2] if original.startswith("http") else ""
+                if dom and dom not in seen_link_domains:
+                    source_links.append(original)
+                    seen_link_domains.add(dom)
+            if len(source_links) >= 2:
+                break
+
+    return selected, diag, source_links
 
 
 # ============================================================================
@@ -1375,21 +1418,23 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
         food_task = fetch_basic_info(session, ean, serp_key, ean_token, market, user_ground_truth=ground_truth)
         image_task = fetch_display_images(session, ean, serp_key, ean_token, market, ground_truth=ground_truth, gemini_key=gemini_key)
-        (name, gemini_images, food_diag), (display_images, image_diag) = await asyncio.gather(food_task, image_task)
+        (name, gemini_images, food_diag), (display_images, image_diag, source_links) = await asyncio.gather(food_task, image_task)
 
         # PATH A continues: send Gemini the food-extraction images (original logic)
         data = await asyncio.to_thread(
             run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, gemini_images, ground_truth
         )
 
-        # PATH B output: display_images for the table
+        # PATH B output: display_images + source_links for the table
         display_urls = [img["url"] for img in display_images]
         imgs = (display_urls + ["", ""])[:2]
+        img_src_links = (source_links + ["", ""])[:2]
 
         if "error" in data:
             row = {
                 "Image 1": imgs[0],
                 "Image 2": imgs[1],
+                "Image Source Link": img_src_links[0],
                 "GTIN / EAN": ean,
                 "User Input": ground_truth,
                 "Status": f"{data['error']}",
@@ -1412,6 +1457,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             row = {
                 "Image 1": imgs[0],
                 "Image 2": imgs[1],
+                "Image Source Link": img_src_links[0],
                 "Image 2 Failure Reason": image_diag.image_2_failure,
                 "Status": "Failed Validation",
                 "GTIN / EAN": ean,
@@ -1446,6 +1492,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
+            "Image Source Link": img_src_links[0],
             "Image 2 Failure Reason": image_diag.image_2_failure,
             "Status": final_status,
             "GTIN / EAN": ean,
@@ -1623,6 +1670,7 @@ if "results_df" in st.session_state:
         "Cached",
         "Image 1",
         "Image 2",
+        "Image Source Link",
         "GTIN / EAN",
         "User Input",
         "Product Name",
@@ -1691,6 +1739,11 @@ if "results_df" in st.session_state:
             ),
             "Image 1": st.column_config.ImageColumn(),
             "Image 2": st.column_config.ImageColumn(),
+            "Image Source Link": st.column_config.LinkColumn(
+                "Image Source Link",
+                display_text="🔗 Image Source",
+                help="Direct URL to the product image. Click to open if the image above could not be rendered.",
+            ),
             "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
             "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
             "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
