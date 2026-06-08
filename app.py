@@ -973,11 +973,15 @@ def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, br
         client = genai.Client(api_key=gemini_key)
         label = f"{brand} {product_name}".strip() if brand else product_name
         prompt = (
-            f"Look at this image. Is it a food or drink product, snack, or packaged food item? "
-            f"Answer NO only if it is clearly something completely unrelated to food: "
-            f"e.g. a power tool, piece of furniture, electronic device, clothing, vehicle, "
-            f"empty barcode image, or landscape photo. "
-            f"Answer YES for anything that could be food, drink, snack, or grocery packaging. "
+            f"Look at this image carefully. "
+            f"Does it show a retail food or drink product packaging — specifically something "
+            f"that could be '{label}'? "
+            f"Answer YES if: the image shows packaged food, a snack, grocery item, or food/drink packaging "
+            f"that plausibly matches the description '{label}'. "
+            f"Answer NO if: the image shows hardware, tools, furniture, electronics, clothing, vehicles, "
+            f"a blank barcode, a landscape, a person, or ANY non-food item. "
+            f"Also answer NO if the image is clearly a completely different product type "
+            f"(e.g. cosmetics when asked about food, or office supplies when asked about snacks). "
             f"One word only: YES or NO."
         )
         response = client.models.generate_content(
@@ -1362,32 +1366,20 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     # Stage 6: Select top MAX_DISPLAY_IMAGES
     selected = display_select(valid_candidates, diag)
 
-    # Collect source links — best candidate URLs even if image couldn't be rendered.
-    # Priority: brand-domain candidates first, then any other original URL found.
-    # These populate "Image Source Link" so the user can visit manually.
+    # Image Source Link = the PRODUCT PAGE URL, not an image file URL.
+    # retailer_urls contains actual product/brand pages found during lookup.
+    # This is what the user should visit to find the image manually.
     source_links = []
     seen_link_domains = set()
-    # First pass: prefer brand domain originals
-    for entry in deduped:
-        src, original, thumbnail, title, src_domain = entry
-        if original and src in ("jsonld_retailer", "og_retailer", "serpapi_strict", "serpapi_barcode"):
-            dom = original.split("/")[2] if original.startswith("http") else ""
-            if dom and dom not in seen_link_domains:
-                source_links.append(original)
-                seen_link_domains.add(dom)
+    for page_url in retailer_urls:
+        if not page_url:
+            continue
+        dom = page_url.split("/")[2] if page_url.startswith("http") else ""
+        if dom and dom not in seen_link_domains:
+            source_links.append(page_url)
+            seen_link_domains.add(dom)
         if len(source_links) >= 2:
             break
-    # Second pass: fill remaining slots from any original URL
-    if len(source_links) < 2:
-        for entry in deduped:
-            src, original, thumbnail, title, src_domain = entry
-            if original:
-                dom = original.split("/")[2] if original.startswith("http") else ""
-                if dom and dom not in seen_link_domains:
-                    source_links.append(original)
-                    seen_link_domains.add(dom)
-            if len(source_links) >= 2:
-                break
 
     return selected, diag, source_links
 
