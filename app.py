@@ -845,44 +845,105 @@ def display_phash_distance(h1, h2):
         return 999
 
 
-async def display_evaluate_candidate(session, source, url, diag,
-                                      gemini_key="", product_name="", brand=""):
-    """Download + inspect a candidate display image."""
-    is_valid, reject_reason = _check_display_url(url)
-    if not is_valid:
-        diag.log_candidate(source, url, "rejected_url", reject_reason)
+# Bad keywords that should never appear in a food product image title/source
+_BAD_TITLE_TOKENS = {
+    "hardware", "tool", "screw", "bolt", "nut ", "drill", "plumb", "pipe",
+    "furniture", "sofa", "chair", "table", "bed ", "bath", "shower", "toilet",
+    "clothing", "shirt", "shoe", "dress", "jacket",
+    "electronic", "laptop", "phone", "cable", "printer", "router",
+    "paint", "roller", "brush", "wallpaper",
+    "vehicle", "car ", "truck", "tyre", "tire",
+    "garden", "plant", "flower", "seed ",
+}
+
+def _title_looks_like_food(title: str, product_name: str) -> bool:
+    """Quick text check: does the image title/source seem food-related?"""
+    if not title:
+        return True  # no title to reject on
+    title_lower = title.lower()
+    for bad in _BAD_TITLE_TOKENS:
+        if bad in title_lower:
+            return False
+    # Bonus: if any word from the product name appears in the title, trust it
+    if product_name:
+        pwords = [w.lower() for w in product_name.split() if len(w) > 3]
+        if any(w in title_lower for w in pwords):
+            return True
+    return True  # default allow — vision check handles the rest
+
+
+async def display_evaluate_candidate(session, source, original_url, thumbnail_url, diag,
+                                     gemini_key="", product_name="", brand="", title="", src_domain=""):
+    """
+    Download + inspect a candidate display image.
+    Strategy:
+      1. Pre-filter on title/source text (free, instant).
+      2. Try original URL first; if 403/error fall back to Google thumbnail.
+      3. Run PIL dimension check.
+      4. Run Gemini vision check on untrusted sources only.
+    """
+    url_to_use = original_url or thumbnail_url
+    if not url_to_use:
         return None
 
-    payload = await display_fetch_image_bytes(session, url)
+    # ── Pre-filter: reject obviously wrong content by title ──
+    if source not in TRUSTED_SOURCES and not _title_looks_like_food(title, product_name):
+        diag.log_candidate(source, url_to_use, "rejected_title",
+                           f"Title suggests non-food content: '{title[:80]}'")
+        return None
+
+    # ── Try original URL first ──
+    payload = None
+    used_url = None
+
+    if original_url:
+        is_valid, reject_reason = _check_display_url(original_url)
+        if is_valid:
+            payload = await display_fetch_image_bytes(session, original_url)
+            if payload and "error" not in payload:
+                used_url = original_url
+            else:
+                diag.log(f"   ⚠️ Original URL failed ({(payload or {}).get('error','no response')}), trying thumbnail...")
+
+    # ── Fall back to Google thumbnail ──
+    if (not payload or "error" in payload) and thumbnail_url:
+        thumb_valid, _ = _check_display_url(thumbnail_url)
+        if thumb_valid:
+            payload = await display_fetch_image_bytes(session, thumbnail_url)
+            if payload and "error" not in payload:
+                used_url = thumbnail_url
+                diag.log(f"   ✅ Using Google thumbnail fallback: {thumbnail_url[:80]}")
+
     if not payload or "error" in payload:
         err = payload.get("error", "unknown") if payload else "no response"
-        diag.log_candidate(source, url, "rejected_download", err)
+        diag.log_candidate(source, url_to_use, "rejected_download", err)
         return None
 
+    # ── Dimension check — relaxed for thumbnails (Google serves ~200px) ──
     inspection = display_inspect_image(payload["data"])
-    if not inspection["ok"]:
-        diag.log_candidate(source, url, "rejected_dimensions", inspection["reason"],
+    if not inspection["ok"] and used_url != thumbnail_url:
+        # Only enforce full size requirement on originals; thumbnails are smaller by design
+        diag.log_candidate(source, used_url, "rejected_dimensions", inspection["reason"],
                            width=inspection.get("width"), height=inspection.get("height"))
         return None
 
     safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
 
-    # Vision verification — only for untrusted sources (serpapi image results).
-    # Trusted sources (brand/retailer product pages) are pre-verified by origin.
+    # ── Vision verification — only for untrusted serpapi sources ──
     if source not in TRUSTED_SOURCES and gemini_key and product_name:
         is_correct = await asyncio.to_thread(
             verify_image_with_gemini,
             payload["data"], safe_mime, product_name, brand, gemini_key
         )
         if not is_correct:
-            diag.log_candidate(source, url, "rejected_vision",
+            diag.log_candidate(source, used_url, "rejected_vision",
                                f"Gemini: image does not match '{brand} {product_name}'",
                                width=inspection.get("width"), height=inspection.get("height"))
             return None
-        diag.log(f"   ✅ Vision verified: {url[:80]}")
+        diag.log(f"   ✅ Vision verified: {used_url[:80]}")
 
     return {
-        "url": url, "mime": safe_mime, "data": payload["data"],
+        "url": used_url, "mime": safe_mime, "data": payload["data"],
         "source": source, "inspection": inspection,
         "phash": display_compute_phash(payload["data"]),
     }
@@ -1107,9 +1168,12 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                 if not isinstance(resp, Exception) and resp.status == 200:
                     img_data = await resp.json()
                     for item in img_data.get("images_results", [])[:8]:
-                        url = item.get("original", "")
-                        if url:
-                            candidate_image_urls.append((tag, url))
+                        original = item.get("original", "")
+                        thumbnail = item.get("thumbnail", "")
+                        title = item.get("title", "").lower()
+                        source = item.get("source", "").lower()
+                        if original or thumbnail:
+                            candidate_image_urls.append((tag, original, thumbnail, title, source))
         except Exception as e:
             diag.log(f"⚠️ SerpAPI EAN search failed: {e}")
 
@@ -1127,24 +1191,33 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                         img_data = await resp.json()
                         name_hits = 0
                         for item in img_data.get("images_results", [])[:6]:
-                            url = item.get("original", "")
-                            if url:
-                                candidate_image_urls.append((q_tag, url))
+                            original = item.get("original", "")
+                            thumbnail = item.get("thumbnail", "")
+                            title = item.get("title", "").lower()
+                            source = item.get("source", "").lower()
+                            if original or thumbnail:
+                                candidate_image_urls.append((q_tag, original, thumbnail, title, source))
                                 name_hits += 1
                         diag.log(f"   [{q_tag}] Found {name_hits} candidates.")
             except Exception as e:
                 diag.log(f"⚠️ SerpAPI name search [{q_tag}] failed: {e}")
 
     if registry_image_url:
-        candidate_image_urls.append(("ean_search_registry", registry_image_url))
+        candidate_image_urls.append(("ean_search_registry", registry_image_url, "", "", ""))
 
-    # Stage 3: Dedup URLs
+    # Stage 3: Normalise to (src, original, thumbnail, title, source_domain) and dedup
     seen_urls = set()
     deduped = []
-    for src, u in candidate_image_urls:
-        if u not in seen_urls:
-            seen_urls.add(u)
-            deduped.append((src, u))
+    for entry in candidate_image_urls:
+        if len(entry) == 2:
+            src, original = entry
+            thumbnail, title, src_domain = "", "", ""
+        else:
+            src, original, thumbnail, title, src_domain = entry
+        key = original or thumbnail
+        if key and key not in seen_urls:
+            seen_urls.add(key)
+            deduped.append((src, original, thumbnail, title, src_domain))
 
     diag.log(f"📊 {len(deduped)} unique candidate URLs. Evaluating...")
 
@@ -1152,12 +1225,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     _pname_for_verify = product_name or ""
     eval_tasks = [
         display_evaluate_candidate(
-            session, src, url, diag,
+            session, src, original, thumbnail, diag,
             gemini_key=gemini_key,
             product_name=_pname_for_verify,
-            brand=brand_for_verify
+            brand=brand_for_verify,
+            title=title, src_domain=src_domain
         )
-        for src, url in deduped[:16]
+        for src, original, thumbnail, title, src_domain in deduped[:20]
     ]
     eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
     valid_candidates = [r for r in eval_results if r and not isinstance(r, Exception)]
@@ -1174,17 +1248,24 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                     img_data = await resp.json()
                     hail = []
                     for item in img_data.get("images_results", [])[:10]:
-                        url = item.get("original", "")
-                        if url and url not in seen_urls:
-                            hail.append(("serpapi_hailmary", url))
-                            seen_urls.add(url)
+                        original = item.get("original", "")
+                        thumbnail = item.get("thumbnail", "")
+                        title = item.get("title", "").lower()
+                        src_domain = item.get("source", "").lower()
+                        key = original or thumbnail
+                        if key and key not in seen_urls:
+                            hail.append(("serpapi_hailmary", original, thumbnail, title, src_domain))
+                            seen_urls.add(key)
                     diag.log(f"   Hail mary: {len(hail)} new candidates.")
                     if hail:
                         h_eval = await asyncio.gather(
-                            *[display_evaluate_candidate(session, s, u, diag,
+                            *[display_evaluate_candidate(
+                                session, s, orig, thumb, diag,
                                 gemini_key=gemini_key,
                                 product_name=_pname_for_verify,
-                                brand=brand_for_verify) for s, u in hail],
+                                brand=brand_for_verify,
+                                title=ttl, src_domain=sdomain
+                              ) for s, orig, thumb, ttl, sdomain in hail],
                             return_exceptions=True
                         )
                         h_valid = [r for r in h_eval if r and not isinstance(r, Exception)]
