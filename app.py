@@ -845,7 +845,8 @@ def display_phash_distance(h1, h2):
         return 999
 
 
-async def display_evaluate_candidate(session, source, url, diag):
+async def display_evaluate_candidate(session, source, url, diag,
+                                      gemini_key="", product_name="", brand=""):
     """Download + inspect a candidate display image."""
     is_valid, reject_reason = _check_display_url(url)
     if not is_valid:
@@ -864,11 +865,75 @@ async def display_evaluate_candidate(session, source, url, diag):
                            width=inspection.get("width"), height=inspection.get("height"))
         return None
 
+    safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
+
+    # Vision verification — only for untrusted sources (serpapi image results).
+    # Trusted sources (brand/retailer product pages) are pre-verified by origin.
+    if source not in TRUSTED_SOURCES and gemini_key and product_name:
+        is_correct = await asyncio.to_thread(
+            verify_image_with_gemini,
+            payload["data"], safe_mime, product_name, brand, gemini_key
+        )
+        if not is_correct:
+            diag.log_candidate(source, url, "rejected_vision",
+                               f"Gemini: image does not match '{brand} {product_name}'",
+                               width=inspection.get("width"), height=inspection.get("height"))
+            return None
+        diag.log(f"   ✅ Vision verified: {url[:80]}")
+
     return {
-        "url": url, "mime": payload["mime"], "data": payload["data"],
+        "url": url, "mime": safe_mime, "data": payload["data"],
         "source": source, "inspection": inspection,
         "phash": display_compute_phash(payload["data"]),
     }
+
+
+# Sources that come directly from a brand/retailer product page —
+# these are trusted without AI verification (they are the OG/JSON-LD image tag
+# on the actual product URL, so they must be the right product).
+TRUSTED_SOURCES = {"jsonld_retailer", "og_retailer", "twitter_retailer", "ean_search_registry"}
+
+
+def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, brand: str, gemini_key: str) -> bool:
+    """
+    Lightweight Gemini Vision check: does this image show the right product?
+    Returns True (keep) or False (reject).
+    Runs synchronously — called via asyncio.to_thread to avoid blocking.
+    """
+    if not gemini_key or not image_data:
+        return True  # can't verify — allow through
+    try:
+        client = genai.Client(api_key=gemini_key)
+        label = f"{brand} {product_name}".strip() if brand else product_name
+        prompt = (
+            f"Look at this image carefully. Does it show retail food product packaging "
+            f"for a product called '{label}'? "
+            f"Answer with only one word: YES if it is a food/drink product package or "
+            f"product photo that plausibly matches this description, "
+            f"NO if it is something completely unrelated (hardware, furniture, clothing, "
+            f"electronics, blank barcode, human, animal, landscape, etc.). "
+            f"One word only."
+        )
+        response = client.models.generate_content(
+            model="gemini-2.0-flash-lite",  # cheapest/fastest model for binary check
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_data, mime_type=mime)
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=5,
+            )
+        )
+        answer = ""
+        if response.candidates and response.candidates[0].content:
+            for part in response.candidates[0].content.parts:
+                if getattr(part, "text", None):
+                    answer += part.text
+        answer = answer.strip().upper()
+        return answer.startswith("YES")
+    except Exception:
+        return True  # on error, allow through rather than drop everything
 
 
 def display_select(candidates, diag):
@@ -916,7 +981,7 @@ def display_select(candidates, diag):
     return selected
 
 
-async def fetch_display_images(session, ean, serp_key, ean_token, market_code, ground_truth=""):
+async def fetch_display_images(session, ean, serp_key, ean_token, market_code, ground_truth="", gemini_key=""):
     """
     NEW IMAGE PIPELINE - completely separate from food extraction.
     Returns: (display_images, diagnostics).
@@ -961,6 +1026,9 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                                 break
             except Exception as e:
                 diag.log(f"⚠️ Brand-site image lookup failed: {e}")
+
+    # Derive brand label for vision verification
+    brand_for_verify = brand_tokens[0] if (ground_truth and [t for t in ground_truth.split() if t[0].isupper() and len(t) > 2]) else ""
 
     # Stage 1: Name lookup
     if ean_token:
@@ -1081,7 +1149,16 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
     diag.log(f"📊 {len(deduped)} unique candidate URLs. Evaluating...")
 
     # Stage 4: Evaluate
-    eval_tasks = [display_evaluate_candidate(session, src, url, diag) for src, url in deduped[:16]]
+    _pname_for_verify = product_name or ""
+    eval_tasks = [
+        display_evaluate_candidate(
+            session, src, url, diag,
+            gemini_key=gemini_key,
+            product_name=_pname_for_verify,
+            brand=brand_for_verify
+        )
+        for src, url in deduped[:16]
+    ]
     eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
     valid_candidates = [r for r in eval_results if r and not isinstance(r, Exception)]
 
@@ -1103,7 +1180,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                             seen_urls.add(url)
                     diag.log(f"   Hail mary: {len(hail)} new candidates.")
                     if hail:
-                        h_eval = await asyncio.gather(*[display_evaluate_candidate(session, s, u, diag) for s, u in hail], return_exceptions=True)
+                        h_eval = await asyncio.gather(
+                            *[display_evaluate_candidate(session, s, u, diag,
+                                gemini_key=gemini_key,
+                                product_name=_pname_for_verify,
+                                brand=brand_for_verify) for s, u in hail],
+                            return_exceptions=True
+                        )
                         h_valid = [r for r in h_eval if r and not isinstance(r, Exception)]
                         valid_candidates.extend(h_valid)
                         diag.log(f"   Rescued {len(h_valid)} viable images.")
@@ -1138,7 +1221,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
     async with sem:
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
         food_task = fetch_basic_info(session, ean, serp_key, ean_token, market, user_ground_truth=ground_truth)
-        image_task = fetch_display_images(session, ean, serp_key, ean_token, market, ground_truth=ground_truth)
+        image_task = fetch_display_images(session, ean, serp_key, ean_token, market, ground_truth=ground_truth, gemini_key=gemini_key)
         (name, gemini_images, food_diag), (display_images, image_diag) = await asyncio.gather(food_task, image_task)
 
         # PATH A continues: send Gemini the food-extraction images (original logic)
