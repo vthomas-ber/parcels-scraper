@@ -204,7 +204,7 @@ async def fetch_image_bytes_simple(session, url):
         pass
     return None
 
-async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
+async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_ground_truth=""):
     """ORIGINAL: Retrieves exact product name and performs deduplicated, size-verified image gathering for Gemini."""
     gl = market_code.lower()
     market_upper = market_code.upper()
@@ -230,10 +230,43 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
         except Exception as e:
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
 
-    # ATTEMPT 2: SerpAPI Text Search
+    # ATTEMPT 2: Brand-site lookup (if brand provided in ground_truth)
+    # This runs BEFORE goldmine so direct brand pages are prioritised as sources.
+    brand_domain = None
+    serp_url = "https://serpapi.com/search"
+    if serp_key and user_ground_truth:
+        # Extract a single-word brand candidate: first capitalised token in ground_truth
+        import re as _re
+        brand_tokens = [t for t in user_ground_truth.split() if t[0].isupper() and len(t) > 2]
+        if brand_tokens:
+            brand_candidate = brand_tokens[0]
+            diagnostic_log.append(f"🔍 Brand-site lookup for '{brand_candidate}'...")
+            try:
+                async with session.get(serp_url, params={
+                    "q": f"{brand_candidate} {ean}",
+                    "gl": gl, "api_key": serp_key
+                }, timeout=10) as resp:
+                    data = await resp.json()
+                    organic = data.get("organic_results", [])
+                    # Look for a result whose domain contains the brand name (case-insensitive)
+                    for res in organic[:5]:
+                        link = res.get("link", "")
+                        domain = link.split("/")[2] if link.startswith("http") else ""
+                        if brand_candidate.lower() in domain.lower():
+                            if not product_name:
+                                product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
+                                diagnostic_log.append(f"✅ Found Name via brand-site: {product_name}")
+                            if link not in retailer_urls:
+                                retailer_urls.insert(0, link)  # brand page goes FIRST
+                            brand_domain = domain
+                            diagnostic_log.append(f"✅ Brand domain found: {brand_domain}")
+                            break
+            except Exception as e:
+                diagnostic_log.append(f"⚠️ Brand-site lookup failed: {e}")
+
+    # ATTEMPT 3: SerpAPI Text Search (Goldmine retailers)
     if not product_name and serp_key:
-        diagnostic_log.append("🔍 Attempt 2: Goldmine Google Search for Name...")
-        serp_url = "https://serpapi.com/search"
+        diagnostic_log.append("🔍 Goldmine Google Search for Name...")
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
 
         try:
@@ -243,7 +276,10 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
                     diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
-                    retailer_urls = [res.get("link") for res in organic[:4] if "link" in res]
+                    new_urls = [res.get("link") for res in organic[:4] if "link" in res]
+                    for u in new_urls:
+                        if u not in retailer_urls:
+                            retailer_urls.append(u)
                 else:
                     diagnostic_log.append("⚠️ Goldmine failed, falling back to global bare GTIN search...")
                     async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
@@ -252,7 +288,10 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code):
                         if organic2:
                             product_name = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
                             diagnostic_log.append(f"✅ Found Name via Global Search: {product_name}")
-                            retailer_urls = [res.get("link") for res in organic2[:4] if "link" in res]
+                            new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res]
+                            for u in new_urls2:
+                                if u not in retailer_urls:
+                                    retailer_urls.append(u)
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
@@ -971,21 +1010,26 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code):
             diag.log(f"⚠️ SerpAPI EAN search failed: {e}")
 
     if serp_key and product_name and not product_name.startswith("Product with EAN"):
-        diag.log("🖼️ SerpAPI image search by name...")
-        name_query = " ".join(product_name.split()[:8])
-        try:
-            async with session.get(serp_url, params={"q": name_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
-                if resp.status == 200:
-                    img_data = await resp.json()
-                    name_hits = 0
-                    for item in img_data.get("images_results", [])[:8]:
-                        url = item.get("original", "")
-                        if url:
-                            candidate_image_urls.append(("serpapi_name", url))
-                            name_hits += 1
-                    diag.log(f"   Found {name_hits} candidates by name.")
-        except Exception as e:
-            diag.log(f"⚠️ SerpAPI name search failed: {e}")
+        diag.log("🖼️ SerpAPI image search by name+EAN (anchored)...")
+        # Use EAN as anchor + first 5 words of name to avoid off-topic image results.
+        # Restrict to known food/product databases to prevent hardware/homeware contamination.
+        name_words = " ".join(product_name.split()[:5])
+        anchored_query = f'"{ean}" {name_words} site:barcodelookup.com OR site:go-upc.com OR site:open.fda.gov OR "{ean}" {name_words}'
+        hailmary_query = f'"{ean}" {name_words} -site:aliexpress.com -site:ebay.com -site:alibaba.com'
+        for q_tag, q_str in [("serpapi_strict", anchored_query), ("serpapi_hailmary", hailmary_query)]:
+            try:
+                async with session.get(serp_url, params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
+                    if resp.status == 200:
+                        img_data = await resp.json()
+                        name_hits = 0
+                        for item in img_data.get("images_results", [])[:6]:
+                            url = item.get("original", "")
+                            if url:
+                                candidate_image_urls.append((q_tag, url))
+                                name_hits += 1
+                        diag.log(f"   [{q_tag}] Found {name_hits} candidates.")
+            except Exception as e:
+                diag.log(f"⚠️ SerpAPI name search [{q_tag}] failed: {e}")
 
     if registry_image_url:
         candidate_image_urls.append(("ean_search_registry", registry_image_url))
@@ -1057,7 +1101,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
 
     async with sem:
         # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
-        food_task = fetch_basic_info(session, ean, serp_key, ean_token, market)
+        food_task = fetch_basic_info(session, ean, serp_key, ean_token, market, user_ground_truth=ground_truth)
         image_task = fetch_display_images(session, ean, serp_key, ean_token, market)
         (name, gemini_images, food_diag), (display_images, image_diag) = await asyncio.gather(food_task, image_task)
 
@@ -1119,15 +1163,23 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # Passed Validation - full populated row
+        # "No result > wrong result": if reliability is Low AND no sources found,
+        # flag explicitly rather than silently passing as Success.
+        reliability = data.get("food_info_reliability", "")
+        all_sources = [srcs[i] for i in range(5) if srcs[i]]
+        if reliability == "L" and not all_sources:
+            final_status = "⚠️ Low Confidence — Review Required"
+        else:
+            final_status = "Success"
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
             "Image 2 Failure Reason": image_diag.image_2_failure,
-            "Status": "Success",
+            "Status": final_status,
             "GTIN / EAN": ean,
             "User Input": ground_truth,
             "Product Name": name,
-            "Info Reliability": data.get("food_info_reliability", ""),
+            "Info Reliability": reliability,
             "Reliability Reasoning": data.get("reliability_reasoning", ""),
             "Chain of Thought": data.get("chain_of_thought", ""),
             "Category L1": data.get("category_1", ""),
