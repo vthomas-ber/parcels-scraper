@@ -597,7 +597,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
 # It does NOT touch food extraction in any way.
 # Runs in parallel with Path A so total time is unchanged.
 
-DISPLAY_MIN_LONG_EDGE_PX = 250
+DISPLAY_MIN_LONG_EDGE_PX = 120  # relaxed: Google thumbnails are ~150-200px, still useful for display table
 DISPLAY_ASPECT_MIN = 0.3
 DISPLAY_ASPECT_MAX = 3.0
 DISPLAY_PHASH_DUPLICATE_THRESHOLD = 5
@@ -967,16 +967,15 @@ def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, br
         client = genai.Client(api_key=gemini_key)
         label = f"{brand} {product_name}".strip() if brand else product_name
         prompt = (
-            f"Look at this image carefully. Does it show retail food product packaging "
-            f"for a product called '{label}'? "
-            f"Answer with only one word: YES if it is a food/drink product package or "
-            f"product photo that plausibly matches this description, "
-            f"NO if it is something completely unrelated (hardware, furniture, clothing, "
-            f"electronics, blank barcode, human, animal, landscape, etc.). "
-            f"One word only."
+            f"Look at this image. Is it a food or drink product, snack, or packaged food item? "
+            f"Answer NO only if it is clearly something completely unrelated to food: "
+            f"e.g. a power tool, piece of furniture, electronic device, clothing, vehicle, "
+            f"empty barcode image, or landscape photo. "
+            f"Answer YES for anything that could be food, drink, snack, or grocery packaging. "
+            f"One word only: YES or NO."
         )
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",  # cheapest/fastest model for binary check
+            model="gemini-2.0-flash-lite",
             contents=[
                 prompt,
                 types.Part.from_bytes(data=image_data, mime_type=mime)
@@ -992,9 +991,10 @@ def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, br
                 if getattr(part, "text", None):
                     answer += part.text
         answer = answer.strip().upper()
-        return answer.startswith("YES")
+        # Only reject on explicit NO — if ambiguous or empty, allow through
+        return not answer.startswith("NO")
     except Exception:
-        return True  # on error, allow through rather than drop everything
+        return True  # on error, allow through
 
 
 def display_select(candidates, diag):
@@ -1532,6 +1532,7 @@ if st.button("🚀 Start Deep Research", type="primary"):
             )
 
             st.session_state["results_df"] = pd.DataFrame(all_data)
+            st.session_state["image_diags"] = all_diags
 
 if "results_df" in st.session_state:
     df = st.session_state["results_df"].copy()
@@ -1628,6 +1629,20 @@ if "results_df" in st.session_state:
         hide_index=True
     )
     
+    # ── Image Diagnostics Expander ──────────────────────────────────────────────
+    if "image_diags" in st.session_state and st.session_state["image_diags"]:
+        with st.expander("🔬 Image Pipeline Diagnostics (click to expand)", expanded=False):
+            for diag in st.session_state["image_diags"]:
+                if not diag or not hasattr(diag, "ean"):
+                    continue
+                st.markdown(f"**EAN {diag.ean}** — {diag.summary_string()}")
+                if diag.text_log:
+                    st.code("\n".join(diag.text_log), language=None)
+                if diag.candidates:
+                    cand_df = pd.DataFrame(diag.to_dict_list())
+                    st.dataframe(cand_df, use_container_width=True, hide_index=True)
+                st.markdown("---")
+
     # Re-run selected rows
     rerun_rows = edited_df[edited_df["Re-run?"] == True]
     rerun_eans = rerun_rows["GTIN / EAN"].tolist()
