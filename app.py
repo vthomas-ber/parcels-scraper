@@ -498,7 +498,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model='gemini-2.5-flash',
+                model='gemini-3.5-flash',
                 contents=contents_payload,
                 config=types.GenerateContentConfig(
                     temperature=0.25,
