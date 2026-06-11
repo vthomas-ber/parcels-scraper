@@ -1271,33 +1271,31 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
     safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
 
     # ── Vision verification ───────────────────────────────────────────────────
-    # Rules:
-    #   TRUSTED sources (brand/retailer pages, not Amazon/eBay):
-    #     Vision is run as a quality signal, but a low score or API failure
-    #     does NOT reject the image — the source page is the primary trust
-    #     signal.  This preserves display behaviour for legitimate brand pages.
-    #   UNTRUSTED sources (SerpAPI image search results):
-    #     Vision is the primary gate.  Fail-closed: 0.0 on any error → reject.
-    #   Unknown product name ("Product with EAN …"):
-    #     Vision can't match against a generic label — skip it for trusted
-    #     sources and reject for untrusted.
+    # TRUSTED sources (brand/retailer pages that passed _is_excluded_domain):
+    #   These are scraped directly from known-good product pages.
+    #   Amazon/eBay are already blocked by effective_trusted above.
+    #   No vision verification — the source page is the trust signal.
+    #   This matches the original behaviour that kept images working.
     #
-    _product_known = (product_name and
-                      not product_name.startswith("Product with EAN"))
-    match_score = 0.5   # default neutral score
+    # UNTRUSTED sources (SerpAPI image search results):
+    #   Vision is the primary quality gate.  Fail-closed: 0.0 on any
+    #   error or API failure → reject.
+    #
+    match_score = 0.8   # default score for trusted sources
 
-    if gemini_key and _product_known:
-        verify_threshold = IMAGE_MATCH_THRESHOLD_TRUSTED if effective_trusted else IMAGE_MATCH_THRESHOLD
-        match_score = await asyncio.to_thread(
-            verify_image_with_gemini,
-            payload["data"], safe_mime, product_name, brand, gemini_key
-        )
-        if match_score < verify_threshold:
-            if not effective_trusted:
-                # Untrusted source failed vision — reject, preserve URL for link column
+    if not effective_trusted:
+        # Untrusted source — must pass vision
+        _product_known = (product_name and
+                          not product_name.startswith("Product with EAN"))
+        if gemini_key and _product_known:
+            match_score = await asyncio.to_thread(
+                verify_image_with_gemini,
+                payload["data"], safe_mime, product_name, brand, gemini_key
+            )
+            if match_score < IMAGE_MATCH_THRESHOLD:
                 diag.log_candidate(
                     source, used_url, "rejected_vision",
-                    f"Vision score {match_score:.2f} < threshold {verify_threshold:.2f} "
+                    f"Vision score {match_score:.2f} < {IMAGE_MATCH_THRESHOLD:.2f} "
                     f"for '{brand} {product_name}'",
                     width=inspection.get("width"), height=inspection.get("height")
                 )
@@ -1306,29 +1304,15 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
                     "source": source, "inspection": inspection,
                     "phash": None, "display": False, "match": match_score,
                 }
-            else:
-                # Trusted source: low vision score is a warning, not a blocker.
-                # The brand/retailer page origin is the trust signal.
-                diag.log(
-                    f"   ⚠️ Trusted source low vision score ({match_score:.2f} < "
-                    f"{verify_threshold:.2f}) — showing; source-page trust applies: "
-                    f"{used_url[:80]}"
-                )
-        else:
             diag.log(f"   ✅ Vision verified (score={match_score:.2f}): {used_url[:80]}")
-
-    elif not _product_known and not effective_trusted:
-        # Product name unknown AND source is untrusted — can't verify, reject
-        diag.log_candidate(source, used_url, "rejected_no_product_name",
-                           "Product name unknown — cannot verify untrusted image source")
-        return None
-
-    elif not gemini_key and not effective_trusted:
-        # No API key and untrusted source — reject
-        diag.log_candidate(source, used_url, "rejected_no_verify",
-                           "GEMINI_API_KEY not set — cannot verify untrusted image source")
-        return None
-    # else: effective_trusted=True, no key, or unknown product name → match_score=0.5
+        else:
+            # No key or unknown product name — can't verify untrusted source
+            reason = ("GEMINI_API_KEY not set" if not gemini_key
+                      else "Product name unknown")
+            diag.log_candidate(source, used_url, "rejected_no_verify", reason)
+            return None
+    else:
+        diag.log(f"   ✅ Trusted source — no vision gate: {used_url[:80]}")
 
     return {
         "url":        used_url,
@@ -2191,3 +2175,26 @@ if "results_df" in st.session_state:
                 st.session_state["results_df"] = base_df
                 st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
                 st.rerun()
+
+    # ── Image pipeline diagnostics ────────────────────────────────────────────
+    # Expandable panel showing exactly what happened in the image pipeline
+    # for each EAN: how many candidates were found, fetched, and why any
+    # were rejected.  Use this to debug missing or wrong images.
+    if "image_diags" in st.session_state:
+        with st.expander("🔬 Image pipeline diagnostics", expanded=False):
+            all_diags = st.session_state["image_diags"]
+            results_eans = (st.session_state["results_df"]["GTIN / EAN"].tolist()
+                            if "results_df" in st.session_state else [])
+            for i, diag_obj in enumerate(all_diags):
+                ean_label = results_eans[i] if i < len(results_eans) else f"EAN #{i+1}"
+                st.markdown(f"**{ean_label}** — {diag_obj.summary_string()}")
+                if diag_obj.text_log:
+                    st.text("\n".join(diag_obj.text_log))
+                cand_data = diag_obj.to_dict_list()
+                if cand_data:
+                    st.dataframe(
+                        pd.DataFrame(cand_data),
+                        hide_index=True,
+                        use_container_width=True,
+                    )
+                st.divider()
