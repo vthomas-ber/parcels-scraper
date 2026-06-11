@@ -27,43 +27,88 @@ import sqlite3
 
 DB_PATH = os.environ.get("CACHE_DB_PATH", "cache.db")
 
+
 def init_cache():
+    """
+    Creates the cache table if it does not exist, then runs a non-destructive
+    schema migration to add columns introduced in CACHE_VERSION 2.
+    Existing rows keep their data; new columns default to NULL / 0.
+    """
     con = sqlite3.connect(DB_PATH)
     con.execute("""
         CREATE TABLE IF NOT EXISTS ean_cache (
-            ean TEXT NOT NULL,
-            market TEXT NOT NULL,
+            ean         TEXT NOT NULL,
+            market      TEXT NOT NULL,
             result_json TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            status      TEXT    DEFAULT 'unknown',
+            confidence  REAL    DEFAULT 0.0,
+            version     INTEGER DEFAULT 1,
+            created_at  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY (ean, market)
         )
     """)
+    # Non-destructive migration: add v2 columns to tables created under v1.
+    # SQLite does not support IF NOT EXISTS on ALTER TABLE, so we catch the
+    # OperationalError that fires when the column already exists.
+    for col, defn in [
+        ("status",     "TEXT DEFAULT 'unknown'"),
+        ("confidence", "REAL DEFAULT 0.0"),
+        ("version",    "INTEGER DEFAULT 1"),
+    ]:
+        try:
+            con.execute(f"ALTER TABLE ean_cache ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass  # column already present — nothing to do
     con.commit()
     con.close()
 
+
 def cache_get(ean: str, market: str):
+    """
+    Return a cached result only if it was stored under the current schema version
+    AND its status was 'Success'.  Any other entry (error, failed-validation,
+    needs-review, wrong schema version) is treated as a miss so the EAN is
+    re-queried fresh.
+
+    NOTE: On first deployment after upgrading to CACHE_VERSION 2, ALL existing
+    entries will be invalidated because their version column is NULL / 1.
+    This is intentional — the extraction prompt and source rules have changed
+    significantly, so stale entries must not be served as authoritative data.
+    """
     try:
         con = sqlite3.connect(DB_PATH)
         row = con.execute(
-            "SELECT result_json FROM ean_cache WHERE ean=? AND market=?",
+            "SELECT result_json, status, version FROM ean_cache WHERE ean=? AND market=?",
             (ean, market)
         ).fetchone()
         con.close()
-        return json.loads(row[0]) if row else None
+        if not row:
+            return None
+        result_json, status, version = row
+        if version != CACHE_VERSION:
+            return None           # stale schema — re-query
+        if status != "Success":
+            return None           # don't serve errors / reviews from cache
+        return json.loads(result_json)
     except Exception:
         return None
 
-def cache_set(ean: str, market: str, result_dict: dict):
+
+def cache_set(ean: str, market: str, result_dict: dict,
+              status: str = "unknown", confidence: float = 0.0):
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
-            "INSERT OR REPLACE INTO ean_cache (ean, market, result_json) VALUES (?,?,?)",
-            (ean, market, json.dumps(result_dict))
+            """INSERT OR REPLACE INTO ean_cache
+               (ean, market, result_json, status, confidence, version)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (ean, market, json.dumps(result_dict), status, confidence, CACHE_VERSION)
         )
         con.commit()
         con.close()
     except Exception:
         pass
+
 
 def cache_delete(ean: str, market: str):
     try:
@@ -76,6 +121,129 @@ def cache_delete(ean: str, market: str):
         con.close()
     except Exception:
         pass
+
+
+# ============================================================================
+# MODEL & QUALITY CONSTANTS
+# Update model strings here when migrating — never scatter them across the file.
+# ============================================================================
+
+# Food data extraction: uses Google Search grounding + full JSON output
+EXTRACTION_MODEL = "gemini-2.5-flash"
+
+# Image identity verification: vision-only, no grounding needed, must be cheap & fast
+# gemini-2.0-flash-lite was SHUT DOWN on 2026-06-01. gemini-2.5-flash-lite is the
+# direct replacement at the same price point ($0.10/$0.40 per 1M tokens) with
+# better multimodal understanding and a stable 2.5 lifecycle.
+VISION_MODEL = "gemini-2.5-flash-lite"
+
+# Bump this whenever the extraction prompt or cache schema changes significantly.
+# All rows stored under a lower version are treated as cache misses on first load.
+CACHE_VERSION = 2
+
+# Minimum vision confidence score (0.0–1.0) required to display an image.
+# Candidates below this threshold are rejected; their URL is preserved in
+# Image Source Link so users can visit the page manually.
+IMAGE_MATCH_THRESHOLD = 0.55
+
+# Lower threshold applied to images from pages that were EAN-verified
+# (i.e. the retailer/brand page's HTML confirmed it contained the queried EAN).
+# These images are more trustworthy, so a slightly more lenient gate is appropriate.
+IMAGE_MATCH_THRESHOLD_TRUSTED = 0.35
+
+
+# ============================================================================
+# HARD-EXCLUDED DOMAINS
+# These sources are NEVER used for food information or product images.
+# Amazon and eBay: marketplaces with reseller-submitted, unverified content.
+# OpenFoodFacts: open-source user-generated database.
+# Add or remove tokens here to maintain the exclusion list centrally.
+# ============================================================================
+
+_EXCLUDED_DOMAIN_TOKENS: tuple = (
+    "amazon.",       # covers amazon.com, amazon.co.uk, amazon.de, etc.
+    "ebay.",         # covers ebay.com, ebay.co.uk, ebay.de, etc.
+    "openfoodfacts.",
+    "aliexpress.",
+    "alibaba.",
+)
+
+
+def _is_excluded_domain(url: str) -> bool:
+    """
+    Returns True if the URL belongs to a hard-excluded marketplace or
+    user-generated source.  Checks by substring so it catches all TLDs
+    (amazon.co.uk, ebay.de, …) and CDN subdomains (m.media-amazon.com, etc.).
+    """
+    if not url:
+        return False
+    url_lower = url.lower()
+    return any(token in url_lower for token in _EXCLUDED_DOMAIN_TOKENS)
+
+
+# ============================================================================
+# BARCODE & IDENTITY UTILITIES
+# ============================================================================
+
+def valid_gtin(ean: str) -> bool:
+    """
+    Luhn / mod-10 check-digit validation for EAN-8, EAN-13, EAN-14, UPC-12.
+    Returns False for barcodes that fail the check digit, preventing wasted
+    API calls on OCR-mangled or mistyped codes.
+    """
+    if not ean.isdigit() or len(ean) not in (8, 12, 13, 14):
+        return False
+    digits = [int(c) for c in ean]
+    check  = digits[-1]
+    body   = digits[:-1][::-1]
+    total  = sum(d * (3 if i % 2 == 0 else 1) for i, d in enumerate(body))
+    return (10 - total % 10) % 10 == check
+
+
+def barcode_matches(returned_barcode: str, queried_ean: str) -> bool:
+    """
+    Compare a source's returned barcode against the queried EAN.
+    Normalises leading zeros so '0012345678905' and '12345678905' match.
+    """
+    if not returned_barcode:
+        return False
+    return (str(returned_barcode).strip().lstrip("0")
+            == str(queried_ean).strip().lstrip("0"))
+
+
+async def page_contains_ean(session, url: str, ean: str) -> bool:
+    """
+    Fetch the first 200 KB of a page and check whether the EAN appears in
+    the raw HTML.  Used to verify a brand/retailer page actually references
+    the product before we trust OG/JSON-LD images from it.
+    Fails closed: returns False on any network or parsing error.
+    """
+    _ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/122.0.0.0 Safari/537.36")
+    try:
+        async with session.get(url, headers={"User-Agent": _ua}, timeout=8) as r:
+            if r.status != 200:
+                return False
+            raw  = await r.content.read(200_000)      # max 200 KB
+            text = raw.decode("utf-8", errors="ignore")
+            return ean in text or ean.lstrip("0") in text
+    except Exception:
+        return False
+
+
+# ============================================================================
+# CACHE POLICY
+# ============================================================================
+
+def should_cache(status: str) -> bool:
+    """
+    Only persist confident successes.  Errors, failed validation, and
+    'Needs Review' results must be re-evaluated on next lookup.
+    A cache miss is always safer than a stale wrong answer.
+    """
+    return status == "Success"
+
 
 # ============================================================================
 # SHARED CONSTANTS (used by both pipelines)
@@ -99,25 +267,27 @@ GOLDMINE = {
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
 # ============================================================================
-# PATH A: ORIGINAL FOOD EXTRACTION PIPELINE (UNCHANGED FROM YOUR ORIGINAL)
+# PATH A: FOOD EXTRACTION PIPELINE
 # ============================================================================
-# Everything in this section is your original code, byte-for-byte.
-# It handles: name lookup, image gathering for Gemini, the Gemini call.
-# DO NOT modify this section - it's working well for food info extraction.
 
 BAD_IMAGE_EXTENSIONS = {".svg", ".gif", ".ico", ".webmanifest", ".json", ".xml"}
 BAD_IMAGE_PATTERNS = [
     "logo", "icon", "banner", "placeholder", "spinner", "loading",
     "payment", "paypal", "mastercard", "visa", "flag", "star",
     "cart", "account", "arrow", "check", "tick", "social",
+    # Hard-excluded sources — images from these are never used
     "openfoodfacts", "pinterest", "ebay", "tiktok", "facebook",
     "instagram", "twitter", "youtube", "amazon-ads", "ad_",
     "s192", "width=250", "160x160", "200x200", "250x250", "300x300",
     "50x50", "75x30", "100x100", "128x128", "150x150", "_xs", "_xxs", "thumbnail"
 ]
 
+
 def _is_valid_image_url(url: str) -> bool:
     if not url or not url.startswith("http"):
+        return False
+    # Hard-exclude marketplace / UGC image URLs
+    if _is_excluded_domain(url):
         return False
     url_lower = url.lower()
     path = url_lower.split("?")[0]
@@ -130,6 +300,7 @@ def _is_valid_image_url(url: str) -> bool:
 
     return True
 
+
 @st.cache_data
 def load_taxonomy():
     """Loads the taxonomy CSV into memory once to prevent repeated disk I/O."""
@@ -139,8 +310,11 @@ def load_taxonomy():
     except FileNotFoundError:
         return "Level 1,Level 2,Level 3,Level 4,Level 5,Level 6\nError: taxonomy.csv not found."
 
+
 async def fetch_og_image(session, url):
     """Visits a retailer URL and extracts the high-quality Open Graph image."""
+    if _is_excluded_domain(url):
+        return None
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
@@ -150,45 +324,44 @@ async def fetch_og_image(session, url):
                 html = await resp.text()
                 match = re.search(r'<meta[^>]*property=[\'"]og:image[\'"][^>]*content=[\'"]([^\'"]+)[\'"]', html, re.IGNORECASE)
                 if match:
-                    return match.group(1)
+                    img_url = match.group(1)
+                    if not _is_excluded_domain(img_url):
+                        return img_url
     except Exception:
         pass
     return None
+
 
 GEMINI_SUPPORTED_MIMES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 MAGIC_BYTES_MAP = [
     (b"\xff\xd8\xff",       "image/jpeg"),
     (b"\x89PNG\r\n\x1a\n", "image/png"),
-    (b"RIFF",               "image/webp"),   # needs extra check but good enough
+    (b"RIFF",               "image/webp"),
     (b"GIF87a",             "image/gif"),
     (b"GIF89a",             "image/gif"),
 ]
 
+
 def _sniff_mime(data: bytes) -> str | None:
-    """Detect image type from magic bytes. Returns None if unrecognised."""
     for magic, mime in MAGIC_BYTES_MAP:
         if data[:len(magic)] == magic:
             return mime
     return None
 
+
 def _safe_mime(raw_mime: str, data: bytes) -> str | None:
-    """
-    Return a Gemini-safe MIME type or None if the image should be skipped.
-    1. Strip content-type parameters (e.g. 'image/jpeg; charset=utf-8' → 'image/jpeg')
-    2. If the cleaned type is supported, use it.
-    3. If it's octet-stream / unknown, sniff from magic bytes.
-    4. If still unresolvable, return None so the caller can skip the image.
-    """
     clean = raw_mime.split(";")[0].strip().lower() if raw_mime else ""
     if clean in GEMINI_SUPPORTED_MIMES:
         return clean
-    # Fall back to magic-byte sniffing
     sniffed = _sniff_mime(data)
-    return sniffed  # may be None → caller should skip
+    return sniffed
+
 
 async def fetch_image_bytes_simple(session, url):
-    """Original image fetcher used by the food extraction pipeline. Lenient by design."""
+    """Image fetcher used by the food extraction pipeline."""
+    if _is_excluded_domain(url):
+        return None
     try:
         async with session.get(url, timeout=10) as resp:
             if resp.status == 200:
@@ -198,24 +371,36 @@ async def fetch_image_bytes_simple(session, url):
                 raw_mime = resp.headers.get("content-type", "")
                 mime = _safe_mime(raw_mime, data)
                 if mime is None:
-                    return None  # skip — Gemini would reject this
+                    return None
                 return {"url": url, "mime": mime, "data": data}
     except Exception:
         pass
     return None
 
+
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_ground_truth=""):
-    """ORIGINAL: Retrieves exact product name and performs deduplicated, size-verified image gathering for Gemini."""
-    gl = market_code.lower()
+    """
+    Path A: Resolves the product name and gathers images for Gemini extraction.
+
+    Returns: (product_name, images, diagnostic_log, ean_verified)
+      - ean_verified: True when the EAN was confirmed via a barcode-registry
+        match (EAN-Search) or when the brand page's HTML contained the EAN.
+        Used downstream to determine whether to cache as 'Success' or flag
+        for review.
+    """
+    gl           = market_code.lower()
     market_upper = market_code.upper()
     diagnostic_log = []
 
-    product_name = None
-    retailer_urls = []
+    product_name       = None
+    retailer_urls      = []
     candidate_image_urls = []
     registry_image_url = None
+    ean_verified       = False   # set True only when barcode is confirmed
 
-    # ATTEMPT 1: EAN-Search API
+    serp_url = "https://serpapi.com/search"
+
+    # ── ATTEMPT 1: EAN-Search registry (barcode-anchored by construction) ──
     if ean_token:
         diagnostic_log.append("🔍 Attempt 1: EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
@@ -224,19 +409,27 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
                 if resp.status == 200:
                     data = await resp.json()
                     if data and len(data) > 0 and "error" not in data[0]:
-                        product_name = data[0].get("name")
-                        registry_image_url = data[0].get("image")
-                        diagnostic_log.append(f"✅ Found Name via EAN-Search: {product_name}")
+                        returned_barcode = str(data[0].get("barcode", data[0].get("ean", "")))
+                        candidate_name   = data[0].get("name", "")
+                        if barcode_matches(returned_barcode, ean):
+                            ean_verified = True
+                            if not is_garbage_name(candidate_name):
+                                product_name       = candidate_name
+                                registry_image_url = data[0].get("image")
+                                diagnostic_log.append(f"✅ EAN-Search barcode verified: {product_name}")
+                            else:
+                                diagnostic_log.append("✅ EAN-Search barcode verified (name discarded — garbage pattern)")
+                        else:
+                            diagnostic_log.append(
+                                f"⚠️ EAN-Search barcode mismatch "
+                                f"(queried={ean}, returned={returned_barcode}) — name discarded"
+                            )
         except Exception as e:
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
 
-    # ATTEMPT 2: Brand-site lookup (if brand provided in ground_truth)
-    # This runs BEFORE goldmine so direct brand pages are prioritised as sources.
+    # ── ATTEMPT 2: Brand-site lookup (if brand token in ground truth) ──
     brand_domain = None
-    serp_url = "https://serpapi.com/search"
     if serp_key and user_ground_truth:
-        # Extract a single-word brand candidate: first capitalised token in ground_truth
-        import re as _re
         brand_candidate = _extract_brand(user_ground_truth)
         if brand_candidate:
             diagnostic_log.append(f"🔍 Brand-site lookup for '{brand_candidate}'...")
@@ -247,47 +440,69 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
                 }, timeout=10) as resp:
                     data = await resp.json()
                     organic = data.get("organic_results", [])
-                    # Look for a result whose domain contains the brand name (case-insensitive)
                     for res in organic[:5]:
-                        link = res.get("link", "")
+                        link   = res.get("link", "")
                         domain = link.split("/")[2] if link.startswith("http") else ""
+                        # Hard guard: never treat Amazon/eBay as a brand domain
+                        if _is_excluded_domain(link):
+                            continue
                         if brand_candidate.lower() in domain.lower():
-                            if not product_name:
-                                product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
-                                diagnostic_log.append(f"✅ Found Name via brand-site: {product_name}")
-                            if link not in retailer_urls:
-                                retailer_urls.insert(0, link)  # brand page goes FIRST
-                            brand_domain = domain
-                            diagnostic_log.append(f"✅ Brand domain found: {brand_domain}")
+                            # Only trust this page if the EAN appears in its HTML
+                            ean_on_page = await page_contains_ean(session, link, ean)
+                            if ean_on_page:
+                                if not product_name:
+                                    product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
+                                    diagnostic_log.append(f"✅ Brand page EAN verified — name: {product_name}")
+                                if not ean_verified:
+                                    ean_verified = True
+                                if link not in retailer_urls:
+                                    retailer_urls.insert(0, link)
+                                brand_domain = domain
+                            else:
+                                diagnostic_log.append(
+                                    f"⚠️ Brand page found ({domain}) but EAN not in page HTML — "
+                                    f"adding as retailer URL but not using as identity source"
+                                )
+                                if link not in retailer_urls:
+                                    retailer_urls.insert(0, link)
+                                brand_domain = domain
                             break
             except Exception as e:
                 diagnostic_log.append(f"⚠️ Brand-site lookup failed: {e}")
 
-    # ATTEMPT 3: SerpAPI Text Search (Goldmine retailers)
+    # ── ATTEMPT 3: SerpAPI goldmine (tier-1 retailers for this market) ──
     if not product_name and serp_key:
         diagnostic_log.append("🔍 Goldmine Google Search for Name...")
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
-
         try:
             async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data = await resp.json()
+                data    = await resp.json()
                 organic = data.get("organic_results", [])
                 if organic:
                     product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
-                    new_urls = [res.get("link") for res in organic[:4] if "link" in res]
+                    if is_garbage_name(product_name):
+                        product_name = None
+                        diagnostic_log.append("⚠️ Goldmine name looks like a garbage/placeholder — discarded")
+                    else:
+                        diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
+                    new_urls = [res.get("link") for res in organic[:4] if "link" in res
+                                and not _is_excluded_domain(res.get("link", ""))]
                     for u in new_urls:
                         if u not in retailer_urls:
                             retailer_urls.append(u)
                 else:
-                    diagnostic_log.append("⚠️ Goldmine failed, falling back to global bare GTIN search...")
+                    # ── ATTEMPT 4: Bare GTIN global fallback (low-confidence) ──
+                    diagnostic_log.append("⚠️ Goldmine returned nothing — bare GTIN global fallback (low confidence)...")
                     async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
-                        data2 = await resp2.json()
+                        data2    = await resp2.json()
                         organic2 = data2.get("organic_results", [])
                         if organic2:
-                            product_name = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                            diagnostic_log.append(f"✅ Found Name via Global Search: {product_name}")
-                            new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res]
+                            candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
+                            if not is_garbage_name(candidate):
+                                product_name = candidate
+                                diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
+                            new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
+                                         and not _is_excluded_domain(res.get("link", ""))]
                             for u in new_urls2:
                                 if u not in retailer_urls:
                                     retailer_urls.append(u)
@@ -295,14 +510,13 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
     if not product_name:
-        diagnostic_log.append("⚠️ Name not found via databases. Relying entirely on Gemini...")
+        diagnostic_log.append("⚠️ Name not found via any source — Gemini will attempt EAN-grounded search.")
         product_name = f"Product with EAN {ean}"
 
-    # GATHERING CANDIDATE IMAGES (for Gemini extraction - lenient, original logic)
-
+    # ── GATHER CANDIDATE IMAGES FOR GEMINI (lenient — Gemini validates these) ──
     if retailer_urls:
-        diagnostic_log.append("🌐 Scraping OG images directly from Retailers...")
-        tasks = [fetch_og_image(session, url) for url in retailer_urls]
+        diagnostic_log.append("🌐 Scraping OG images from approved retailer pages...")
+        tasks     = [fetch_og_image(session, url) for url in retailer_urls]
         og_images = await asyncio.gather(*tasks)
         for img in og_images:
             if img and _is_valid_image_url(img) and img not in candidate_image_urls:
@@ -310,7 +524,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
 
     if serp_key:
         diagnostic_log.append("🖼️ Searching high-res images via Google Images...")
-        serp_url = "https://serpapi.com/search"
         try:
             r1, r2 = await asyncio.gather(
                 session.get(serp_url, params={"q": f'"{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
@@ -324,38 +537,43 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
                         url = item.get("original", "")
                         if _is_valid_image_url(url) and url not in candidate_image_urls:
                             candidate_image_urls.append(url)
-        except Exception as e:
+        except Exception:
             pass
 
     if registry_image_url and _is_valid_image_url(registry_image_url) and registry_image_url not in candidate_image_urls:
         candidate_image_urls.append(registry_image_url)
 
-    # DOWNLOADING, SIZING, AND DEDUPLICATING IMAGES (for Gemini)
+    # ── DOWNLOAD, SIZE, AND DEDUPLICATE IMAGES (for Gemini) ──
     final_downloaded_images = []
     seen_b64_prefixes = []
 
     for url in candidate_image_urls:
         if len(final_downloaded_images) >= 2:
             break
-
         img_payload = await fetch_image_bytes_simple(session, url)
         if not img_payload:
             continue
-
         prefix = img_payload["data"][:120]
         if prefix in seen_b64_prefixes:
             continue
-
         seen_b64_prefixes.append(prefix)
         final_downloaded_images.append(img_payload)
 
-    diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} distinct image(s) for Gemini extraction.")
-    return product_name, final_downloaded_images, "\n".join(diagnostic_log)
+    diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} image(s) for Gemini extraction.")
+    return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified
 
 
-def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, image_bytes_list, user_ground_truth):
-    """ORIGINAL: Gemini call with the original prompt - untouched from your working version."""
-    market_upper = market_code.upper()
+def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
+                    image_bytes_list, user_ground_truth):
+    """
+    Path A: Sends the resolved product name + images to Gemini for structured
+    food data extraction.  Uses Google Search grounding so Gemini can reach
+    tier-1 retailer and brand pages directly.
+
+    Source exclusion rules are enforced both in this prompt and in the
+    Python-side domain blocklist (_is_excluded_domain).
+    """
+    market_upper  = market_code.upper()
     goldmine_sites = GOLDMINE.get(market_upper, "Major Tier-1 Supermarkets")
 
     prompt = f"""
@@ -366,15 +584,22 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     MARKET: {market_code}
 
     CORE DIRECTIVES:
-    0. VALIDATION GATE (THE BOUNCER): Look at the "USER INPUT (GROUND TRUTH)". If it is empty, proceed normally. If it contains text (like a brand, name, or weight), compare it to the product data you found online for this EAN. They MUST be the same product — but allow for minor formatting differences such as abbreviations, capitalisation, punctuation, and language translation. Only set "is_exact_match" to false if there is a CLEAR, MEANINGFUL mismatch: e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g', or the brand is completely different, or the weight differs by more than 20%. Do NOT fail validation for cosmetic name differences (e.g. 'da 100 gr.' vs '100g', or 'al Cioccolato' vs 'Al Cioccolato Fondente'). If it matches or is a cosmetic difference, set "is_exact_match" to true and extract the data.
-    1. ACCURACY: You have access to Google Search. You MUST prioritize official brand websites and major tier-1 retailers.
-    2. SOURCE EXCLUSION: AVOID openfoodfacts.org, wikis, or open-source databases. Only use them as an absolute last resort.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below to ensure database consistency.
+    0. VALIDATION GATE (THE BOUNCER): First and foremost, confirm that the product data you find online genuinely corresponds to EAN/barcode {ean}. If you find a product but its barcode, EAN, or GTIN does not match {ean}, set "is_exact_match" to false immediately and explain. Then, look at "USER INPUT (GROUND TRUTH)". If it is empty, proceed with the verified EAN data. If it contains text (like a brand, name, or weight), compare it to the product data you found for EAN {ean}. They MUST be the same product — but allow for minor formatting differences (abbreviations, capitalisation, punctuation, language translation). Only set "is_exact_match" to false for a CLEAR, MEANINGFUL mismatch: e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g', brand is completely different, or weight differs by more than 20%. Do NOT fail for cosmetic differences (e.g. 'da 100 gr.' vs '100g'). A null result or failed validation is always better than wrong data presented as correct.
+    1. ACCURACY: You have access to Google Search. You MUST prioritise official brand websites and approved tier-1 retailers only.
+    2. SOURCE EXCLUSION (HARD CONSTRAINT): The following sources are STRICTLY FORBIDDEN — do NOT use them under any circumstances, even as a last resort:
+       - Amazon (any amazon.* domain or subdomain including amazon.com, amazon.co.uk, amazon.de, etc.)
+       - eBay (any ebay.* domain or subdomain including ebay.com, ebay.co.uk, ebay.de, etc.)
+       - openfoodfacts.org or any Open Food Facts mirror or API
+       - barcodelookup.com, go-upc.com, or similar barcode aggregator sites
+       - Any wiki (including Wikipedia), forum, Reddit, social media, or user-generated database
+       - Any marketplace, reseller, third-party seller, or affiliate page
+       ONLY approved sources: official brand website and the Tier-1 retailers listed below.
+    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below.
     4. MISSING DATA & SOURCE CASCADE: You MUST try to fill every field. Follow this cascade:
         STEP 1 — Official brand website (highest priority). Extract everything available.
         STEP 2 — If ANY field is still null after Step 1, search the Tier-1 retailers for {market_code}: {goldmine_sites}. Cross-reference and fill any remaining nulls.
-        STEP 3 — If ANY field is still null after Step 2, search global databases (barcodelookup.com, go-upc.com, Open Food Facts as last resort).
-        STEP 4 — If a field is genuinely not available anywhere after all 3 steps, return "null". Do NOT guess nutritional values. Do NOT invent ingredients.
+        STEP 3 — If a field is STILL null after Steps 1 and 2, return "null" for that field. Do NOT fall back to forbidden sources (Amazon, eBay, Open Food Facts, barcodelookup, go-upc, wikis, forums, or any marketplace). Returning "null" is always better than data from a forbidden or unverified source.
+        STEP 4 — Do NOT guess nutritional values. Do NOT invent ingredients. Do NOT copy from similar products.
         IMPORTANT: A brand page that has ingredients but no nutrition table is NOT a complete source. Continue to Step 2 for the missing fields.
         Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
     5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
@@ -390,7 +615,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         - Solid food items, snacks, and meals → Food.
     6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
-    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 site. Explain your choice in the reliability_reasoning field.
+    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other approved retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 approved site or if the source is uncertain. Explain your choice in the reliability_reasoning field.
     9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. Treat this as a mandatory True/False checklist for every single tag to ensure maximum consistency across outputs.
         EU REGULATORY TAG DEFINITIONS — apply tags ONLY when the product meets these thresholds:
         DIETARY TAGS (EU Regulation 1169/2011 & Regulation 432/2012):
@@ -443,7 +668,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     SCHEMA:
     {{
         "is_exact_match": true or false,
-        "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images.",
+        "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images. Include which sources you used and confirm EAN match.",
         "food_info_reliability": "H, M, or L",
         "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
         "category_1": "Level 1 Category (English)",
@@ -481,7 +706,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
         "protein_g": "Value",
         "fiber_g": "Value",
         "salt_g": "Value",
-        "sources": ["Array of full URLs (starting with https://) you visited to find this data"]
+        "sources": ["Array of full URLs (starting with https://) from approved sources only — NO Amazon, eBay, OpenFoodFacts, or any forbidden domain"]
     }}
     """
 
@@ -498,12 +723,15 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model='gemini-3.5-flash',
+                model=EXTRACTION_MODEL,
                 contents=contents_payload,
                 config=types.GenerateContentConfig(
                     temperature=0.25,
                     tools=[{"google_search": {}}],
                     max_output_tokens=8192,
+                    # NOTE: To disable thinking tokens on gemini-2.5-flash and control costs,
+                    # uncomment the line below (requires google-genai >= 0.8.0):
+                    # thinking_config=types.ThinkingConfig(thinking_budget=0),
                     safety_settings=[
                         types.SafetySetting(
                             category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -541,25 +769,24 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
             raw_text = raw_text.strip() if raw_text else ""
 
             if not raw_text:
-                candidate = response.candidates[0]
+                candidate    = response.candidates[0]
                 finish_reason = candidate.finish_reason
                 raise Exception(f"Empty text extracted. Reason: {finish_reason}")
 
-            working_urls = []
+            # ── Collect grounding redirect URLs as supplementary source references ──
+            grounding_urls = []
             try:
                 if response.candidates and response.candidates[0].grounding_metadata:
                     metadata = response.candidates[0].grounding_metadata
                     if metadata.grounding_chunks:
                         for chunk in metadata.grounding_chunks:
                             if chunk.web and chunk.web.uri:
-                                working_urls.append(chunk.web.uri)
+                                grounding_urls.append(chunk.web.uri)
             except Exception:
                 pass
 
-            unique_urls = list(dict.fromkeys(working_urls))
-
             start_idx = raw_text.find('{')
-            end_idx = raw_text.rfind('}')
+            end_idx   = raw_text.rfind('}')
 
             if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
                 clean_json = raw_text[start_idx:end_idx+1]
@@ -569,12 +796,22 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
 
             data = json.loads(clean_json, strict=False)
 
-            if unique_urls:
-                data["sources"] = unique_urls
-            elif isinstance(data.get("sources"), str):
-                data["sources"] = [s.strip() for s in data.get("sources").split(",") if s.strip()]
-            elif not isinstance(data.get("sources"), list):
-                data["sources"] = []
+            # ── Merge sources: model-claimed URLs first, grounding redirects appended ──
+            # Model sources are the real claimed domains; grounding redirects are
+            # supplementary references (Vertex redirect URLs, not real domains).
+            # Filter out any forbidden domains from model-claimed sources.
+            model_sources = data.get("sources", [])
+            if isinstance(model_sources, str):
+                model_sources = [s.strip() for s in model_sources.split(",") if s.strip()]
+            elif not isinstance(model_sources, list):
+                model_sources = []
+
+            # Hard filter: remove any forbidden domains that Gemini may have included
+            model_sources = [s for s in model_sources if not _is_excluded_domain(s)]
+
+            # Merge: model sources take priority; grounding redirects appended as refs
+            all_sources = list(dict.fromkeys([*model_sources, *grounding_urls]))
+            data["sources"] = all_sources
 
             return data
 
@@ -590,17 +827,14 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text, i
 
 
 # ============================================================================
-# PATH B: NEW IMAGE DISPLAY PIPELINE (separate from food extraction)
+# PATH B: DISPLAY IMAGE PIPELINE
 # ============================================================================
-# This pipeline ONLY produces the 2 images shown in the results table + diagnostics.
-# It does NOT touch food extraction in any way.
-# Runs in parallel with Path A so total time is unchanged.
 
-DISPLAY_MIN_LONG_EDGE_PX = 120  # relaxed: Google thumbnails are ~150-200px, still useful for display table
-DISPLAY_ASPECT_MIN = 0.3
-DISPLAY_ASPECT_MAX = 3.0
+DISPLAY_MIN_LONG_EDGE_PX       = 120
+DISPLAY_ASPECT_MIN             = 0.3
+DISPLAY_ASPECT_MAX             = 3.0
 DISPLAY_PHASH_DUPLICATE_THRESHOLD = 5
-MAX_DISPLAY_IMAGES = 2
+MAX_DISPLAY_IMAGES             = 2
 
 DISPLAY_BAD_PATH_TOKENS = {
     "logo", "icon", "banner", "placeholder", "spinner", "loading",
@@ -608,19 +842,35 @@ DISPLAY_BAD_PATH_TOKENS = {
     "pinterest", "tiktok", "facebook", "instagram", "twitter", "youtube",
     "thumbnail", "thumb", "avatar", "favicon", "sprite",
 }
+
+# Hard-excluded domain substrings for image URLs.
+# This covers product image CDNs as well as storefront URLs.
 DISPLAY_BAD_SUBSTRINGS = {
-    "openfoodfacts", "amazon-ads", "ad_servlet", "doubleclick",
+    # ── Forbidden marketplaces and UGC databases ──
+    "openfoodfacts",
+    # Amazon — storefront domains and product image CDNs
+    "amazon.com", "amazon.co.uk", "amazon.de", "amazon.fr",
+    "amazon.it", "amazon.es", "amazon.nl", "amazon.pl", "amazon.be",
+    "amazon.se", "amazon.dk", "amazon.at",
+    "m.media-amazon.com", "images-amazon.com", "media-amazon.com",
+    # eBay — storefront domains and image CDN
+    "ebay.com", "ebay.co.uk", "ebay.de", "ebay.fr",
+    "ebay.it", "ebay.es", "ebay.nl", "ebay.pl", "ebay.be",
+    "i.ebayimg.com", "ebayimg.com",
+    # ── Ad networks ──
+    "amazon-ads", "ad_servlet", "doubleclick",
+    # ── Size indicators ──
     "_xs.", "_xxs.", "/icons/", "/logos/",
 }
 
 DISPLAY_SOURCE_PRIORITY = {
-    "jsonld_retailer": 100,
-    "og_retailer": 80,
-    "twitter_retailer": 70,
-    "serpapi_strict": 60,
-    "serpapi_barcode": 55,
-    "serpapi_name": 50,
-    "serpapi_hailmary": 45,
+    "jsonld_retailer":  100,
+    "og_retailer":       80,
+    "twitter_retailer":  70,
+    "serpapi_strict":    60,
+    "serpapi_barcode":   55,
+    "serpapi_name":      50,
+    "serpapi_hailmary":  45,
     "ean_search_registry": 40,
 }
 
@@ -644,22 +894,25 @@ def is_garbage_name(name: str) -> bool:
 
 
 def _check_display_url(url: str):
-    """URL filter for the DISPLAY pipeline only. Returns (is_valid, reject_reason)."""
+    """URL filter for the display pipeline. Returns (is_valid, reject_reason)."""
     if not url or not url.startswith("http"):
         return False, "Not a valid http(s) URL"
+    # Hard-exclude marketplace / UGC domains before any other check
+    if _is_excluded_domain(url):
+        return False, f"Hard-excluded domain (marketplace/UGC): {url[:80]}"
     url_lower = url.lower()
-    path = url_lower.split("?")[0]
+    path      = url_lower.split("?")[0]
 
     for ext in BAD_IMAGE_EXTENSIONS:
         if path.endswith(ext):
             return False, f"Bad extension: {ext}"
     for substr in DISPLAY_BAD_SUBSTRINGS:
         if substr in url_lower:
-            return False, f"Substring blacklist: '{substr}'"
+            return False, f"Domain/substring blocklist: '{substr}'"
     tokens = set(re.split(r"[/_\-.]+", path))
     for token in tokens:
         if token in DISPLAY_BAD_PATH_TOKENS:
-            return False, f"Path token blacklist: '{token}'"
+            return False, f"Path token blocklist: '{token}'"
     if "media-amazon.com" in url_lower and ("," in url_lower or "_bo" in url_lower):
         return False, "Amazon UI composite (commas / _bo modifier)"
     return True, ""
@@ -669,9 +922,9 @@ class ImageDiagnostics:
     """Per-EAN diagnostics for the display image pipeline."""
 
     def __init__(self, ean):
-        self.ean = ean
-        self.text_log = []
-        self.candidates = []
+        self.ean            = ean
+        self.text_log       = []
+        self.candidates     = []
         self.final_selected = []
         self.image_2_failure = ""
 
@@ -680,13 +933,13 @@ class ImageDiagnostics:
 
     def log_candidate(self, source, url, status, reason="", width=None, height=None):
         self.candidates.append({
-            "source": source,
-            "url": url[:120] + "..." if len(url) > 120 else url,
+            "source":   source,
+            "url":      url[:120] + "..." if len(url) > 120 else url,
             "full_url": url,
-            "status": status,
-            "reason": reason,
-            "width": width,
-            "height": height,
+            "status":   status,
+            "reason":   reason,
+            "width":    width,
+            "height":   height,
         })
 
     def status_counts(self):
@@ -697,23 +950,27 @@ class ImageDiagnostics:
 
     def summary_string(self):
         counts = self.status_counts()
-        parts = [f"{k}={v}" for k, v in counts.items()]
-        return f"Selected {len(self.final_selected)}/{MAX_DISPLAY_IMAGES} images from {len(self.candidates)} candidates. " + ", ".join(parts)
+        parts  = [f"{k}={v}" for k, v in counts.items()]
+        return (f"Selected {len(self.final_selected)}/{MAX_DISPLAY_IMAGES} images "
+                f"from {len(self.candidates)} candidates. " + ", ".join(parts))
 
     def to_dict_list(self):
         return [{
             "Source": c["source"],
             "Status": c["status"],
             "Reason": c["reason"],
-            "Width": c["width"],
+            "Width":  c["width"],
             "Height": c["height"],
-            "URL": c["url"],
+            "URL":    c["url"],
         } for c in self.candidates]
 
 
 async def display_extract_from_page(session, url):
     """Scrape JSON-LD + OG + Twitter images from a retailer page."""
-    images = []
+    # Hard guard: never scrape excluded marketplace pages
+    if _is_excluded_domain(url):
+        return []
+    images  = []
     headers = {"User-Agent": DISPLAY_USER_AGENTS[0]}
     try:
         async with session.get(url, headers=headers, timeout=8) as resp:
@@ -726,7 +983,7 @@ async def display_extract_from_page(session, url):
                 html, re.S | re.I
             ):
                 try:
-                    data = json.loads(match.group(1).strip())
+                    data  = json.loads(match.group(1).strip())
                     items = data if isinstance(data, list) else [data]
                     expanded = []
                     for it in items:
@@ -737,33 +994,34 @@ async def display_extract_from_page(session, url):
                     for item in expanded:
                         if not isinstance(item, dict):
                             continue
-                        item_type = item.get("@type", "")
-                        is_product = ("Product" in item_type) if isinstance(item_type, list) else (item_type == "Product")
+                        item_type  = item.get("@type", "")
+                        is_product = (("Product" in item_type) if isinstance(item_type, list)
+                                      else (item_type == "Product"))
                         if is_product:
                             img = item.get("image")
                             if isinstance(img, list):
                                 for i in img:
-                                    if isinstance(i, str):
+                                    if isinstance(i, str) and not _is_excluded_domain(i):
                                         images.append(("jsonld_retailer", i))
-                                    elif isinstance(i, dict) and i.get("url"):
+                                    elif isinstance(i, dict) and i.get("url") and not _is_excluded_domain(i["url"]):
                                         images.append(("jsonld_retailer", i["url"]))
-                            elif isinstance(img, str):
+                            elif isinstance(img, str) and not _is_excluded_domain(img):
                                 images.append(("jsonld_retailer", img))
-                            elif isinstance(img, dict) and img.get("url"):
+                            elif isinstance(img, dict) and img.get("url") and not _is_excluded_domain(img["url"]):
                                 images.append(("jsonld_retailer", img["url"]))
                 except Exception:
                     continue
 
             og = re.search(r'<meta[^>]*property=[\'"]og:image[\'"][^>]*content=[\'"]([^\'"]+)[\'"]', html, re.I)
-            if og:
+            if og and not _is_excluded_domain(og.group(1)):
                 images.append(("og_retailer", og.group(1)))
             tw = re.search(r'<meta[^>]*name=[\'"]twitter:image[\'"][^>]*content=[\'"]([^\'"]+)[\'"]', html, re.I)
-            if tw:
+            if tw and not _is_excluded_domain(tw.group(1)):
                 images.append(("twitter_retailer", tw.group(1)))
     except Exception:
         pass
 
-    seen = set()
+    seen   = set()
     unique = []
     for src, u in images:
         if u not in seen:
@@ -775,13 +1033,13 @@ async def display_extract_from_page(session, url):
 async def display_fetch_image_bytes(session, url):
     """Display pipeline image fetcher with UA rotation on 403/429."""
     last_status = None
-    last_error = None
+    last_error  = None
     for attempt, ua in enumerate(DISPLAY_USER_AGENTS):
         headers = {
-            "User-Agent": ua,
-            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "User-Agent":      ua,
+            "Accept":          "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
-            "Referer": "https://www.google.com/",
+            "Referer":         "https://www.google.com/",
         }
         try:
             async with session.get(url, headers=headers, timeout=10) as resp:
@@ -809,11 +1067,11 @@ def display_inspect_image(data: bytes):
     if not IMAGE_LIBS_OK:
         return {"width": None, "height": None, "ok": len(data) >= 5000, "reason": "PIL unavailable"}
     try:
-        img = Image.open(BytesIO(data))
+        img  = Image.open(BytesIO(data))
         w, h = img.size
         if h == 0:
             return {"width": w, "height": h, "ok": False, "reason": "Zero height"}
-        aspect = w / h
+        aspect   = w / h
         long_edge = max(w, h)
         if long_edge < DISPLAY_MIN_LONG_EDGE_PX:
             return {"width": w, "height": h, "long_edge": long_edge, "aspect": aspect,
@@ -844,7 +1102,6 @@ def display_phash_distance(h1, h2):
         return 999
 
 
-# Bad keywords that should never appear in a food product image title/source
 _BAD_TITLE_TOKENS = {
     "hardware", "tool", "screw", "bolt", "nut ", "drill", "plumb", "pipe",
     "furniture", "sofa", "chair", "table", "bed ", "bath", "shower", "toilet",
@@ -853,46 +1110,130 @@ _BAD_TITLE_TOKENS = {
     "paint", "roller", "brush", "wallpaper",
     "vehicle", "car ", "truck", "tyre", "tire",
     "garden", "plant", "flower", "seed ",
+    "safari", "tour", "travel", "lodge", "camp ", "wildlife",
 }
+
 
 def _title_looks_like_food(title: str, product_name: str) -> bool:
     """Quick text check: does the image title/source seem food-related?"""
     if not title:
-        return True  # no title to reject on
+        return True
     title_lower = title.lower()
     for bad in _BAD_TITLE_TOKENS:
         if bad in title_lower:
             return False
-    # Bonus: if any word from the product name appears in the title, trust it
     if product_name:
         pwords = [w.lower() for w in product_name.split() if len(w) > 3]
         if any(w in title_lower for w in pwords):
             return True
-    return True  # default allow — vision check handles the rest
+    return True
+
+
+# ============================================================================
+# IMAGE VERIFIER  (rewritten: VISION_MODEL, float return, fail-closed)
+# ============================================================================
+
+def verify_image_with_gemini(image_data: bytes, mime: str,
+                              product_name: str, brand: str,
+                              gemini_key: str) -> float:
+    """
+    Identity verification: how confident are we that this image shows
+    THIS specific product (correct brand AND variant)?
+
+    Returns a float 0.0–1.0.
+    FAILS CLOSED: returns 0.0 on any error, network failure, or API timeout.
+    Never returns True/1.0 by default — every unverifiable image is rejected.
+
+    Model: VISION_MODEL (gemini-2.5-flash-lite) — the stable replacement for
+    the now-discontinued gemini-2.0-flash-lite (shut down 2026-06-01).
+    """
+    if not gemini_key or not image_data:
+        return 0.0   # fail closed — no key, no approval
+
+    label  = f"{brand} {product_name}".strip() if brand else (product_name or "")
+    prompt = (
+        f"You are verifying a product photo for a food database.\n"
+        f"Target product: '{label}'.\n\n"
+        f"Reply with ONLY a number 0-100 representing your confidence that this image "
+        f"shows the packaging of THAT SPECIFIC product (same brand AND same variant/flavour).\n\n"
+        f"Scoring guide:\n"
+        f"  0-15  : Non-food item (hardware, tools, furniture, landscapes, people, "
+        f"logos, blank barcodes, safari or travel imagery).\n"
+        f"  16-45 : Food or drink item but clearly a DIFFERENT brand or product variant.\n"
+        f"  46-79 : Plausibly the right product but brand or variant is unclear.\n"
+        f"  80-100: Brand name and product visibly match '{label}'.\n\n"
+        f"Respond with a single integer only. No explanation."
+    )
+    try:
+        client = genai.Client(api_key=gemini_key)
+        resp   = client.models.generate_content(
+            model=VISION_MODEL,
+            contents=[
+                prompt,
+                types.Part.from_bytes(data=image_data, mime_type=mime),
+            ],
+            config=types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=8,
+            ),
+        )
+        txt = ""
+        if resp.candidates and resp.candidates[0].content:
+            for part in resp.candidates[0].content.parts:
+                if getattr(part, "text", None):
+                    txt += part.text
+        m = re.search(r"\d{1,3}", txt)
+        return (min(100, int(m.group())) / 100.0) if m else 0.0
+    except Exception:
+        return 0.0   # FAIL CLOSED — never allow an unverifiable image
+
+
+# Sources that come directly from a brand/retailer product page.
+# These still undergo vision verification but with a lower threshold (0.35)
+# because the page-scraping context gives us higher prior confidence.
+# IMPORTANT: this trust is only applied after _is_excluded_domain() confirms
+# the URL is not from a hard-excluded marketplace.
+TRUSTED_SOURCES = {"jsonld_retailer", "og_retailer", "twitter_retailer", "ean_search_registry"}
 
 
 async def display_evaluate_candidate(session, source, original_url, thumbnail_url, diag,
                                      gemini_key="", product_name="", brand="", title="", src_domain=""):
     """
-    Download + inspect a candidate display image.
+    Download + inspect a single candidate display image.
     Strategy:
-      1. Pre-filter on title/source text (free, instant).
-      2. Try original URL first; if 403/error fall back to Google thumbnail.
-      3. Run PIL dimension check.
-      4. Run Gemini vision check on untrusted sources only.
+      1. Hard reject any URL from an excluded marketplace/UGC domain.
+      2. Pre-filter on title/source text (instant, free).
+      3. Try original URL; fall back to Google thumbnail on error.
+      4. PIL dimension check.
+      5. Gemini vision verification (mandatory for all sources).
+         - Excluded-domain URLs NEVER reach this step.
+         - 'Trusted' source images use a lower threshold (0.35).
+         - All other images use IMAGE_MATCH_THRESHOLD (0.55).
+         - FAILS CLOSED: returns 0.0 on error, never silently allows.
     """
     url_to_use = original_url or thumbnail_url
     if not url_to_use:
         return None
 
+    # ── Hard reject: excluded marketplace / UGC image URL ──
+    if _is_excluded_domain(url_to_use):
+        diag.log_candidate(source, url_to_use, "rejected_excluded_domain",
+                           f"Hard-excluded domain: {url_to_use[:80]}")
+        return None
+
+    # A source is 'effectively trusted' only when it is in TRUSTED_SOURCES
+    # AND the URL itself is not from an excluded domain.
+    # This guards against Amazon/eBay listing pages being tagged as jsonld_retailer.
+    effective_trusted = (source in TRUSTED_SOURCES) and not _is_excluded_domain(url_to_use)
+
     # ── Pre-filter: reject obviously wrong content by title ──
-    if source not in TRUSTED_SOURCES and not _title_looks_like_food(title, product_name):
+    if not effective_trusted and not _title_looks_like_food(title, product_name):
         diag.log_candidate(source, url_to_use, "rejected_title",
                            f"Title suggests non-food content: '{title[:80]}'")
         return None
 
     # ── Try original URL first ──
-    payload = None
+    payload  = None
     used_url = None
 
     if original_url:
@@ -903,6 +1244,8 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
                 used_url = original_url
             else:
                 diag.log(f"   ⚠️ Original URL failed ({(payload or {}).get('error','no response')}), trying thumbnail...")
+        else:
+            diag.log(f"   ⚠️ Original URL pre-rejected: {reject_reason}")
 
     # ── Fall back to Google thumbnail ──
     if (not payload or "error" in payload) and thumbnail_url:
@@ -918,119 +1261,88 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
         diag.log_candidate(source, url_to_use, "rejected_download", err)
         return None
 
-    # ── Dimension check — relaxed for thumbnails (Google serves ~200px) ──
+    # ── Dimension check ──
     inspection = display_inspect_image(payload["data"])
     if not inspection["ok"] and used_url != thumbnail_url:
-        # Only enforce full size requirement on originals; thumbnails are smaller by design
         diag.log_candidate(source, used_url, "rejected_dimensions", inspection["reason"],
                            width=inspection.get("width"), height=inspection.get("height"))
         return None
 
     safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
 
-    # ── Vision verification — only for untrusted serpapi sources ──
-    if source not in TRUSTED_SOURCES and gemini_key and product_name:
-        is_correct = await asyncio.to_thread(
+    # ── Vision verification (mandatory for all sources) ──
+    match_score = 0.0
+    if gemini_key and product_name:
+        verify_threshold = IMAGE_MATCH_THRESHOLD_TRUSTED if effective_trusted else IMAGE_MATCH_THRESHOLD
+        match_score = await asyncio.to_thread(
             verify_image_with_gemini,
             payload["data"], safe_mime, product_name, brand, gemini_key
         )
-        if not is_correct:
-            diag.log_candidate(source, used_url, "rejected_vision",
-                               f"Gemini: image does not match '{brand} {product_name}'",
-                               width=inspection.get("width"), height=inspection.get("height"))
-            # Return rejected candidate with display=False so the URL is preserved
-            # for the Image Source Link column (no displayed image but link still available)
+        if match_score < verify_threshold:
+            diag.log_candidate(
+                source, used_url, "rejected_vision",
+                f"Vision score {match_score:.2f} < threshold {verify_threshold:.2f} "
+                f"for '{brand} {product_name}'",
+                width=inspection.get("width"), height=inspection.get("height")
+            )
+            # Preserve URL for Image Source Link so user can visit manually
             return {
                 "url": used_url, "mime": safe_mime, "data": None,
                 "source": source, "inspection": inspection,
-                "phash": None, "display": False
+                "phash": None, "display": False, "match": match_score,
             }
-        diag.log(f"   ✅ Vision verified: {used_url[:80]}")
+        diag.log(f"   ✅ Vision verified (score={match_score:.2f}): {used_url[:80]}")
+    elif not gemini_key and not effective_trusted:
+        # Cannot verify an untrusted source without the Gemini key
+        diag.log_candidate(source, used_url, "rejected_no_verify",
+                           "GEMINI_API_KEY not set — cannot verify untrusted image source")
+        return None
+    else:
+        # effective_trusted=True but no gemini_key or no product_name
+        match_score = 0.5   # neutral score; verified source, unverifiable content
 
     return {
-        "url": used_url, "mime": safe_mime, "data": payload["data"],
-        "source": source, "inspection": inspection,
-        "phash": display_compute_phash(payload["data"]),
-        "display": True
+        "url":        used_url,
+        "mime":       safe_mime,
+        "data":       payload["data"],
+        "source":     source,
+        "inspection": inspection,
+        "phash":      display_compute_phash(payload["data"]),
+        "display":    True,
+        "match":      match_score,
     }
 
 
-# Sources that come directly from a brand/retailer product page —
-# these are trusted without AI verification (they are the OG/JSON-LD image tag
-# on the actual product URL, so they must be the right product).
-TRUSTED_SOURCES = {"jsonld_retailer", "og_retailer", "twitter_retailer", "ean_search_registry"}
-
-
-def verify_image_with_gemini(image_data: bytes, mime: str, product_name: str, brand: str, gemini_key: str) -> bool:
-    """
-    Lightweight Gemini Vision check: does this image show the right product?
-    Returns True (keep) or False (reject).
-    Runs synchronously — called via asyncio.to_thread to avoid blocking.
-    """
-    if not gemini_key or not image_data:
-        return True  # can't verify — allow through
-    try:
-        client = genai.Client(api_key=gemini_key)
-        label = f"{brand} {product_name}".strip() if brand else product_name
-        prompt = (
-            f"Look at this image carefully. "
-            f"Does it show a retail food or drink product packaging — specifically something "
-            f"that could be '{label}'? "
-            f"Answer YES if: the image shows packaged food, a snack, grocery item, or food/drink packaging "
-            f"that plausibly matches the description '{label}'. "
-            f"Answer NO if: the image shows hardware, tools, furniture, electronics, clothing, vehicles, "
-            f"a blank barcode, a landscape, a person, or ANY non-food item. "
-            f"Also answer NO if the image is clearly a completely different product type "
-            f"(e.g. cosmetics when asked about food, or office supplies when asked about snacks). "
-            f"One word only: YES or NO."
-        )
-        response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
-            contents=[
-                prompt,
-                types.Part.from_bytes(data=image_data, mime_type=mime)
-            ],
-            config=types.GenerateContentConfig(
-                temperature=0.0,
-                max_output_tokens=5,
-            )
-        )
-        answer = ""
-        if response.candidates and response.candidates[0].content:
-            for part in response.candidates[0].content.parts:
-                if getattr(part, "text", None):
-                    answer += part.text
-        answer = answer.strip().upper()
-        # Only reject on explicit NO — if ambiguous or empty, allow through
-        return not answer.startswith("NO")
-    except Exception:
-        return True  # on error, allow through
-
-
 def display_select(candidates, diag):
-    """Pick top MAX_DISPLAY_IMAGES for rendering. Only display=True candidates shown."""
+    """
+    Pick top MAX_DISPLAY_IMAGES for rendering.
+    Scoring: source priority + resolution + vision match confidence.
+    """
     if not candidates:
         diag.image_2_failure = "No candidate images survived quality checks."
         return []
 
-    # Split: displayable (verified) vs rejected (wrong content, link-only)
-    displayable = [c for c in candidates if c.get("display", True) and c.get("data")]
+    displayable    = [c for c in candidates if c.get("display", True) and c.get("data")]
     rejected_links = [c for c in candidates if not c.get("display", True)]
 
     if rejected_links:
         diag.log(f"   ℹ️ {len(rejected_links)} image(s) rejected by vision — URLs preserved for Image Source Link.")
 
     def score(c):
-        base = DISPLAY_SOURCE_PRIORITY.get(c["source"], 30)
+        base      = DISPLAY_SOURCE_PRIORITY.get(c["source"], 30)
         long_edge = c["inspection"].get("long_edge") or 0
-        return base + min(20, long_edge / 75)
+        match     = c.get("match", 0.5)
+        # Vision match is weighted heavily — a smaller but correctly identified
+        # product image outranks a large but uncertain one.
+        return base + min(20, long_edge / 75) + 40 * match
 
     sorted_cands = sorted(displayable, key=score, reverse=True)
 
-    selected = []
+    selected        = []
     selected_hashes = []
     for c in sorted_cands:
-        if any(display_phash_distance(c["phash"], h) < DISPLAY_PHASH_DUPLICATE_THRESHOLD for h in selected_hashes):
+        if any(display_phash_distance(c["phash"], h) < DISPLAY_PHASH_DUPLICATE_THRESHOLD
+               for h in selected_hashes):
             diag.log_candidate(
                 c["source"], c["url"], "rejected_dedup",
                 f"Near-identical to selected (phash < {DISPLAY_PHASH_DUPLICATE_THRESHOLD})",
@@ -1042,7 +1354,9 @@ def display_select(candidates, diag):
             selected_hashes.append(c["phash"])
         diag.log_candidate(
             c["source"], c["url"], "selected",
-            f"Display image #{len(selected)} (score={score(c):.0f}, {c['inspection']['width']}x{c['inspection']['height']})",
+            f"Display image #{len(selected)} "
+            f"(score={score(c):.0f}, match={c.get('match',0):.2f}, "
+            f"{c['inspection']['width']}x{c['inspection']['height']})",
             width=c["inspection"]["width"], height=c["inspection"]["height"]
         )
         if len(selected) >= MAX_DISPLAY_IMAGES:
@@ -1062,30 +1376,26 @@ def display_select(candidates, diag):
 
 
 _BRAND_STOPWORDS = {
-    # Italian food words that appear capitalised in product names
     "mandorle", "anacardi", "arachidi", "nocciole", "pistacchi", "noci",
     "mix", "assortiti", "ricoperte", "tostate", "salate", "bio", "organic",
     "cioccolato", "fondente", "bianco", "latte", "cocco", "yogurt", "limone",
     "arancia", "fragola", "lampone", "vaniglia", "caramello", "miele",
     "preparazione", "confezione", "formato", "gusto", "sapore",
-    # French
     "preparation", "aromatisation", "saveur", "pour", "avec",
-    # Generic
     "product", "item", "food", "snack", "pack", "bag", "box",
     "gr", "kg", "ml", "cl", "da", "al", "di", "con", "per",
 }
+
 
 def _extract_brand(ground_truth: str) -> str:
     """
     Extract a brand token from ground_truth.
     Skips common food/descriptive words and short tokens.
-    Returns the first capitalised token that looks like a brand name.
     """
     if not ground_truth:
         return ""
     tokens = ground_truth.split()
     for token in tokens:
-        # Clean punctuation
         clean = token.strip(".,;:()-/")
         if len(clean) < 3:
             continue
@@ -1093,67 +1403,83 @@ def _extract_brand(ground_truth: str) -> str:
             continue
         if clean.lower() in _BRAND_STOPWORDS:
             continue
-        # Skip tokens that are all numbers or EAN-like
         if clean.replace(".", "").isdigit():
             continue
         return clean
     return ""
 
-async def fetch_display_images(session, ean, serp_key, ean_token, market_code, ground_truth="", gemini_key=""):
+
+async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
+                                ground_truth="", gemini_key=""):
     """
-    NEW IMAGE PIPELINE - completely separate from food extraction.
-    Returns: (display_images, diagnostics).
-    Does its own name lookup and retailer URL discovery so it doesn't depend on Path A.
+    Path B: Find and verify the 2 images shown in the results table.
+    Completely separate from food extraction; runs in parallel with Path A.
+
+    Hard constraints enforced here:
+    - Amazon and eBay domains are skipped at every stage.
+    - Brand pages are only trusted when page_contains_ean() confirms the EAN.
+    - Images from unconfirmed pages use a lower-priority source tag (og_retailer).
     """
-    gl = market_code.lower()
+    gl           = market_code.lower()
     market_upper = market_code.upper()
-    diag = ImageDiagnostics(ean)
-    serp_url = "https://serpapi.com/search"
+    diag         = ImageDiagnostics(ean)
+    serp_url     = "https://serpapi.com/search"
 
-    product_name = None
-    retailer_urls = []
+    product_name         = None
+    retailer_urls        = []
     candidate_image_urls = []
-    registry_image_url = None
+    registry_image_url   = None
+    brand_for_verify     = _extract_brand(ground_truth) if ground_truth else ""
 
-    # Stage 0: Brand-site image lookup via SerpAPI site: search
-    # When a brand is in ground_truth:
-    #   Step A — find the brand domain via text search
-    #   Step B — search Google Images restricted to that domain (bypasses 403 entirely)
-    #   Step C — also add the product page URL for the scraper to try
-    brand_domain_found = None
+    # ── Stage 0: Brand-site image lookup ──────────────────────────────────────
+    brand_domain_found  = None
+    brand_ean_verified  = False   # True only if page_contains_ean() passed
+
     if serp_key and ground_truth:
         brand_candidate = _extract_brand(ground_truth)
         if brand_candidate:
             diag.log(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
-                # Step A: text search to find the brand domain
                 async with session.get(serp_url, params={
                     "q": f"{brand_candidate} {ean}",
                     "gl": gl, "api_key": serp_key
                 }, timeout=10) as resp:
                     if resp.status == 200:
-                        data = await resp.json()
+                        data    = await resp.json()
                         organic = data.get("organic_results", [])
                         for res in organic[:5]:
-                            link = res.get("link", "")
+                            link   = res.get("link", "")
                             domain = link.split("/")[2] if link.startswith("http") else ""
+                            # Hard guard: never accept Amazon/eBay as a brand domain
+                            if _is_excluded_domain(link):
+                                diag.log(f"   ⚠️ Skipping excluded domain: {domain}")
+                                continue
                             if brand_candidate.lower() in domain.lower():
+                                # Verify the page actually contains the EAN in its HTML
+                                ean_on_page = await page_contains_ean(session, link, ean)
+                                if ean_on_page:
+                                    brand_ean_verified = True
+                                    diag.log(f"✅ Brand page EAN verified: {domain}")
+                                else:
+                                    diag.log(f"⚠️ Brand page found ({domain}) but EAN not in HTML — lower trust")
                                 if not product_name:
-                                    product_name = res.get("title","").split("-")[0].split("|")[0].strip()
+                                    product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
                                     diag.log(f"✅ Brand-site name: {product_name}")
                                 if link not in retailer_urls:
                                     retailer_urls.insert(0, link)
                                 brand_domain_found = domain
-                                diag.log(f"✅ Brand domain: {domain}")
                                 break
             except Exception as e:
                 diag.log(f"⚠️ Brand text search failed: {e}")
 
-            # Step B: Google Images restricted to brand domain — bypasses 403
+            # Google Images restricted to brand domain
             if brand_domain_found and serp_key:
                 diag.log(f"🖼️ Image search on site:{brand_domain_found}...")
-                name_hint = " ".join((product_name or ground_truth).split()[:4])
-                site_img_query = f"site:{brand_domain_found} {name_hint}"
+                name_hint       = " ".join((product_name or ground_truth).split()[:4])
+                site_img_query  = f"site:{brand_domain_found} {name_hint}"
+                # Use jsonld_retailer tag only for EAN-verified brand pages;
+                # use og_retailer for unverified (still useful but lower priority)
+                brand_img_tag = "jsonld_retailer" if brand_ean_verified else "og_retailer"
                 try:
                     async with session.get(serp_url, params={
                         "q": site_img_query, "tbm": "isch",
@@ -1161,26 +1487,25 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                     }, timeout=10) as resp:
                         if resp.status == 200:
                             img_data = await resp.json()
-                            hits = 0
+                            hits     = 0
                             for item in img_data.get("images_results", [])[:8]:
-                                original = item.get("original", "")
-                                thumbnail = item.get("thumbnail", "")
-                                title = item.get("title", "").lower()
+                                original   = item.get("original", "")
+                                thumbnail  = item.get("thumbnail", "")
+                                title      = item.get("title", "").lower()
                                 src_domain = item.get("source", "").lower()
+                                # Skip any image from an excluded domain
+                                if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                                    continue
                                 if original or thumbnail:
-                                    # Mark as jsonld_retailer priority — came from brand domain
                                     candidate_image_urls.append(
-                                        ("jsonld_retailer", original, thumbnail, title, src_domain)
+                                        (brand_img_tag, original, thumbnail, title, src_domain)
                                     )
                                     hits += 1
-                            diag.log(f"   Found {hits} brand-domain image candidates.")
+                            diag.log(f"   Found {hits} brand-domain image candidates (tag={brand_img_tag}).")
                 except Exception as e:
                     diag.log(f"⚠️ Brand domain image search failed: {e}")
 
-    # Derive brand label for vision verification
-    brand_for_verify = _extract_brand(ground_truth) if ground_truth else ""
-
-    # Stage 1: Name lookup
+    # ── Stage 1: Name lookup ──────────────────────────────────────────────────
     if ean_token:
         diag.log("🔍 EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
@@ -1189,13 +1514,18 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                 if resp.status == 200:
                     data = await resp.json()
                     if data and len(data) > 0 and "error" not in data[0]:
-                        candidate_name = data[0].get("name", "")
+                        returned_barcode = str(data[0].get("barcode", data[0].get("ean", "")))
+                        candidate_name   = data[0].get("name", "")
                         registry_image_url = data[0].get("image")
-                        if is_garbage_name(candidate_name):
-                            diag.log(f"⚠️ EAN-Search returned placeholder: '{candidate_name}' - discarded")
+                        if barcode_matches(returned_barcode, ean):
+                            if is_garbage_name(candidate_name):
+                                diag.log(f"⚠️ EAN-Search barcode verified but name discarded (garbage): '{candidate_name}'")
+                            else:
+                                product_name = candidate_name
+                                diag.log(f"✅ EAN-Search name (barcode verified): {product_name}")
                         else:
-                            product_name = candidate_name
-                            diag.log(f"✅ EAN-Search name: {product_name}")
+                            diag.log(f"⚠️ EAN-Search barcode mismatch (got {returned_barcode}) — discarded")
+                            registry_image_url = None  # don't trust registry image either
         except Exception as e:
             diag.log(f"⚠️ EAN-Search failed: {e}")
 
@@ -1204,13 +1534,18 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
         try:
             async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data = await resp.json()
+                data    = await resp.json()
                 organic = data.get("organic_results", [])
                 if organic:
                     if not product_name:
-                        product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                        diag.log(f"✅ Goldmine name: {product_name}")
-                    retailer_urls.extend([res.get("link") for res in organic[:4] if "link" in res])
+                        candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                        if not is_garbage_name(candidate):
+                            product_name = candidate
+                            diag.log(f"✅ Goldmine name: {product_name}")
+                    retailer_urls.extend([
+                        res.get("link") for res in organic[:4]
+                        if "link" in res and not _is_excluded_domain(res.get("link", ""))
+                    ])
         except Exception as e:
             diag.log(f"⚠️ Goldmine failed: {e}")
 
@@ -1218,31 +1553,37 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
         diag.log("🔍 Global GTIN search for retailer URLs...")
         try:
             async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data = await resp.json()
+                data    = await resp.json()
                 organic = data.get("organic_results", [])
                 if organic:
                     if not product_name:
-                        product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                        diag.log(f"✅ Global name: {product_name}")
-                    new_urls = [res.get("link") for res in organic[:5] if "link" in res]
+                        candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                        if not is_garbage_name(candidate):
+                            product_name = candidate
+                            diag.log(f"✅ Global GTIN name (unverified): {product_name}")
+                    new_urls = [
+                        res.get("link") for res in organic[:5]
+                        if "link" in res and not _is_excluded_domain(res.get("link", ""))
+                    ]
                     for u in new_urls:
                         if u not in retailer_urls:
                             retailer_urls.append(u)
         except Exception as e:
             diag.log(f"⚠️ Global search failed: {e}")
 
-    # Stage 2: Gather candidate image URLs from all sources
+    # ── Stage 2: Gather candidate image URLs ─────────────────────────────────
     if retailer_urls:
         diag.log(f"🌐 Scraping JSON-LD/OG/Twitter from {min(len(retailer_urls), 5)} retailer pages...")
-        scrape_tasks = [display_extract_from_page(session, url) for url in retailer_urls[:5]]
+        scrape_tasks    = [display_extract_from_page(session, url) for url in retailer_urls[:5]]
         per_page_results = await asyncio.gather(*scrape_tasks, return_exceptions=True)
-        scraped_count = 0
+        scraped_count   = 0
         for result in per_page_results:
             if isinstance(result, Exception):
                 continue
             for source_tag, img_url in result:
-                candidate_image_urls.append((source_tag, img_url))
-                scraped_count += 1
+                if not _is_excluded_domain(img_url):
+                    candidate_image_urls.append((source_tag, img_url))
+                    scraped_count += 1
         diag.log(f"   Scraped {scraped_count} URLs from retailer pages.")
 
     if serp_key:
@@ -1257,10 +1598,12 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
                 if not isinstance(resp, Exception) and resp.status == 200:
                     img_data = await resp.json()
                     for item in img_data.get("images_results", [])[:8]:
-                        original = item.get("original", "")
-                        thumbnail = item.get("thumbnail", "")
-                        title = item.get("title", "").lower()
-                        source = item.get("source", "").lower()
+                        original   = item.get("original", "")
+                        thumbnail  = item.get("thumbnail", "")
+                        title      = item.get("title", "").lower()
+                        source     = item.get("source", "").lower()
+                        if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                            continue
                         if original or thumbnail:
                             candidate_image_urls.append((tag, original, thumbnail, title, source))
         except Exception as e:
@@ -1268,22 +1611,22 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
 
     if serp_key and product_name and not product_name.startswith("Product with EAN"):
         diag.log("🖼️ SerpAPI image search by name+EAN (anchored)...")
-        # Use EAN as anchor + first 5 words of name to avoid off-topic image results.
-        # Restrict to known food/product databases to prevent hardware/homeware contamination.
-        name_words = " ".join(product_name.split()[:5])
-        anchored_query = f'"{ean}" {name_words} site:barcodelookup.com OR site:go-upc.com OR site:open.fda.gov OR "{ean}" {name_words}'
-        hailmary_query = f'"{ean}" {name_words} -site:aliexpress.com -site:ebay.com -site:alibaba.com'
+        name_words      = " ".join(product_name.split()[:5])
+        anchored_query  = f'"{ean}" {name_words} site:barcodelookup.com OR site:go-upc.com OR "{ean}" {name_words}'
+        hailmary_query  = f'"{ean}" {name_words} -site:aliexpress.com -site:ebay.com -site:alibaba.com -site:amazon.com'
         for q_tag, q_str in [("serpapi_strict", anchored_query), ("serpapi_hailmary", hailmary_query)]:
             try:
                 async with session.get(serp_url, params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
                     if resp.status == 200:
-                        img_data = await resp.json()
+                        img_data  = await resp.json()
                         name_hits = 0
                         for item in img_data.get("images_results", [])[:6]:
-                            original = item.get("original", "")
-                            thumbnail = item.get("thumbnail", "")
-                            title = item.get("title", "").lower()
-                            source = item.get("source", "").lower()
+                            original   = item.get("original", "")
+                            thumbnail  = item.get("thumbnail", "")
+                            title      = item.get("title", "").lower()
+                            source     = item.get("source", "").lower()
+                            if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                                continue
                             if original or thumbnail:
                                 candidate_image_urls.append((q_tag, original, thumbnail, title, source))
                                 name_hits += 1
@@ -1291,12 +1634,12 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
             except Exception as e:
                 diag.log(f"⚠️ SerpAPI name search [{q_tag}] failed: {e}")
 
-    if registry_image_url:
+    if registry_image_url and not _is_excluded_domain(registry_image_url):
         candidate_image_urls.append(("ean_search_registry", registry_image_url, "", "", ""))
 
-    # Stage 3: Normalise to (src, original, thumbnail, title, source_domain) and dedup
+    # ── Stage 3: Normalise and deduplicate ────────────────────────────────────
     seen_urls = set()
-    deduped = []
+    deduped   = []
     for entry in candidate_image_urls:
         if len(entry) == 2:
             src, original = entry
@@ -1304,13 +1647,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
         else:
             src, original, thumbnail, title, src_domain = entry
         key = original or thumbnail
-        if key and key not in seen_urls:
+        if key and key not in seen_urls and not _is_excluded_domain(key):
             seen_urls.add(key)
             deduped.append((src, original, thumbnail, title, src_domain))
 
-    diag.log(f"📊 {len(deduped)} unique candidate URLs. Evaluating...")
+    diag.log(f"📊 {len(deduped)} unique candidate URLs after deduplication. Evaluating...")
 
-    # Stage 4: Evaluate
+    # ── Stage 4: Evaluate candidates ─────────────────────────────────────────
     _pname_for_verify = product_name or ""
     eval_tasks = [
         display_evaluate_candidate(
@@ -1322,27 +1665,28 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
         )
         for src, original, thumbnail, title, src_domain in deduped[:20]
     ]
-    eval_results = await asyncio.gather(*eval_tasks, return_exceptions=True)
+    eval_results   = await asyncio.gather(*eval_tasks, return_exceptions=True)
     valid_candidates = [r for r in eval_results if r and not isinstance(r, Exception)]
 
     diag.log(f"✅ {len(valid_candidates)} candidates passed quality checks.")
 
-    # Stage 5: Hail mary if zero viable
+    # ── Stage 5: Hail-mary fallback ───────────────────────────────────────────
     if len(valid_candidates) == 0 and serp_key:
-        diag.log("🆘 HAIL MARY: zero viable - generic search...")
-        generic_query = product_name if product_name and not product_name.startswith("Product with EAN") else str(ean)
+        diag.log("🆘 HAIL MARY: zero viable — generic search...")
+        generic_query = (product_name if product_name and not product_name.startswith("Product with EAN")
+                         else str(ean))
         try:
             async with session.get(serp_url, params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
                 if resp.status == 200:
                     img_data = await resp.json()
-                    hail = []
+                    hail     = []
                     for item in img_data.get("images_results", [])[:10]:
-                        original = item.get("original", "")
-                        thumbnail = item.get("thumbnail", "")
-                        title = item.get("title", "").lower()
+                        original   = item.get("original", "")
+                        thumbnail  = item.get("thumbnail", "")
+                        title      = item.get("title", "").lower()
                         src_domain = item.get("source", "").lower()
-                        key = original or thumbnail
-                        if key and key not in seen_urls:
+                        key        = original or thumbnail
+                        if key and key not in seen_urls and not _is_excluded_domain(key):
                             hail.append(("serpapi_hailmary", original, thumbnail, title, src_domain))
                             seen_urls.add(key)
                     diag.log(f"   Hail mary: {len(hail)} new candidates.")
@@ -1363,19 +1707,17 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
         except Exception as e:
             diag.log(f"⚠️ Hail mary failed: {e}")
 
-    # Stage 6: Select top MAX_DISPLAY_IMAGES
+    # ── Stage 6: Select top images ────────────────────────────────────────────
     selected = display_select(valid_candidates, diag)
 
-    # Image Source Link = the PRODUCT PAGE URL, not an image file URL.
-    # retailer_urls contains actual product/brand pages found during lookup.
-    # This is what the user should visit to find the image manually.
-    source_links = []
+    # Image Source Link = the actual product/brand PAGE url (not an image file url)
+    source_links     = []
     seen_link_domains = set()
     for page_url in retailer_urls:
         if not page_url:
             continue
         dom = page_url.split("/")[2] if page_url.startswith("http") else ""
-        if dom and dom not in seen_link_domains:
+        if dom and dom not in seen_link_domains and not _is_excluded_domain(page_url):
             source_links.append(page_url)
             seen_link_domains.add(dom)
         if len(source_links) >= 2:
@@ -1385,15 +1727,15 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code, g
 
 
 # ============================================================================
-# MERGE: orchestrate Path A (food) + Path B (display images) in parallel
+# ORCHESTRATION: run Path A + Path B in parallel, merge results
 # ============================================================================
 
 async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text):
-    ean = item["ean"]
-    ground_truth = item.get("ground_truth", "")
-    force_refresh = item.get("force_refresh", False)  # <-- new flag
+    ean           = item["ean"]
+    ground_truth  = item.get("ground_truth", "")
+    force_refresh = item.get("force_refresh", False)
 
-    # Cache check
+    # ── Cache check ──────────────────────────────────────────────────────────
     if not force_refresh:
         cached = cache_get(ean, market)
         if cached:
@@ -1402,26 +1744,30 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
     else:
-        # force_refresh: delete the cache entry so a stale result isn't re-used
         cache_delete(ean, market)
 
-
     async with sem:
-        # Run BOTH pipelines concurrently - food extraction is unaffected by image pipeline
-        food_task = fetch_basic_info(session, ean, serp_key, ean_token, market, user_ground_truth=ground_truth)
-        image_task = fetch_display_images(session, ean, serp_key, ean_token, market, ground_truth=ground_truth, gemini_key=gemini_key)
-        (name, gemini_images, food_diag), (display_images, image_diag, source_links) = await asyncio.gather(food_task, image_task)
+        # ── Run both pipelines concurrently ──────────────────────────────────
+        food_task  = fetch_basic_info(session, ean, serp_key, ean_token, market,
+                                      user_ground_truth=ground_truth)
+        image_task = fetch_display_images(session, ean, serp_key, ean_token, market,
+                                           ground_truth=ground_truth, gemini_key=gemini_key)
 
-        # PATH A continues: send Gemini the food-extraction images (original logic)
+        (name, gemini_images, food_diag, ean_verified), \
+        (display_images, image_diag, source_links) = await asyncio.gather(food_task, image_task)
+
+        # ── Path A: Gemini food extraction ───────────────────────────────────
         data = await asyncio.to_thread(
-            run_gemini_sync, ean, name, market, gemini_key, taxonomy_text, gemini_images, ground_truth
+            run_gemini_sync, ean, name, market, gemini_key,
+            taxonomy_text, gemini_images, ground_truth
         )
 
-        # PATH B output: display_images + source_links for the table
-        display_urls = [img["url"] for img in display_images]
-        imgs = (display_urls + ["", ""])[:2]
+        # ── Path B output ─────────────────────────────────────────────────────
+        display_urls  = [img["url"] for img in display_images]
+        imgs          = (display_urls + ["", ""])[:2]
         img_src_links = (source_links + ["", ""])[:2]
 
+        # ── Error branch — do NOT cache ───────────────────────────────────────
         if "error" in data:
             row = {
                 "Image 1": imgs[0],
@@ -1432,19 +1778,27 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Status": f"{data['error']}",
                 "Cached": "🔄 Fresh"
             }
-            cache_set(ean, market, row)    # <-- here, inside the if block
-            return {
-                "row": row,
-                "image_diag": image_diag,
-                "food_diag": food_diag,
-            }
+            # Errors are never cached — they will be retried on next lookup
+            return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
+        # ── Parse sources — merge model claims + grounding refs, strip forbidden ──
         sources = data.get("sources", [])
         if isinstance(sources, str):
             sources = [s.strip() for s in sources.split(",") if s.strip()]
-        srcs = (sources + ["", "", "", "", ""])[:5]
+        elif not isinstance(sources, list):
+            sources = []
+        # Final safety pass: remove any forbidden domains Gemini may have slipped in
+        sources = [s for s in sources if s and not _is_excluded_domain(s)]
+        srcs    = (sources + ["", "", "", "", ""])[:5]
 
-        # Validation Gate
+        # ── Determine real approved sources (filter grounding redirect URLs) ──
+        real_sources = [
+            s for s in srcs
+            if s and not s.startswith("https://vertexaisearch.cloud.google.com")
+            and not _is_excluded_domain(s)
+        ]
+
+        # ── Validation gate — is_exact_match=False means wrong product ────────
         if data.get("is_exact_match") is False:
             row = {
                 "Image 1": imgs[0],
@@ -1459,28 +1813,45 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
                 "Info Reliability": "",
                 "Reliability Reasoning": data.get("chain_of_thought", ""),
                 "Chain of Thought": data.get("chain_of_thought", ""),
-                "Category L1": "", "Category L2": "", "Category L3": "", "Category L4": "", "Category L5": "", "Category L6": "",
-                "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "", "Tagging Reasoning": "",
-                "Brand": "", "UoM": "", "Packaging": "", "Fragile Item": "", "Net Weight (g) / Volume": "", "Gross Weight (g)": "",
-                "Organic Product": "", "Net Weight/ Volume (Customer Facing)": "", "Ingredients": "", "Allergens": "", "May Contain": "",
-                "Nutritional Info": "", "Manufacturer Name": "", "Manufacturer Address": "", "Place of Origin": "", "Organic Certification ID": "",
-                "Energy (kJ)": "", "Fat (g)": "", "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "", "Of Which Sugars (g)": "",
-                "Protein (g)": "", "Fiber (g)": "", "Salt (g)": "",
-                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2], "Source 4": srcs[3], "Source 5": srcs[4],
+                "Category L1": "", "Category L2": "", "Category L3": "",
+                "Category L4": "", "Category L5": "", "Category L6": "",
+                "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "",
+                "Tagging Reasoning": "",
+                "Brand": "", "UoM": "", "Packaging": "", "Fragile Item": "",
+                "Net Weight (g) / Volume": "", "Gross Weight (g)": "",
+                "Organic Product": "", "Net Weight/ Volume (Customer Facing)": "",
+                "Ingredients": "", "Allergens": "", "May Contain": "",
+                "Nutritional Info": "", "Manufacturer Name": "",
+                "Manufacturer Address": "", "Place of Origin": "",
+                "Organic Certification ID": "",
+                "Energy (kJ)": "", "Fat (g)": "",
+                "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "",
+                "Of Which Sugars (g)": "", "Protein (g)": "",
+                "Fiber (g)": "", "Salt (g)": "",
+                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2],
+                "Source 4": srcs[3], "Source 5": srcs[4],
                 "Cached": "🔄 Fresh"
             }
-            cache_set(ean, market, row)
+            # Failed validation is never cached — the product may be retried with
+            # corrected ground truth
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
-        # Passed Validation - full populated row
-        # "No result > wrong result": if reliability is Low AND no sources found,
-        # flag explicitly rather than silently passing as Success.
+        # ── Determine final status ────────────────────────────────────────────
+        # Priority: wrong answer < needs review < success.
+        # Rules (most conservative first):
+        #   L reliability         → always Needs Review
+        #   No approved sources   → always Needs Review
+        #   M reliability + no EAN barcode verification → Needs Review
+        #   Otherwise             → Success
         reliability = data.get("food_info_reliability", "")
-        all_sources = [srcs[i] for i in range(5) if srcs[i]]
-        if reliability == "L" and not all_sources:
-            final_status = "⚠️ Low Confidence — Review Required"
+
+        if reliability == "L" or not real_sources:
+            final_status = "⚠️ Needs Review"
+        elif reliability == "M" and not ean_verified:
+            final_status = "⚠️ Needs Review"
         else:
             final_status = "Success"
+
         row = {
             "Image 1": imgs[0],
             "Image 2": imgs[1],
@@ -1535,21 +1906,25 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             "Source 5": srcs[4],
             "Cached": "🔄 Fresh"
         }
-        cache_set(ean, market, row)
+
+        # ── Cache only confirmed successes ────────────────────────────────────
+        if should_cache(final_status):
+            cache_set(ean, market, row, status=final_status, confidence=1.0)
+
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
 
-async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market, taxonomy_text, progress_bar, status_text):
-    sem = asyncio.Semaphore(5)
-    total = len(parsed_inputs)
+async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market,
+                   taxonomy_text, progress_bar, status_text):
+    sem       = asyncio.Semaphore(5)
+    total     = len(parsed_inputs)
     completed = 0
 
     async with aiohttp.ClientSession() as session:
-        # Wrap each task to update progress as each one completes,
-        # then gather with return_exceptions=True to preserve input order.
         async def tracked(item):
             nonlocal completed
-            res = await process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text)
+            res = await process_ean(sem, session, item, serp_key, gemini_key,
+                                     ean_token, market, taxonomy_text)
             completed += 1
             progress_bar.progress(completed / total)
             status_text.text(f"Processed {completed}/{total} items...")
@@ -1569,12 +1944,12 @@ async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market, taxon
 
 st.title("🔬 Food Data Researcher PRO")
 
-SERP_KEY = os.environ.get("SERPAPI_KEY", "")
+SERP_KEY   = os.environ.get("SERPAPI_KEY", "")
 GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-EAN_TOKEN = os.environ.get("EAN_SEARCH_TOKEN", "")
+EAN_TOKEN  = os.environ.get("EAN_SEARCH_TOKEN", "")
 
 taxonomy_text = load_taxonomy()
-init_cache()  # ensures table exists on every startup
+init_cache()
 
 with st.sidebar:
     st.header("⚙️ Settings")
@@ -1622,12 +1997,21 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
         match = re.search(r'\b\d{8,14}\b', line)
         if match:
-            ean = match.group(0)
-            ground_truth = line.replace(ean, "").strip()
+            ean_raw      = match.group(0)
+            ground_truth = line.replace(ean_raw, "").strip()
             ground_truth = re.sub(r'\s+', ' ', ground_truth)
+
+            # ── EAN check-digit validation ────────────────────────────────────
+            if not valid_gtin(ean_raw):
+                st.warning(
+                    f"⚠️ '{ean_raw}' failed the barcode check digit (mod-10 validation). "
+                    f"Please verify this EAN is correct before submitting. Skipping."
+                )
+                continue
+
             parsed_inputs.append({
-                "ean": ean,
-                "ground_truth": ground_truth,
+                "ean":           ean_raw,
+                "ground_truth":  ground_truth,
                 "force_refresh": force_refresh
             })
         else:
@@ -1635,28 +2019,25 @@ if st.button("🚀 Start Deep Research", type="primary"):
 
     if parsed_inputs:
         progress_bar = st.progress(0.0)
-        status_text = st.empty()
+        status_text  = st.empty()
         with st.spinner(f"Analyzing {len(parsed_inputs)} products concurrently..."):
             all_data, all_diags = asyncio.run(
                 run_main(parsed_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code,
                          taxonomy_text, progress_bar, status_text)
             )
 
-            st.session_state["results_df"] = pd.DataFrame(all_data)
-            st.session_state["image_diags"] = all_diags
+            st.session_state["results_df"]   = pd.DataFrame(all_data)
+            st.session_state["image_diags"]  = all_diags
 
 if "results_df" in st.session_state:
     df = st.session_state["results_df"].copy()
     df = df.drop(columns=["Image 2 Failure Reason", "Packaging"], errors="ignore")
 
-     # Ensure Cached column exists for all rows
     if "Cached" not in df.columns:
         df["Cached"] = "🔄 Fresh"
 
-        # Add Re-run checkbox column at the front
     df.insert(0, "Re-run?", False)
 
-    # Define preferred column order
     column_order = [
         "Re-run?",
         "Cached",
@@ -1712,8 +2093,8 @@ if "results_df" in st.session_state:
     ]
 
     existing_ordered = [c for c in column_order if c in df.columns]
-    remaining = [c for c in df.columns if c not in column_order]
-    df = df[existing_ordered + remaining]
+    remaining        = [c for c in df.columns if c not in column_order]
+    df               = df[existing_ordered + remaining]
 
     st.subheader("📊 Results")
     edited_df = st.data_editor(
@@ -1729,8 +2110,8 @@ if "results_df" in st.session_state:
                 help="Whether this result came from cache or was freshly scraped",
                 disabled=True,
             ),
-            "Image 1": st.column_config.ImageColumn(),
-            "Image 2": st.column_config.ImageColumn(),
+            "Image 1":          st.column_config.ImageColumn(),
+            "Image 2":          st.column_config.ImageColumn(),
             "Image Source Link": st.column_config.LinkColumn(
                 "Image Source Link",
                 display_text="🔗 Image Source",
@@ -1745,7 +2126,7 @@ if "results_df" in st.session_state:
         width='stretch',
         hide_index=True
     )
-    
+
     # Re-run selected rows
     rerun_rows = edited_df[edited_df["Re-run?"] == True]
     rerun_eans = rerun_rows["GTIN / EAN"].tolist()
@@ -1753,20 +2134,19 @@ if "results_df" in st.session_state:
         if st.button(f"🔄 Re-run {len(rerun_eans)} selected EAN(s)", type="primary"):
             rerun_inputs = [
                 {
-                    "ean": row["GTIN / EAN"],
-                    "ground_truth": str(row.get("User Input", "") or "").strip(),
+                    "ean":           row["GTIN / EAN"],
+                    "ground_truth":  str(row.get("User Input", "") or "").strip(),
                     "force_refresh": True
                 }
                 for _, row in rerun_rows.iterrows()
             ]
             rerun_progress = st.progress(0.0)
-            rerun_status = st.empty()
+            rerun_status   = st.empty()
             with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
                 rerun_data, _ = asyncio.run(
                     run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN,
                              market_code, taxonomy_text, rerun_progress, rerun_status)
                 )
-                # Merge rerun results back into the display
                 rerun_df = pd.DataFrame(rerun_data)
                 if "Cached" not in rerun_df.columns:
                     rerun_df["Cached"] = "🔄 Fresh"
