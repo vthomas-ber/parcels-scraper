@@ -1270,36 +1270,65 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
 
     safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
 
-    # ── Vision verification (mandatory for all sources) ──
-    match_score = 0.0
-    if gemini_key and product_name:
+    # ── Vision verification ───────────────────────────────────────────────────
+    # Rules:
+    #   TRUSTED sources (brand/retailer pages, not Amazon/eBay):
+    #     Vision is run as a quality signal, but a low score or API failure
+    #     does NOT reject the image — the source page is the primary trust
+    #     signal.  This preserves display behaviour for legitimate brand pages.
+    #   UNTRUSTED sources (SerpAPI image search results):
+    #     Vision is the primary gate.  Fail-closed: 0.0 on any error → reject.
+    #   Unknown product name ("Product with EAN …"):
+    #     Vision can't match against a generic label — skip it for trusted
+    #     sources and reject for untrusted.
+    #
+    _product_known = (product_name and
+                      not product_name.startswith("Product with EAN"))
+    match_score = 0.5   # default neutral score
+
+    if gemini_key and _product_known:
         verify_threshold = IMAGE_MATCH_THRESHOLD_TRUSTED if effective_trusted else IMAGE_MATCH_THRESHOLD
         match_score = await asyncio.to_thread(
             verify_image_with_gemini,
             payload["data"], safe_mime, product_name, brand, gemini_key
         )
         if match_score < verify_threshold:
-            diag.log_candidate(
-                source, used_url, "rejected_vision",
-                f"Vision score {match_score:.2f} < threshold {verify_threshold:.2f} "
-                f"for '{brand} {product_name}'",
-                width=inspection.get("width"), height=inspection.get("height")
-            )
-            # Preserve URL for Image Source Link so user can visit manually
-            return {
-                "url": used_url, "mime": safe_mime, "data": None,
-                "source": source, "inspection": inspection,
-                "phash": None, "display": False, "match": match_score,
-            }
-        diag.log(f"   ✅ Vision verified (score={match_score:.2f}): {used_url[:80]}")
+            if not effective_trusted:
+                # Untrusted source failed vision — reject, preserve URL for link column
+                diag.log_candidate(
+                    source, used_url, "rejected_vision",
+                    f"Vision score {match_score:.2f} < threshold {verify_threshold:.2f} "
+                    f"for '{brand} {product_name}'",
+                    width=inspection.get("width"), height=inspection.get("height")
+                )
+                return {
+                    "url": used_url, "mime": safe_mime, "data": None,
+                    "source": source, "inspection": inspection,
+                    "phash": None, "display": False, "match": match_score,
+                }
+            else:
+                # Trusted source: low vision score is a warning, not a blocker.
+                # The brand/retailer page origin is the trust signal.
+                diag.log(
+                    f"   ⚠️ Trusted source low vision score ({match_score:.2f} < "
+                    f"{verify_threshold:.2f}) — showing; source-page trust applies: "
+                    f"{used_url[:80]}"
+                )
+        else:
+            diag.log(f"   ✅ Vision verified (score={match_score:.2f}): {used_url[:80]}")
+
+    elif not _product_known and not effective_trusted:
+        # Product name unknown AND source is untrusted — can't verify, reject
+        diag.log_candidate(source, used_url, "rejected_no_product_name",
+                           "Product name unknown — cannot verify untrusted image source")
+        return None
+
     elif not gemini_key and not effective_trusted:
-        # Cannot verify an untrusted source without the Gemini key
+        # No API key and untrusted source — reject
         diag.log_candidate(source, used_url, "rejected_no_verify",
                            "GEMINI_API_KEY not set — cannot verify untrusted image source")
         return None
-    else:
-        # effective_trusted=True but no gemini_key or no product_name
-        match_score = 0.5   # neutral score; verified source, unverifiable content
+    # else: effective_trusted=True, no key, or unknown product name → match_score=0.5
 
     return {
         "url":        used_url,
