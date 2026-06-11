@@ -446,7 +446,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
                         # Hard guard: never treat Amazon/eBay as a brand domain
                         if _is_excluded_domain(link):
                             continue
-                        if brand_candidate.lower() in domain.lower():
+                        if _brand_matches_domain(brand_candidate, domain):
                             # Only trust this page if the EAN appears in its HTML
                             ean_on_page = await page_contains_ean(session, link, ean)
                             if ean_on_page:
@@ -1422,6 +1422,21 @@ def _extract_brand(ground_truth: str) -> str:
     return ""
 
 
+def _brand_matches_domain(brand: str, domain: str) -> bool:
+    """
+    Fuzzy brand-to-domain match, stripping apostrophes, hyphens, and
+    spaces before comparing.  Handles cases like:
+      "Hellmann's" -> "hellmanns"  matches "uk.hellmanns.com"
+      "Coca-Cola"  -> "cocacola"   matches "coca-cola.com"
+    Requires at least 4 clean characters to avoid false positives.
+    """
+    if not brand or not domain:
+        return False
+    brand_clean  = re.sub(r"[^a-z0-9]", "", brand.lower())
+    domain_clean = re.sub(r"[^a-z0-9.]", "", domain.lower())
+    return len(brand_clean) >= 4 and brand_clean in domain_clean
+
+
 async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                                 ground_truth="", gemini_key=""):
     """
@@ -1443,6 +1458,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     candidate_image_urls = []
     registry_image_url   = None
     brand_for_verify     = _extract_brand(ground_truth) if ground_truth else ""
+
+    # Marketplace exclusion string — used in every SerpAPI image query so
+    # Google Images returns retailer/brand images instead of Amazon/eBay CDN URLs.
+    _mkt_excl = ("-site:amazon.com -site:amazon.co.uk -site:amazon.de "
+                 "-site:amazon.fr -site:amazon.it -site:amazon.es "
+                 "-site:ebay.com -site:ebay.co.uk -site:ebay.de "
+                 "-site:ebay.fr -site:ebay.it")
 
     # ── Stage 0: Brand-site image lookup ──────────────────────────────────────
     brand_domain_found  = None
@@ -1467,7 +1489,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                             if _is_excluded_domain(link):
                                 diag.log(f"   ⚠️ Skipping excluded domain: {domain}")
                                 continue
-                            if brand_candidate.lower() in domain.lower():
+                            if _brand_matches_domain(brand_candidate, domain):
                                 # Verify the page actually contains the EAN in its HTML
                                 ean_on_page = await page_contains_ean(session, link, ean)
                                 if ean_on_page:
@@ -1555,10 +1577,15 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                         if not is_garbage_name(candidate):
                             product_name = candidate
                             diag.log(f"✅ Goldmine name: {product_name}")
+                    before = len(retailer_urls)
                     retailer_urls.extend([
                         res.get("link") for res in organic[:4]
-                        if "link" in res and not _is_excluded_domain(res.get("link", ""))
+                        if "link" in res
+                        and res.get("link")
+                        and not _is_excluded_domain(res.get("link", ""))
                     ])
+                    added = len(retailer_urls) - before
+                    diag.log(f"   Goldmine: {len(organic)} results → {added} retailer URLs added.")
         except Exception as e:
             diag.log(f"⚠️ Goldmine failed: {e}")
 
@@ -1600,17 +1627,19 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         diag.log(f"   Scraped {scraped_count} URLs from retailer pages.")
 
     if serp_key:
-        diag.log("🖼️ SerpAPI image search by EAN...")
+        diag.log("🖼️ SerpAPI image search by EAN (marketplace-excluded)...")
         try:
             r1, r2 = await asyncio.gather(
-                session.get(serp_url, params={"q": f'"{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
+                session.get(serp_url, params={"q": f'"{ean}" {_mkt_excl}', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
                 session.get(serp_url, params={"q": f'site:barcodelookup.com OR site:go-upc.com "{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
                 return_exceptions=True
             )
             for resp, tag in [(r1, "serpapi_strict"), (r2, "serpapi_barcode")]:
                 if not isinstance(resp, Exception) and resp.status == 200:
                     img_data = await resp.json()
-                    for item in img_data.get("images_results", [])[:8]:
+                    items    = img_data.get("images_results", [])
+                    accepted = 0
+                    for item in items[:12]:
                         original   = item.get("original", "")
                         thumbnail  = item.get("thumbnail", "")
                         title      = item.get("title", "").lower()
@@ -1619,14 +1648,20 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                             continue
                         if original or thumbnail:
                             candidate_image_urls.append((tag, original, thumbnail, title, source))
+                            accepted += 1
+                    diag.log(f"   [{tag}] {accepted}/{len(items)} URLs kept after exclusion filter.")
+                else:
+                    status = getattr(resp, "status", "exception") if not isinstance(resp, Exception) else f"exception: {resp}"
+                    diag.log(f"   ⚠️ [{tag}] SerpAPI returned: {status}")
         except Exception as e:
             diag.log(f"⚠️ SerpAPI EAN search failed: {e}")
 
     if serp_key and product_name and not product_name.startswith("Product with EAN"):
         diag.log("🖼️ SerpAPI image search by name+EAN (anchored)...")
         name_words      = " ".join(product_name.split()[:5])
-        anchored_query  = f'"{ean}" {name_words} site:barcodelookup.com OR site:go-upc.com OR "{ean}" {name_words}'
-        hailmary_query  = f'"{ean}" {name_words} -site:aliexpress.com -site:ebay.com -site:alibaba.com -site:amazon.com'
+        # Both queries exclude Amazon/eBay so we get retailer/brand images
+        anchored_query  = f'"{ean}" {name_words} {_mkt_excl}'
+        hailmary_query  = f'{name_words} "{ean}" {_mkt_excl} -site:aliexpress.com -site:alibaba.com'
         for q_tag, q_str in [("serpapi_strict", anchored_query), ("serpapi_hailmary", hailmary_query)]:
             try:
                 async with session.get(serp_url, params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
@@ -1685,9 +1720,10 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
 
     # ── Stage 5: Hail-mary fallback ───────────────────────────────────────────
     if len(valid_candidates) == 0 and serp_key:
-        diag.log("🆘 HAIL MARY: zero viable — generic search...")
-        generic_query = (product_name if product_name and not product_name.startswith("Product with EAN")
+        diag.log("🆘 HAIL MARY: zero viable — generic search (marketplace-excluded)...")
+        generic_base  = (product_name if product_name and not product_name.startswith("Product with EAN")
                          else str(ean))
+        generic_query = f"{generic_base} {_mkt_excl}"
         try:
             async with session.get(serp_url, params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
                 if resp.status == 200:
