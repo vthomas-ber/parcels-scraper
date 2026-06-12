@@ -543,7 +543,32 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
         diagnostic_log.append("⚠️ Name not found via any source — Gemini will attempt EAN-grounded search.")
         product_name = f"Product with EAN {ean}"
 
-    # ── GATHER CANDIDATE IMAGES FOR GEMINI (lenient — Gemini validates these) ──
+    # ── GATHER CANDIDATE IMAGES FOR GEMINI ───────────────────────────────────
+    # Stage A: Google Shopping — primary EAN-anchored image source.
+    # Shopping matches on the barcode directly; images are retailer-submitted
+    # product photos, not arbitrary search results.
+    # Also yields retailer product-page URLs for Stage B OG scraping.
+    if serp_key:
+        diagnostic_log.append("🛒 Google Shopping images for Gemini (primary)...")
+        shopping_data_a = await _serp_get(session, serp_url,
+            params={"engine": "google_shopping", "q": ean,
+                    "gl": gl, "api_key": serp_key}, timeout=15)
+        if shopping_data_a:
+            for item in shopping_data_a.get("shopping_results", [])[:6]:
+                thumb = item.get("thumbnail", "")
+                link  = item.get("link", "")
+                if thumb and _is_valid_image_url(thumb) and thumb not in candidate_image_urls:
+                    candidate_image_urls.append(thumb)
+                # Enrich retailer_urls so Stage B can scrape product-page images
+                if link and not _is_excluded_domain(link) and link not in retailer_urls:
+                    retailer_urls.append(link)
+            diagnostic_log.append(
+                f"   Shopping: {len(shopping_data_a.get('shopping_results', []))} results.")
+        else:
+            diagnostic_log.append("   ⚠️ Google Shopping returned no data.")
+
+    # Stage B: OG/JSON-LD images scraped from retailer pages
+    # (includes pages discovered via Shopping above)
     if retailer_urls:
         diagnostic_log.append("🌐 Scraping OG images from approved retailer pages...")
         tasks     = [fetch_og_image(session, url) for url in retailer_urls]
@@ -552,9 +577,9 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
             if img and _is_valid_image_url(img) and img not in candidate_image_urls:
                 candidate_image_urls.append(img)
 
+    # Stage C: Google Images — secondary fallback only
     if serp_key:
-        diagnostic_log.append("🖼️ Searching high-res images via Google Images...")
-        # Sequential to avoid 429 burst; _serp_get handles retry automatically
+        diagnostic_log.append("🖼️ Google Images (secondary fallback for Gemini)...")
         _mkt_excl_a = ("-site:amazon.com -site:amazon.co.uk -site:amazon.de "
                        "-site:amazon.fr -site:ebay.com -site:ebay.co.uk")
         for img_q in [f'"{ean}" {_mkt_excl_a}',
@@ -562,7 +587,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
             img_data = await _serp_get(session, serp_url,
                 params={"q": img_q, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
             if img_data:
-                for item in img_data.get("images_results", [])[:8]:
+                for item in img_data.get("images_results", [])[:6]:
                     url = item.get("original", "")
                     if _is_valid_image_url(url) and url not in candidate_image_urls:
                         candidate_image_urls.append(url)
@@ -891,14 +916,15 @@ DISPLAY_BAD_SUBSTRINGS = {
 }
 
 DISPLAY_SOURCE_PRIORITY = {
-    "jsonld_retailer":  100,
-    "og_retailer":       80,
-    "twitter_retailer":  70,
-    "serpapi_strict":    60,
-    "serpapi_barcode":   55,
-    "serpapi_name":      50,
-    "serpapi_hailmary":  45,
-    "ean_search_registry": 40,
+    "jsonld_retailer":     100,  # scraped from page confirmed to contain the EAN
+    "og_retailer":          80,  # OG tag from retailer page
+    "shopping_result":      75,  # Google Shopping — EAN-matched, retailer-submitted
+    "twitter_retailer":     70,  # Twitter card from retailer page
+    "serpapi_strict":       60,  # Google Images EAN search (marketplace-excluded)
+    "serpapi_barcode":      55,  # Barcode-site image search
+    "serpapi_name":         50,  # Google Images name+EAN search
+    "serpapi_hailmary":     45,  # Google Images generic fallback
+    "ean_search_registry":  40,  # EAN-Search.org registry image
 }
 
 DISPLAY_USER_AGENTS = [
@@ -1676,6 +1702,48 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         except Exception as e:
             diag.log(f"⚠️ Global search failed: {e}")
 
+    # ── Stage 2a: Google Shopping (primary EAN-anchored image source) ───────────
+    # Google Shopping matches on GTIN/barcode and returns retailer-submitted
+    # product images.  These are directly tied to a product listing, not
+    # ranked by image SEO, making them far more product-specific than Google
+    # Images results.  Shopping results also enrich retailer_urls so Stage 2b
+    # can scrape additional JSON-LD/OG images from the product pages.
+    if serp_key:
+        diag.log("🛒 Google Shopping by EAN (primary image source)...")
+        shopping_data = await _serp_get(session, serp_url,
+            params={"engine": "google_shopping", "q": ean,
+                    "gl": gl, "api_key": serp_key}, timeout=15)
+        if shopping_data:
+            shopping_results = shopping_data.get("shopping_results", [])
+            shopping_hits    = 0
+            for item in shopping_results[:10]:
+                thumbnail   = item.get("thumbnail", "")
+                link        = item.get("link", "")
+                title_txt   = item.get("title", "").lower()
+                source_name = item.get("source", "").lower()
+                # Hard guard: skip excluded domains
+                if _is_excluded_domain(thumbnail) or _is_excluded_domain(link):
+                    continue
+                # Add retailer product-page URL for JSON-LD/OG scraping in Stage 2b
+                if link and link not in retailer_urls:
+                    retailer_urls.append(link)
+                # Collect thumbnail as a Shopping candidate
+                if thumbnail:
+                    candidate_image_urls.append(
+                        ("shopping_result", thumbnail, "", title_txt, source_name)
+                    )
+                    shopping_hits += 1
+            diag.log(f"   Shopping: {shopping_hits}/{len(shopping_results)} product images found.")
+            # Bootstrap product name from Shopping if still unknown
+            if not product_name and shopping_results:
+                candidate_nm = shopping_results[0].get("title", "")
+                if candidate_nm and not is_garbage_name(candidate_nm):
+                    product_name = candidate_nm
+                    diag.log(f"✅ Product name from Shopping: {product_name}")
+        else:
+            diag.log("   ⚠️ Google Shopping: no results (rate-limited or quota).")
+
+    # ── Stage 2b: Retailer page scraping (now enriched with Shopping URLs) ───
     # ── Stage 2: Gather candidate image URLs ─────────────────────────────────
     if retailer_urls:
         diag.log(f"🌐 Scraping JSON-LD/OG/Twitter from {min(len(retailer_urls), 5)} retailer pages...")
@@ -1719,29 +1787,58 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                 diag.log(f"   ⚠️ [{tag}] No results (rate-limited, quota, or empty).")
 
     if serp_key and product_name and not product_name.startswith("Product with EAN"):
-        diag.log("🖼️ SerpAPI image search by name+EAN (anchored)...")
-        name_words      = " ".join(product_name.split()[:5])
-        # Both queries exclude Amazon/eBay so we get retailer/brand images
-        anchored_query  = f'"{ean}" {name_words} {_mkt_excl}'
-        hailmary_query  = f'{name_words} "{ean}" {_mkt_excl} -site:aliexpress.com -site:alibaba.com'
-        for q_tag, q_str in [("serpapi_strict", anchored_query), ("serpapi_hailmary", hailmary_query)]:
-            img_data = await _serp_get(session, serp_url,
-                params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
-            if img_data:
-                name_hits = 0
-                for item in img_data.get("images_results", [])[:6]:
-                    original   = item.get("original", "")
-                    thumbnail  = item.get("thumbnail", "")
-                    title      = item.get("title", "").lower()
-                    source     = item.get("source", "").lower()
-                    if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
-                        continue
-                    if original or thumbnail:
-                        candidate_image_urls.append((q_tag, original, thumbnail, title, source))
-                        name_hits += 1
-                diag.log(f"   [{q_tag}] Found {name_hits} candidates.")
-            else:
-                diag.log(f"   ⚠️ [{q_tag}] No results (rate-limited or empty).")
+        name_words = " ".join(product_name.split()[:5])
+
+        # ── Supplementary Shopping search by name + EAN ──────────────────────
+        # A second Google Shopping call using the product name alongside the EAN
+        # surfaces variants and additional retailer listings that the EAN-only
+        # call may have missed.
+        diag.log("🛒 Google Shopping by name+EAN (supplementary)...")
+        shopping_name_data = await _serp_get(session, serp_url,
+            params={"engine": "google_shopping", "q": f"{name_words} {ean}",
+                    "gl": gl, "api_key": serp_key}, timeout=15)
+        if shopping_name_data:
+            name_shop_hits = 0
+            for item in shopping_name_data.get("shopping_results", [])[:6]:
+                thumbnail   = item.get("thumbnail", "")
+                link        = item.get("link", "")
+                title_txt   = item.get("title", "").lower()
+                source_name = item.get("source", "").lower()
+                if _is_excluded_domain(thumbnail) or _is_excluded_domain(link):
+                    continue
+                if link and link not in retailer_urls:
+                    retailer_urls.append(link)
+                if thumbnail:
+                    candidate_image_urls.append(
+                        ("shopping_result", thumbnail, "", title_txt, source_name)
+                    )
+                    name_shop_hits += 1
+            diag.log(f"   Name+EAN Shopping: {name_shop_hits} images found.")
+        else:
+            diag.log("   ⚠️ Name+EAN Shopping: no results.")
+
+        # ── Google Images hailmary — last resort for name-based image search ──
+        hailmary_query = (f'{name_words} "{ean}" {_mkt_excl}'
+                          f' -site:aliexpress.com -site:alibaba.com')
+        img_data = await _serp_get(session, serp_url,
+            params={"q": hailmary_query, "tbm": "isch",
+                    "gl": gl, "api_key": serp_key}, timeout=10)
+        if img_data:
+            name_hits = 0
+            for item in img_data.get("images_results", [])[:6]:
+                original   = item.get("original", "")
+                thumbnail  = item.get("thumbnail", "")
+                title      = item.get("title", "").lower()
+                source     = item.get("source", "").lower()
+                if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                    continue
+                if original or thumbnail:
+                    candidate_image_urls.append(
+                        ("serpapi_hailmary", original, thumbnail, title, source))
+                    name_hits += 1
+            diag.log(f"   [hailmary] Found {name_hits} Google Images candidates.")
+        else:
+            diag.log("   ⚠️ [hailmary] No results (rate-limited or empty).")
 
     if registry_image_url and not _is_excluded_domain(registry_image_url):
         candidate_image_urls.append(("ean_search_registry", registry_image_url, "", "", ""))
@@ -1781,42 +1878,58 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
 
     # ── Stage 5: Hail-mary fallback ───────────────────────────────────────────
     if len(valid_candidates) == 0 and serp_key:
-        diag.log("🆘 HAIL MARY: zero viable — generic search (marketplace-excluded)...")
+        diag.log("🆘 HAIL MARY: zero viable — trying Shopping then Google Images...")
+        hail = []
+
+        # Hail mary attempt 1: Google Shopping by EAN (no results yet = likely quota)
+        # This is a last-chance retry of the primary Shopping search with a fresh call.
+        hm_shopping = await _serp_get(session, serp_url,
+            params={"engine": "google_shopping", "q": ean,
+                    "gl": gl, "api_key": serp_key}, timeout=15)
+        if hm_shopping:
+            for item in hm_shopping.get("shopping_results", [])[:6]:
+                thumbnail   = item.get("thumbnail", "")
+                title_txt   = item.get("title", "").lower()
+                source_name = item.get("source", "").lower()
+                key         = thumbnail
+                if key and key not in seen_urls and not _is_excluded_domain(key):
+                    hail.append(("shopping_result", thumbnail, "", title_txt, source_name))
+                    seen_urls.add(key)
+            diag.log(f"   Hail mary Shopping: {len(hm_shopping.get('shopping_results', []))} results.")
+
+        # Hail mary attempt 2: Google Images generic fallback
         generic_base  = (product_name if product_name and not product_name.startswith("Product with EAN")
                          else str(ean))
         generic_query = f"{generic_base} {_mkt_excl}"
-        try:
-            img_data = await _serp_get(session, serp_url,
-                params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
-            if img_data:
-                if True:
-                    hail     = []
-                    for item in img_data.get("images_results", [])[:10]:
-                        original   = item.get("original", "")
-                        thumbnail  = item.get("thumbnail", "")
-                        title      = item.get("title", "").lower()
-                        src_domain = item.get("source", "").lower()
-                        key        = original or thumbnail
-                        if key and key not in seen_urls and not _is_excluded_domain(key):
-                            hail.append(("serpapi_hailmary", original, thumbnail, title, src_domain))
-                            seen_urls.add(key)
-                    diag.log(f"   Hail mary: {len(hail)} new candidates.")
-                    if hail:
-                        h_eval = await asyncio.gather(
-                            *[display_evaluate_candidate(
-                                session, s, orig, thumb, diag,
-                                gemini_key=gemini_key,
-                                product_name=_pname_for_verify,
-                                brand=brand_for_verify,
-                                title=ttl, src_domain=sdomain
-                              ) for s, orig, thumb, ttl, sdomain in hail],
-                            return_exceptions=True
-                        )
-                        h_valid = [r for r in h_eval if r and not isinstance(r, Exception)]
-                        valid_candidates.extend(h_valid)
-                        diag.log(f"   Rescued {len(h_valid)} viable images.")
-        except Exception as e:
-            diag.log(f"⚠️ Hail mary failed: {e}")
+        img_data = await _serp_get(session, serp_url,
+            params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
+        if img_data:
+            for item in img_data.get("images_results", [])[:10]:
+                original   = item.get("original", "")
+                thumbnail  = item.get("thumbnail", "")
+                title      = item.get("title", "").lower()
+                src_domain = item.get("source", "").lower()
+                key        = original or thumbnail
+                if key and key not in seen_urls and not _is_excluded_domain(key):
+                    hail.append(("serpapi_hailmary", original, thumbnail, title, src_domain))
+                    seen_urls.add(key)
+            diag.log(f"   Hail mary Images: {len(img_data.get('images_results', []))} results.")
+
+        diag.log(f"   Total hail mary candidates: {len(hail)}.")
+        if hail:
+            h_eval = await asyncio.gather(
+                *[display_evaluate_candidate(
+                    session, s, orig, thumb, diag,
+                    gemini_key=gemini_key,
+                    product_name=_pname_for_verify,
+                    brand=brand_for_verify,
+                    title=ttl, src_domain=sdomain
+                  ) for s, orig, thumb, ttl, sdomain in hail],
+                return_exceptions=True
+            )
+            h_valid = [r for r in h_eval if r and not isinstance(r, Exception)]
+            valid_candidates.extend(h_valid)
+            diag.log(f"   Rescued {len(h_valid)} viable images.")
 
     # ── Stage 6: Select top images ────────────────────────────────────────────
     selected = display_select(valid_candidates, diag)
