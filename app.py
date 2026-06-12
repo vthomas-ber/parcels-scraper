@@ -1911,11 +1911,13 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
 
         # ── Validation gate — is_exact_match=False means wrong product ────────
         if data.get("is_exact_match") is False:
+            # Images are suppressed: Path B searched under the wrong product
+            # name, so any images found belong to the wrong product.
             row = {
-                "Image 1": imgs[0],
-                "Image 2": imgs[1],
-                "Image Source Link": img_src_links[0],
-                "Image 2 Failure Reason": image_diag.image_2_failure,
+                "Image 1": "",
+                "Image 2": "",
+                "Image Source Link": "",
+                "Image 2 Failure Reason": "Images suppressed — EAN validation failed",
                 "Status": "Failed Validation",
                 "GTIN / EAN": ean,
                 "User Input": ground_truth,
@@ -2045,6 +2047,25 @@ async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market,
 
         results     = [r["row"]        for r in all_results]
         diagnostics = [r["image_diag"] for r in all_results]
+
+        # ── Cross-EAN duplicate image detection ────────────────────────────
+        # If two different EANs ended up with the same Image 1 URL, the image
+        # pipeline found a generic brand photo rather than a product-specific
+        # shot.  Flag those rows so users know to verify manually.
+        seen_img_urls: dict = {}
+        for row in results:
+            for col in ("Image 1", "Image 2"):
+                url = row.get(col, "")
+                if not url:
+                    continue
+                ean_key = row.get("GTIN / EAN", "")
+                if url in seen_img_urls and seen_img_urls[url] != ean_key:
+                    # Same URL appeared for a different EAN — flag both rows
+                    current_note = row.get("Image 2 Failure Reason", "")
+                    flag = f"⚠️ Duplicate image shared with EAN {seen_img_urls[url]} — may be a generic brand photo, not product-specific"
+                    row["Image 2 Failure Reason"] = flag if not current_note else f"{current_note}; {flag}"
+                else:
+                    seen_img_urls[url] = ean_key
 
         return results, diagnostics
 
@@ -2279,6 +2300,14 @@ if "results_df" in st.session_state:
     # for each EAN: how many candidates were found, fetched, and why any
     # were rejected.  Use this to debug missing or wrong images.
     if "image_diags" in st.session_state:
+        # Surface duplicate-image warnings as visible banners above the table
+        if "results_df" in st.session_state:
+            for _, warn_row in st.session_state["results_df"].iterrows():
+                reason = warn_row.get("Image 2 Failure Reason", "")
+                if reason and "Duplicate image" in str(reason):
+                    st.warning(
+                        f"**{warn_row.get('GTIN / EAN', '')}** — {reason}"
+                    )
         with st.expander("🔬 Image pipeline diagnostics", expanded=False):
             all_diags = st.session_state["image_diags"]
             results_eans = (st.session_state["results_df"]["GTIN / EAN"].tolist()
