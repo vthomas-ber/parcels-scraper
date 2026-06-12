@@ -378,6 +378,39 @@ async def fetch_image_bytes_simple(session, url):
     return None
 
 
+
+async def _serp_get(session, url: str, params: dict, timeout: int = 15,
+                    max_retries: int = 2) -> dict | None:
+    """
+    SerpAPI GET with automatic 429 backoff-retry.
+    Returns the parsed JSON dict, or None on persistent failure.
+    Converts concurrent burst failures into safe sequential retries.
+
+    Backoff schedule: 3 s after attempt 1, 6 s after attempt 2.
+    """
+    for attempt in range(max_retries + 1):
+        try:
+            async with session.get(url, params=params, timeout=timeout) as resp:
+                if resp.status == 200:
+                    return await resp.json()
+                if resp.status == 429:
+                    if attempt < max_retries:
+                        wait = 3 * (attempt + 1)   # 3 s, 6 s
+                        await asyncio.sleep(wait)
+                        continue
+                    return None   # exhausted retries
+                # Other HTTP error (403, 5xx…) — don't retry
+                return None
+        except asyncio.TimeoutError:
+            if attempt < max_retries:
+                await asyncio.sleep(1)
+                continue
+            return None
+        except Exception:
+            return None
+    return None
+
+
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_ground_truth=""):
     """
     Path A: Resolves the product name and gathers images for Gemini extraction.
@@ -434,13 +467,10 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
         if brand_candidate:
             diagnostic_log.append(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
-                async with session.get(serp_url, params={
-                    "q": f"{brand_candidate} {ean}",
-                    "gl": gl, "api_key": serp_key
-                }, timeout=10) as resp:
-                    data = await resp.json()
-                    organic = data.get("organic_results", [])
-                    for res in organic[:5]:
+                data    = await _serp_get(session, serp_url,
+                    params={"q": f"{brand_candidate} {ean}", "gl": gl, "api_key": serp_key})
+                organic = data.get("organic_results", []) if data else []
+                for res in organic[:5]:
                         link   = res.get("link", "")
                         domain = link.split("/")[2] if link.startswith("http") else ""
                         # Hard guard: never treat Amazon/eBay as a brand domain
@@ -475,37 +505,37 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
         diagnostic_log.append("🔍 Goldmine Google Search for Name...")
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
         try:
-            async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data    = await resp.json()
-                organic = data.get("organic_results", [])
-                if organic:
-                    product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    if is_garbage_name(product_name):
-                        product_name = None
-                        diagnostic_log.append("⚠️ Goldmine name looks like a garbage/placeholder — discarded")
-                    else:
-                        diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
-                    new_urls = [res.get("link") for res in organic[:4] if "link" in res
-                                and not _is_excluded_domain(res.get("link", ""))]
-                    for u in new_urls:
+            data = await _serp_get(session, serp_url,
+                params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key})
+            organic = data.get("organic_results", []) if data else []
+            if organic:
+                product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                if is_garbage_name(product_name):
+                    product_name = None
+                    diagnostic_log.append("⚠️ Goldmine name looks like a garbage/placeholder — discarded")
+                else:
+                    diagnostic_log.append(f"✅ Found Name via Goldmine: {product_name}")
+                new_urls = [res.get("link") for res in organic[:4] if "link" in res
+                            and not _is_excluded_domain(res.get("link", ""))]
+                for u in new_urls:
+                    if u not in retailer_urls:
+                        retailer_urls.append(u)
+            else:
+                # ── ATTEMPT 4: Bare GTIN global fallback (low-confidence) ──
+                diagnostic_log.append("⚠️ Goldmine returned nothing — bare GTIN global fallback (low confidence)...")
+                data2   = await _serp_get(session, serp_url,
+                    params={"q": str(ean), "gl": gl, "api_key": serp_key})
+                organic2 = data2.get("organic_results", []) if data2 else []
+                if organic2:
+                    candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
+                    if not is_garbage_name(candidate):
+                        product_name = candidate
+                        diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
+                    new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
+                                 and not _is_excluded_domain(res.get("link", ""))]
+                    for u in new_urls2:
                         if u not in retailer_urls:
                             retailer_urls.append(u)
-                else:
-                    # ── ATTEMPT 4: Bare GTIN global fallback (low-confidence) ──
-                    diagnostic_log.append("⚠️ Goldmine returned nothing — bare GTIN global fallback (low confidence)...")
-                    async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp2:
-                        data2    = await resp2.json()
-                        organic2 = data2.get("organic_results", [])
-                        if organic2:
-                            candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                            if not is_garbage_name(candidate):
-                                product_name = candidate
-                                diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
-                            new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
-                                         and not _is_excluded_domain(res.get("link", ""))]
-                            for u in new_urls2:
-                                if u not in retailer_urls:
-                                    retailer_urls.append(u)
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
 
@@ -524,21 +554,18 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
 
     if serp_key:
         diagnostic_log.append("🖼️ Searching high-res images via Google Images...")
-        try:
-            r1, r2 = await asyncio.gather(
-                session.get(serp_url, params={"q": f'"{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
-                session.get(serp_url, params={"q": f'site:barcodelookup.com OR site:go-upc.com "{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
-                return_exceptions=True
-            )
-            for resp in [r1, r2]:
-                if not isinstance(resp, Exception) and resp.status == 200:
-                    img_data = await resp.json()
-                    for item in img_data.get("images_results", []):
-                        url = item.get("original", "")
-                        if _is_valid_image_url(url) and url not in candidate_image_urls:
-                            candidate_image_urls.append(url)
-        except Exception:
-            pass
+        # Sequential to avoid 429 burst; _serp_get handles retry automatically
+        _mkt_excl_a = ("-site:amazon.com -site:amazon.co.uk -site:amazon.de "
+                       "-site:amazon.fr -site:ebay.com -site:ebay.co.uk")
+        for img_q in [f'"{ean}" {_mkt_excl_a}',
+                      f'site:barcodelookup.com OR site:go-upc.com "{ean}"']:
+            img_data = await _serp_get(session, serp_url,
+                params={"q": img_q, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
+            if img_data:
+                for item in img_data.get("images_results", [])[:8]:
+                    url = item.get("original", "")
+                    if _is_valid_image_url(url) and url not in candidate_image_urls:
+                        candidate_image_urls.append(url)
 
     if registry_image_url and _is_valid_image_url(registry_image_url) and registry_image_url not in candidate_image_urls:
         candidate_image_urls.append(registry_image_url)
@@ -1140,15 +1167,18 @@ def verify_image_with_gemini(image_data: bytes, mime: str,
     Identity verification: how confident are we that this image shows
     THIS specific product (correct brand AND variant)?
 
-    Returns a float 0.0–1.0.
-    FAILS CLOSED: returns 0.0 on any error, network failure, or API timeout.
-    Never returns True/1.0 by default — every unverifiable image is rejected.
+    Returns:
+      -1.0  : API unavailable / network error (cannot make a judgement)
+      0.0–1.0 : Model's confidence score (0 = definitively wrong product)
 
-    Model: VISION_MODEL (gemini-2.5-flash-lite) — the stable replacement for
-    the now-discontinued gemini-2.0-flash-lite (shut down 2026-06-01).
+    The sentinel -1.0 lets callers distinguish "model said no" from
+    "model couldn't run" — trusted sources allow -1.0 through, untrusted
+    sources reject it (fail-closed).
+
+    Model: VISION_MODEL (gemini-2.5-flash-lite).
     """
     if not gemini_key or not image_data:
-        return 0.0   # fail closed — no key, no approval
+        return -1.0   # can't verify — caller decides what to do
 
     label  = f"{brand} {product_name}".strip() if brand else (product_name or "")
     prompt = (
@@ -1185,7 +1215,7 @@ def verify_image_with_gemini(image_data: bytes, mime: str,
         m = re.search(r"\d{1,3}", txt)
         return (min(100, int(m.group())) / 100.0) if m else 0.0
     except Exception:
-        return 0.0   # FAIL CLOSED — never allow an unverifiable image
+        return -1.0   # API error — caller decides; -1 != "model said wrong"
 
 
 # Sources that come directly from a brand/retailer product page.
@@ -1275,44 +1305,78 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
     #   These are scraped directly from known-good product pages.
     #   Amazon/eBay are already blocked by effective_trusted above.
     #   No vision verification — the source page is the trust signal.
-    #   This matches the original behaviour that kept images working.
+    # ── Vision verification ───────────────────────────────────────────────────
+    # Both trusted and untrusted sources are verified.
+    # The sentinel value from verify_image_with_gemini:
+    #   -1.0  : API error / model unavailable
+    #    0.0–1.0 : Model score (0 = definitively wrong product)
     #
-    # UNTRUSTED sources (SerpAPI image search results):
-    #   Vision is the primary quality gate.  Fail-closed: 0.0 on any
-    #   error or API failure → reject.
+    # TRUSTED sources (brand/retailer pages, not Amazon/eBay):
+    #   -1.0 (API error)           → allow with neutral score (source trust applies)
+    #   0.0 – threshold            → REJECT: model clearly says wrong product
+    #   threshold – 1.0            → allow
+    #   Threshold: IMAGE_MATCH_THRESHOLD_TRUSTED (0.35) — lenient because
+    #   page-scraping context already gives prior confidence.
     #
-    match_score = 0.8   # default score for trusted sources
+    # UNTRUSTED sources (SerpAPI image results):
+    #   -1.0 or < threshold        → REJECT (fail-closed, no benefit of the doubt)
+    #   Threshold: IMAGE_MATCH_THRESHOLD (0.55)
+    #
+    _product_known = (product_name and
+                      not product_name.startswith("Product with EAN"))
+    match_score = 0.5   # default neutral
 
-    if not effective_trusted:
-        # Untrusted source — must pass vision
-        _product_known = (product_name and
-                          not product_name.startswith("Product with EAN"))
-        if gemini_key and _product_known:
-            match_score = await asyncio.to_thread(
-                verify_image_with_gemini,
-                payload["data"], safe_mime, product_name, brand, gemini_key
-            )
-            if match_score < IMAGE_MATCH_THRESHOLD:
+    if gemini_key and _product_known:
+        raw = await asyncio.to_thread(
+            verify_image_with_gemini,
+            payload["data"], safe_mime, product_name, brand, gemini_key
+        )
+
+        if effective_trusted:
+            if raw < 0:
+                # API error — allow trusted source; log for transparency
+                diag.log(f"   ⚠️ Trusted — vision API unavailable; showing: {used_url[:80]}")
+                match_score = 0.5
+            elif raw < IMAGE_MATCH_THRESHOLD_TRUSTED:
+                # Model says clearly wrong product — reject even trusted source
                 diag.log_candidate(
                     source, used_url, "rejected_vision",
-                    f"Vision score {match_score:.2f} < {IMAGE_MATCH_THRESHOLD:.2f} "
-                    f"for '{brand} {product_name}'",
+                    f"Trusted source — vision score {raw:.2f} < {IMAGE_MATCH_THRESHOLD_TRUSTED:.2f} "
+                    f"(model says wrong product: '{brand} {product_name}')",
                     width=inspection.get("width"), height=inspection.get("height")
                 )
                 return {
                     "url": used_url, "mime": safe_mime, "data": None,
                     "source": source, "inspection": inspection,
-                    "phash": None, "display": False, "match": match_score,
+                    "phash": None, "display": False, "match": raw,
                 }
-            diag.log(f"   ✅ Vision verified (score={match_score:.2f}): {used_url[:80]}")
+            else:
+                match_score = raw
+                diag.log(f"   ✅ Trusted vision verified (score={raw:.2f}): {used_url[:80]}")
         else:
-            # No key or unknown product name — can't verify untrusted source
-            reason = ("GEMINI_API_KEY not set" if not gemini_key
-                      else "Product name unknown")
-            diag.log_candidate(source, used_url, "rejected_no_verify", reason)
-            return None
+            # Untrusted: fail-closed — both API error and low score → reject
+            if raw < 0 or raw < IMAGE_MATCH_THRESHOLD:
+                diag.log_candidate(
+                    source, used_url, "rejected_vision",
+                    f"Untrusted — score {raw:.2f} (API error or wrong product for '{brand} {product_name}')",
+                    width=inspection.get("width"), height=inspection.get("height")
+                )
+                return {
+                    "url": used_url, "mime": safe_mime, "data": None,
+                    "source": source, "inspection": inspection,
+                    "phash": None, "display": False, "match": max(raw, 0),
+                }
+            match_score = raw
+            diag.log(f"   ✅ Vision verified (score={raw:.2f}): {used_url[:80]}")
+
+    elif not effective_trusted:
+        # No Gemini key or unknown product name — reject untrusted source
+        reason = "GEMINI_API_KEY not set" if not gemini_key else "Product name unknown"
+        diag.log_candidate(source, used_url, "rejected_no_verify", reason)
+        return None
     else:
-        diag.log(f"   ✅ Trusted source — no vision gate: {used_url[:80]}")
+        # Trusted source, no product name or no API key — allow with neutral score
+        diag.log(f"   ⚠️ Trusted source — no verification possible: {used_url[:80]}")
 
     return {
         "url":        used_url,
@@ -1475,13 +1539,11 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         if brand_candidate:
             diag.log(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
-                async with session.get(serp_url, params={
-                    "q": f"{brand_candidate} {ean}",
-                    "gl": gl, "api_key": serp_key
-                }, timeout=10) as resp:
-                    if resp.status == 200:
-                        data    = await resp.json()
-                        organic = data.get("organic_results", [])
+                data    = await _serp_get(session, serp_url,
+                    params={"q": f"{brand_candidate} {ean}", "gl": gl, "api_key": serp_key})
+                if data:
+                    organic = data.get("organic_results", [])
+                if data:
                         for res in organic[:5]:
                             link   = res.get("link", "")
                             domain = link.split("/")[2] if link.startswith("http") else ""
@@ -1516,12 +1578,11 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                 # use og_retailer for unverified (still useful but lower priority)
                 brand_img_tag = "jsonld_retailer" if brand_ean_verified else "og_retailer"
                 try:
-                    async with session.get(serp_url, params={
-                        "q": site_img_query, "tbm": "isch",
-                        "gl": gl, "api_key": serp_key
-                    }, timeout=10) as resp:
-                        if resp.status == 200:
-                            img_data = await resp.json()
+                    img_data = await _serp_get(session, serp_url,
+                        params={"q": site_img_query, "tbm": "isch",
+                                "gl": gl, "api_key": serp_key}, timeout=10)
+                    if img_data:
+                        if True:
                             hits     = 0
                             for item in img_data.get("images_results", [])[:8]:
                                 original   = item.get("original", "")
@@ -1568,46 +1629,50 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         diag.log("🔍 Goldmine search...")
         goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
         try:
-            async with session.get(serp_url, params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data    = await resp.json()
-                organic = data.get("organic_results", [])
-                if organic:
-                    if not product_name:
-                        candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                        if not is_garbage_name(candidate):
-                            product_name = candidate
-                            diag.log(f"✅ Goldmine name: {product_name}")
-                    before = len(retailer_urls)
-                    retailer_urls.extend([
-                        res.get("link") for res in organic[:4]
-                        if "link" in res
-                        and res.get("link")
-                        and not _is_excluded_domain(res.get("link", ""))
-                    ])
-                    added = len(retailer_urls) - before
-                    diag.log(f"   Goldmine: {len(organic)} results → {added} retailer URLs added.")
+            data    = await _serp_get(session, serp_url,
+                params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key})
+            organic = data.get("organic_results", []) if data else []
+            if organic:
+                if not product_name:
+                    candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                    if not is_garbage_name(candidate):
+                        product_name = candidate
+                        diag.log(f"✅ Goldmine name: {product_name}")
+                before = len(retailer_urls)
+                retailer_urls.extend([
+                    res.get("link") for res in organic[:4]
+                    if "link" in res
+                    and res.get("link")
+                    and not _is_excluded_domain(res.get("link", ""))
+                ])
+                added = len(retailer_urls) - before
+                diag.log(f"   Goldmine: {len(organic)} results → {added} retailer URLs added.")
+            elif data is None:
+                diag.log("   ⚠️ Goldmine: SerpAPI returned no data (rate-limited or quota).")
         except Exception as e:
             diag.log(f"⚠️ Goldmine failed: {e}")
 
     if serp_key and (not retailer_urls or not product_name):
         diag.log("🔍 Global GTIN search for retailer URLs...")
         try:
-            async with session.get(serp_url, params={"q": str(ean), "gl": gl, "api_key": serp_key}, timeout=15) as resp:
-                data    = await resp.json()
-                organic = data.get("organic_results", [])
-                if organic:
-                    if not product_name:
-                        candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                        if not is_garbage_name(candidate):
-                            product_name = candidate
-                            diag.log(f"✅ Global GTIN name (unverified): {product_name}")
-                    new_urls = [
-                        res.get("link") for res in organic[:5]
-                        if "link" in res and not _is_excluded_domain(res.get("link", ""))
-                    ]
-                    for u in new_urls:
-                        if u not in retailer_urls:
-                            retailer_urls.append(u)
+            data    = await _serp_get(session, serp_url,
+                params={"q": str(ean), "gl": gl, "api_key": serp_key})
+            organic = data.get("organic_results", []) if data else []
+            if organic:
+                if not product_name:
+                    candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
+                    if not is_garbage_name(candidate):
+                        product_name = candidate
+                        diag.log(f"✅ Global GTIN name (unverified): {product_name}")
+                new_urls = [
+                    res.get("link") for res in organic[:5]
+                    if "link" in res and not _is_excluded_domain(res.get("link", ""))
+                ]
+                for u in new_urls:
+                    if u not in retailer_urls:
+                        retailer_urls.append(u)
+            elif data is None:
+                diag.log("   ⚠️ Global GTIN: SerpAPI returned no data (rate-limited or quota).")
         except Exception as e:
             diag.log(f"⚠️ Global search failed: {e}")
 
@@ -1628,33 +1693,30 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
 
     if serp_key:
         diag.log("🖼️ SerpAPI image search by EAN (marketplace-excluded)...")
-        try:
-            r1, r2 = await asyncio.gather(
-                session.get(serp_url, params={"q": f'"{ean}" {_mkt_excl}', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
-                session.get(serp_url, params={"q": f'site:barcodelookup.com OR site:go-upc.com "{ean}"', "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10),
-                return_exceptions=True
-            )
-            for resp, tag in [(r1, "serpapi_strict"), (r2, "serpapi_barcode")]:
-                if not isinstance(resp, Exception) and resp.status == 200:
-                    img_data = await resp.json()
-                    items    = img_data.get("images_results", [])
-                    accepted = 0
-                    for item in items[:12]:
-                        original   = item.get("original", "")
-                        thumbnail  = item.get("thumbnail", "")
-                        title      = item.get("title", "").lower()
-                        source     = item.get("source", "").lower()
-                        if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
-                            continue
-                        if original or thumbnail:
-                            candidate_image_urls.append((tag, original, thumbnail, title, source))
-                            accepted += 1
-                    diag.log(f"   [{tag}] {accepted}/{len(items)} URLs kept after exclusion filter.")
-                else:
-                    status = getattr(resp, "status", "exception") if not isinstance(resp, Exception) else f"exception: {resp}"
-                    diag.log(f"   ⚠️ [{tag}] SerpAPI returned: {status}")
-        except Exception as e:
-            diag.log(f"⚠️ SerpAPI EAN search failed: {e}")
+        # Sequential (not concurrent) to avoid 429 burst.
+        # _serp_get handles 429 with automatic backoff-retry.
+        for q_str, tag in [
+            (f'"{ean}" {_mkt_excl}', "serpapi_strict"),
+            (f'site:barcodelookup.com OR site:go-upc.com "{ean}"', "serpapi_barcode"),
+        ]:
+            img_data = await _serp_get(session, serp_url,
+                params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
+            if img_data:
+                items    = img_data.get("images_results", [])
+                accepted = 0
+                for item in items[:12]:
+                    original   = item.get("original", "")
+                    thumbnail  = item.get("thumbnail", "")
+                    title      = item.get("title", "").lower()
+                    source     = item.get("source", "").lower()
+                    if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                        continue
+                    if original or thumbnail:
+                        candidate_image_urls.append((tag, original, thumbnail, title, source))
+                        accepted += 1
+                diag.log(f"   [{tag}] {accepted}/{len(items)} URLs kept after exclusion filter.")
+            else:
+                diag.log(f"   ⚠️ [{tag}] No results (rate-limited, quota, or empty).")
 
     if serp_key and product_name and not product_name.startswith("Product with EAN"):
         diag.log("🖼️ SerpAPI image search by name+EAN (anchored)...")
@@ -1663,24 +1725,23 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         anchored_query  = f'"{ean}" {name_words} {_mkt_excl}'
         hailmary_query  = f'{name_words} "{ean}" {_mkt_excl} -site:aliexpress.com -site:alibaba.com'
         for q_tag, q_str in [("serpapi_strict", anchored_query), ("serpapi_hailmary", hailmary_query)]:
-            try:
-                async with session.get(serp_url, params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
-                    if resp.status == 200:
-                        img_data  = await resp.json()
-                        name_hits = 0
-                        for item in img_data.get("images_results", [])[:6]:
-                            original   = item.get("original", "")
-                            thumbnail  = item.get("thumbnail", "")
-                            title      = item.get("title", "").lower()
-                            source     = item.get("source", "").lower()
-                            if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
-                                continue
-                            if original or thumbnail:
-                                candidate_image_urls.append((q_tag, original, thumbnail, title, source))
-                                name_hits += 1
-                        diag.log(f"   [{q_tag}] Found {name_hits} candidates.")
-            except Exception as e:
-                diag.log(f"⚠️ SerpAPI name search [{q_tag}] failed: {e}")
+            img_data = await _serp_get(session, serp_url,
+                params={"q": q_str, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
+            if img_data:
+                name_hits = 0
+                for item in img_data.get("images_results", [])[:6]:
+                    original   = item.get("original", "")
+                    thumbnail  = item.get("thumbnail", "")
+                    title      = item.get("title", "").lower()
+                    source     = item.get("source", "").lower()
+                    if _is_excluded_domain(original) or _is_excluded_domain(thumbnail):
+                        continue
+                    if original or thumbnail:
+                        candidate_image_urls.append((q_tag, original, thumbnail, title, source))
+                        name_hits += 1
+                diag.log(f"   [{q_tag}] Found {name_hits} candidates.")
+            else:
+                diag.log(f"   ⚠️ [{q_tag}] No results (rate-limited or empty).")
 
     if registry_image_url and not _is_excluded_domain(registry_image_url):
         candidate_image_urls.append(("ean_search_registry", registry_image_url, "", "", ""))
@@ -1725,9 +1786,10 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                          else str(ean))
         generic_query = f"{generic_base} {_mkt_excl}"
         try:
-            async with session.get(serp_url, params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10) as resp:
-                if resp.status == 200:
-                    img_data = await resp.json()
+            img_data = await _serp_get(session, serp_url,
+                params={"q": generic_query, "tbm": "isch", "gl": gl, "api_key": serp_key}, timeout=10)
+            if img_data:
+                if True:
                     hail     = []
                     for item in img_data.get("images_results", [])[:10]:
                         original   = item.get("original", "")
