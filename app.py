@@ -245,24 +245,129 @@ def should_cache(status: str) -> bool:
     return status == "Success"
 
 
+def _is_displayable_url(url: str) -> bool:
+    """
+    Change 4 — Returns True only for real, clickable source URLs.
+    Filters out Vertex AI grounding redirects (which 404 immediately)
+    and all hard-excluded domains.  Applied before storing Source 1-5.
+    """
+    if not url or not url.startswith("http"):
+        return False
+    if "vertexaisearch.cloud.google.com" in url:
+        return False
+    if _is_excluded_domain(url):
+        return False
+    return True
+
+
+def _extract_weight_hint(ground_truth: str) -> str:
+    """
+    Change 7 — Extract weight/volume hint from ground truth for use in image
+    verification label.  Matches patterns like 100g, 330ml, 1.5L, 250 gr.
+    """
+    if not ground_truth:
+        return ""
+    m = re.search(
+        r'\b(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|cl|l|oz|lb)\b',
+        ground_truth, re.IGNORECASE
+    )
+    return f"{m.group(1)}{m.group(2).lower()}" if m else ""
+
+
+# ── Go-UPC rate limiter (2 req/s per plan documentation) ─────────────────────
+_GO_UPC_SEM:  asyncio.Semaphore | None = None   # lazily initialised in event loop
+_GO_UPC_LAST: list[float]              = [0.0]  # mutable so nested fn can update it
+
+
+async def fetch_go_upc(session, ean: str, go_upc_key: str) -> dict | None:
+    """
+    Tier 1A — Go-UPC barcode lookup (https://go-upc.com/docs).
+
+    Returns a structured dict on success, None on 404 / any error.
+    Enforces the 2 requests/second rate limit documented by Go-UPC.
+
+    Fields returned:
+      name, brand, description, image_url, ingredients,
+      category, category_path, specs (dict), is_food (bool)
+    """
+    global _GO_UPC_SEM, _GO_UPC_LAST
+    if not go_upc_key:
+        return None
+    if _GO_UPC_SEM is None:
+        _GO_UPC_SEM = asyncio.Semaphore(1)  # serialise → max 2 req/s with sleep below
+
+    async with _GO_UPC_SEM:
+        # Enforce 0.5 s minimum gap between consecutive calls (= max 2 req/s)
+        now  = asyncio.get_event_loop().time()
+        wait = 0.5 - (now - _GO_UPC_LAST[0])
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _GO_UPC_LAST[0] = asyncio.get_event_loop().time()
+
+        url = f"https://go-upc.com/api/v1/code/{ean}"
+        try:
+            async with session.get(
+                url,
+                headers={"Authorization": f"Bearer {go_upc_key}"},
+                timeout=10
+            ) as resp:
+                if resp.status == 404:
+                    return None   # product not in Go-UPC database
+                if resp.status == 429:
+                    await asyncio.sleep(1.0)
+                    return None   # rate-limited — skip rather than retry
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                p    = data.get("product") or {}
+                if not p or not p.get("name"):
+                    return None
+                # Verify the returned barcode matches the queried EAN
+                returned = str(data.get("code", ""))
+                if not barcode_matches(returned, ean):
+                    return None
+                # Determine food/non-food from Google Shopping category path
+                cat_path = p.get("categoryPath") or []
+                is_food  = bool(cat_path) and cat_path[0].lower().startswith("food")
+                return {
+                    "name":          p.get("name", ""),
+                    "brand":         p.get("brand", ""),
+                    "description":   p.get("description", ""),
+                    "image_url":     p.get("imageUrl", "") or "",
+                    "ingredients":   (p.get("ingredients") or {}).get("text", ""),
+                    "category":      p.get("category", ""),
+                    "category_path": cat_path,
+                    "specs":         dict(p.get("specs") or []),
+                    "is_food":       is_food,
+                }
+        except Exception:
+            return None
+
+
 # ============================================================================
 # SHARED CONSTANTS (used by both pipelines)
 # ============================================================================
 
 GOLDMINE = {
-    "FR": "site:carrefour.fr OR site:auchan.fr OR site:coursesu.com",
-    "UK": "site:ocado.com OR site:waitrose.com OR site:asda.com OR site:tesco.com",
-    "NL": "site:ah.nl OR site:jumbo.com OR site:plus.nl",
-    "BE": "site:delhaize.be OR site:colruyt.be OR site:carrefour.be",
-    "DE": "site:rewe.de OR site:edeka.de OR site:kaufland.de OR site:dm.de OR site:rossmann.de",
-    "AT": "site:billa.at OR site:spar.at OR site:gurkerl.at OR site:hofer.at",
-    "DK": "site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk",
-    "IT": "site:carrefour.it OR site:conad.it OR site:coop.it",
-    "ES": "site:carrefour.es OR site:mercadona.es OR site:dia.es",
-    "SE": "site:ica.se OR site:coop.se OR site:willys.se",
-    "NO": "site:oda.com OR site:meny.no OR site:holdbart.no",
-    "FI": "site:k-ruoka.fi OR site:s-kaupat.fi",
-    "PL": "site:carrefour.pl OR site:auchan.pl OR site:frisco.pl",
+    "FR": ("site:carrefour.fr OR site:auchan.fr OR site:coursesu.com "
+           "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr"),
+    "UK": ("site:ocado.com OR site:waitrose.com OR site:asda.com "
+           "OR site:tesco.com OR site:sainsburys.co.uk OR site:morrisons.com"),
+    "NL": "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl",
+    "BE": ("site:delhaize.be OR site:colruyt.be OR site:carrefour.be "
+           "OR site:spar.be OR site:lidl.be"),
+    "DE": ("site:rewe.de OR site:edeka.de OR site:kaufland.de "
+           "OR site:dm.de OR site:rossmann.de OR site:metro.de"),
+    "AT": ("site:billa.at OR site:spar.at OR site:gurkerl.at "
+           "OR site:hofer.at OR site:mpreis.at"),
+    "DK": ("site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk "
+           "OR site:coop.dk OR site:salling.dk"),
+    "IT": ("site:carrefour.it OR site:conad.it OR site:coop.it "
+           "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it"),
+    "ES": ("site:carrefour.es OR site:mercadona.es OR site:dia.es "
+           "OR site:alcampo.es OR site:eroski.es OR site:lidl.es"),
+    "PL": ("site:carrefour.pl OR site:auchan.pl OR site:frisco.pl "
+           "OR site:lidl.pl OR site:kaufland.pl"),
 }
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
@@ -411,15 +516,16 @@ async def _serp_get(session, url: str, params: dict, timeout: int = 15,
     return None
 
 
-async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_ground_truth=""):
+async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
+                          user_ground_truth="", go_upc_data=None):
     """
     Path A: Resolves the product name and gathers images for Gemini extraction.
 
+    go_upc_data: pre-fetched Go-UPC result (from process_ean) or None.
+    Waterfall: Go-UPC (Tier 1A) → EAN-Search (Tier 1B, only if Go-UPC empty)
+               → SerpAPI goldmine → SerpAPI global fallback.
+
     Returns: (product_name, images, diagnostic_log, ean_verified)
-      - ean_verified: True when the EAN was confirmed via a barcode-registry
-        match (EAN-Search) or when the brand page's HTML contained the EAN.
-        Used downstream to determine whether to cache as 'Success' or flag
-        for review.
     """
     gl           = market_code.lower()
     market_upper = market_code.upper()
@@ -429,13 +535,28 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
     retailer_urls      = []
     candidate_image_urls = []
     registry_image_url = None
-    ean_verified       = False   # set True only when barcode is confirmed
+    ean_verified       = False
 
     serp_url = "https://serpapi.com/search"
 
-    # ── ATTEMPT 1: EAN-Search registry (barcode-anchored by construction) ──
-    if ean_token:
-        diagnostic_log.append("🔍 Attempt 1: EAN-Search.org API...")
+    # ── TIER 1A: Go-UPC (barcode-keyed, highest accuracy) ────────────────────
+    if go_upc_data:
+        diagnostic_log.append("✅ Tier 1A: Go-UPC data received.")
+        ean_verified = True
+        gname = go_upc_data.get("name", "")
+        if gname and not is_garbage_name(gname):
+            product_name = gname
+            diagnostic_log.append(f"✅ Go-UPC verified name: {product_name}")
+        img_url = go_upc_data.get("image_url", "")
+        if img_url and _is_valid_image_url(img_url):
+            candidate_image_urls.append(img_url)
+            diagnostic_log.append("✅ Go-UPC image URL added for Gemini context.")
+    else:
+        diagnostic_log.append("ℹ️ Go-UPC: no data — falling through to EAN-Search.")
+
+    # ── TIER 1B: EAN-Search (only if Go-UPC returned nothing) ────────────────
+    if not go_upc_data and ean_token:
+        diagnostic_log.append("🔍 Tier 1B: EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
         try:
             async with session.get(ean_url, timeout=5) as resp:
@@ -542,6 +663,14 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
     if not product_name:
         diagnostic_log.append("⚠️ Name not found via any source — Gemini will attempt EAN-grounded search.")
         product_name = f"Product with EAN {ean}"
+    elif not product_name.startswith("Product with EAN"):
+        # Change 5: guard resolved name against obviously non-food titles
+        if not _title_looks_like_food(product_name, ""):
+            diagnostic_log.append(
+                f"⚠️ Resolved name '{product_name}' appears non-food — treating as not found."
+            )
+            product_name = f"Product with EAN {ean}"
+            ean_verified = False  # non-food name cannot count as a verified identity
 
     # ── GATHER CANDIDATE IMAGES FOR GEMINI ───────────────────────────────────
     # Stage A: Google Shopping — primary EAN-anchored image source.
@@ -616,17 +745,32 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code, user_
 
 
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
-                    image_bytes_list, user_ground_truth):
+                    image_bytes_list, user_ground_truth, go_upc_data=None):
     """
     Path A: Sends the resolved product name + images to Gemini for structured
     food data extraction.  Uses Google Search grounding so Gemini can reach
     tier-1 retailer and brand pages directly.
 
+    go_upc_data: optional dict from fetch_go_upc — used as search-anchoring
+    context only. Never cited as an output source.
+
     Source exclusion rules are enforced both in this prompt and in the
     Python-side domain blocklist (_is_excluded_domain).
     """
-    market_upper  = market_code.upper()
+    market_upper   = market_code.upper()
     goldmine_sites = GOLDMINE.get(market_upper, "Major Tier-1 Supermarkets")
+
+    # Build barcode-database context string for search anchoring (never output source)
+    _go_upc_ctx = ""
+    if go_upc_data:
+        _parts = []
+        if go_upc_data.get("brand"):
+            _parts.append(f"Brand: {go_upc_data['brand']}")
+        if go_upc_data.get("category"):
+            _parts.append(f"Category: {go_upc_data['category']}")
+        if go_upc_data.get("ingredients"):
+            _parts.append(f"Ingredients reference: {go_upc_data['ingredients'][:400]}")
+        _go_upc_ctx = "\n".join(_parts)
 
     prompt = f"""
     You are the Lead Food Product Researcher.
@@ -634,9 +778,29 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
     ONLINE PRODUCT NAME FOUND: {product_name}
     USER INPUT (GROUND TRUTH): {user_ground_truth if user_ground_truth else "None provided (Proceed normally)"}
     MARKET: {market_code}
+    BARCODE DATABASE CONTEXT (search anchoring only — do NOT cite as output source):
+    {_go_upc_ctx if _go_upc_ctx else "No additional context available."}
 
     CORE DIRECTIVES:
-    0. VALIDATION GATE (THE BOUNCER): First and foremost, confirm that the product data you find online genuinely corresponds to EAN/barcode {ean}. If you find a product but its barcode, EAN, or GTIN does not match {ean}, set "is_exact_match" to false immediately and explain. Then, look at "USER INPUT (GROUND TRUTH)". If it is empty, proceed with the verified EAN data. If it contains text (like a brand, name, or weight), compare it to the product data you found for EAN {ean}. They MUST be the same product — but allow for minor formatting differences (abbreviations, capitalisation, punctuation, language translation). Only set "is_exact_match" to false for a CLEAR, MEANINGFUL mismatch: e.g. user says 'Strawberry 100g' but you found 'Vanilla 50g', brand is completely different, or weight differs by more than 20%. Do NOT fail for cosmetic differences (e.g. 'da 100 gr.' vs '100g'). A null result or failed validation is always better than wrong data presented as correct.
+    0. VALIDATION GATE — TIERED CONFIRMATION:
+
+       FOOD CHECK (mandatory first step): This tool is exclusively for food and drink products for human consumption. If the product you find is NOT food or drink — including household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, pet products, electronics, stationery, or ANY non-food item — set "is_exact_match" to false immediately and do not extract any data.
+
+       TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of an approved food product page. This is the strongest possible confirmation. Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
+
+       TIER B — Good confidence (only when USER INPUT ground truth is non-empty): The EAN {ean} does NOT appear in page text, BUT all three of the following match the USER INPUT (GROUND TRUTH):
+         - Brand name matches the product you found (minor spelling differences allowed)
+         - Product name matches closely (key words present, language differences allowed)
+         - Weight or volume matches within 15% of what USER INPUT states
+       In this case, accept the product and note in chain_of_thought that EAN was confirmed via name/brand/weight match rather than page text. Set food_info_reliability to "M" at most for Tier B confirmations. If USER INPUT (GROUND TRUTH) is empty, Tier B is NOT available — only Tier A is accepted.
+
+       TIER C — Reject immediately (set is_exact_match to false):
+         - Product is not food or drink for human consumption
+         - Brand OR product name clearly do not match USER INPUT (for a clear, meaningful mismatch — not cosmetic differences)
+         - EAN found on page but belongs to a different product
+         - No food product can be found for EAN {ean} on any approved source
+
+       COSMETIC DIFFERENCES: Do NOT fail for minor formatting differences (e.g. 'da 100 gr.' vs '100g', abbreviations, capitalisation, language translation). Only reject for clear, meaningful mismatches. A null result is always better than wrong data.
     1. ACCURACY: You have access to Google Search. You MUST prioritise official brand websites and approved tier-1 retailers only.
     2. SOURCE EXCLUSION (HARD CONSTRAINT): The following sources are STRICTLY FORBIDDEN — do NOT use them under any circumstances, even as a last resort:
        - Amazon (any amazon.* domain or subdomain including amazon.com, amazon.co.uk, amazon.de, etc.)
@@ -917,6 +1081,7 @@ DISPLAY_BAD_SUBSTRINGS = {
 
 DISPLAY_SOURCE_PRIORITY = {
     "jsonld_retailer":     100,  # scraped from page confirmed to contain the EAN
+    "go_upc_tier1":         95,  # Go-UPC API — barcode-keyed, S3-hosted image
     "og_retailer":          80,  # OG tag from retailer page
     "shopping_result":      75,  # Google Shopping — EAN-matched, retailer-submitted
     "twitter_retailer":     70,  # Twitter card from retailer page
@@ -1188,10 +1353,11 @@ def _title_looks_like_food(title: str, product_name: str) -> bool:
 
 def verify_image_with_gemini(image_data: bytes, mime: str,
                               product_name: str, brand: str,
-                              gemini_key: str) -> float:
+                              gemini_key: str,
+                              weight_hint: str = "") -> float:
     """
     Identity verification: how confident are we that this image shows
-    THIS specific product (correct brand AND variant)?
+    THIS specific product (correct brand, variant, AND weight/volume)?
 
     Returns:
       -1.0  : API unavailable / network error (cannot make a judgement)
@@ -1201,20 +1367,28 @@ def verify_image_with_gemini(image_data: bytes, mime: str,
     "model couldn't run" — trusted sources allow -1.0 through, untrusted
     sources reject it (fail-closed).
 
+    weight_hint: optional weight/volume string extracted from ground truth
+    (e.g. "330ml", "100g") appended to the label for tighter matching.
+
     Model: VISION_MODEL (gemini-2.5-flash-lite).
     """
     if not gemini_key or not image_data:
         return -1.0   # can't verify — caller decides what to do
 
-    label  = f"{brand} {product_name}".strip() if brand else (product_name or "")
+    base_label = f"{brand} {product_name}".strip() if brand else (product_name or "")
+    label      = f"{base_label} {weight_hint}".strip() if weight_hint else base_label
     prompt = (
         f"You are verifying a product photo for a food database.\n"
         f"Target product: '{label}'.\n\n"
         f"Reply with ONLY a number 0-100 representing your confidence that this image "
         f"shows the packaging of THAT SPECIFIC product (same brand AND same variant/flavour).\n\n"
         f"Scoring guide:\n"
-        f"  0-15  : Non-food item (hardware, tools, furniture, landscapes, people, "
-        f"logos, blank barcodes, safari or travel imagery).\n"
+        f"  0-15  : Non-food item — this includes: hardware, tools, furniture, "
+        f"landscapes, people, logos, blank barcodes, safari/travel imagery, "
+        f"household cleaning products, air fresheners, plug-in refills, "
+        f"cling wrap, aluminium foil, baking paper, film rolls, "
+        f"personal care products, cosmetics, pet products, electronics, "
+        f"stationery, or ANY item that is not food or drink for human consumption.\n"
         f"  16-45 : Food or drink item but clearly a DIFFERENT brand or product variant.\n"
         f"  46-79 : Plausibly the right product but brand or variant is unclear.\n"
         f"  80-100: Brand name and product visibly match '{label}'.\n\n"
@@ -1249,13 +1423,16 @@ def verify_image_with_gemini(image_data: bytes, mime: str,
 # because the page-scraping context gives us higher prior confidence.
 # IMPORTANT: this trust is only applied after _is_excluded_domain() confirms
 # the URL is not from a hard-excluded marketplace.
-TRUSTED_SOURCES = {"jsonld_retailer", "og_retailer", "twitter_retailer", "ean_search_registry"}
+TRUSTED_SOURCES = {"jsonld_retailer", "og_retailer", "twitter_retailer", "ean_search_registry", "go_upc_tier1"}
 
 
 async def display_evaluate_candidate(session, source, original_url, thumbnail_url, diag,
-                                     gemini_key="", product_name="", brand="", title="", src_domain=""):
+                                     gemini_key="", product_name="", brand="",
+                                     title="", src_domain="", weight_hint=""):
     """
     Download + inspect a single candidate display image.
+    weight_hint: optional weight/volume string (e.g. "330ml") passed to the
+    vision verifier so it can distinguish weight variants of the same product.
     Strategy:
       1. Hard reject any URL from an excluded marketplace/UGC domain.
       2. Pre-filter on title/source text (instant, free).
@@ -1355,7 +1532,8 @@ async def display_evaluate_candidate(session, source, original_url, thumbnail_ur
     if gemini_key and _product_known:
         raw = await asyncio.to_thread(
             verify_image_with_gemini,
-            payload["data"], safe_mime, product_name, brand, gemini_key
+            payload["data"], safe_mime, product_name, brand, gemini_key,
+            weight_hint  # Change 7: include weight for tighter variant matching
         )
 
         if effective_trusted:
@@ -1528,7 +1706,7 @@ def _brand_matches_domain(brand: str, domain: str) -> bool:
 
 
 async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
-                                ground_truth="", gemini_key=""):
+                                ground_truth="", gemini_key="", go_upc_data=None):
     """
     Path B: Find and verify the 2 images shown in the results table.
     Completely separate from food extraction; runs in parallel with Path A.
@@ -1548,6 +1726,22 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     candidate_image_urls = []
     registry_image_url   = None
     brand_for_verify     = _extract_brand(ground_truth) if ground_truth else ""
+    weight_for_verify    = _extract_weight_hint(ground_truth) if ground_truth else ""
+
+    # ── Tier 1A: Go-UPC — inject verified name and image before any search ────
+    if go_upc_data:
+        diag.log("✅ Tier 1A: Go-UPC data received.")
+        if not product_name:
+            gname = go_upc_data.get("name", "")
+            if gname and not is_garbage_name(gname):
+                product_name = gname
+                diag.log(f"✅ Go-UPC verified name: {product_name}")
+        img_url = go_upc_data.get("image_url", "")
+        if img_url and not _is_excluded_domain(img_url):
+            candidate_image_urls.append(("go_upc_tier1", img_url, "", "", "go-upc"))
+            diag.log(f"✅ Go-UPC Tier 1 image added: {img_url[:80]}")
+    else:
+        diag.log("ℹ️ Go-UPC: no data — falling through to EAN-Search.")
 
     # Marketplace exclusion string — used in every SerpAPI image query so
     # Google Images returns retailer/brand images instead of Amazon/eBay CDN URLs.
@@ -1627,9 +1821,9 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                 except Exception as e:
                     diag.log(f"⚠️ Brand domain image search failed: {e}")
 
-    # ── Stage 1: Name lookup ──────────────────────────────────────────────────
-    if ean_token:
-        diag.log("🔍 EAN-Search.org API...")
+    # ── Stage 1B: EAN-Search (only if Go-UPC returned nothing) ─────────────────
+    if not go_upc_data and ean_token:
+        diag.log("🔍 Tier 1B: EAN-Search.org API...")
         ean_url = f"https://api.ean-search.org/api?token={ean_token}&op=barcode-lookup&ean={ean}&format=json"
         try:
             async with session.get(ean_url, timeout=5) as resp:
@@ -1867,7 +2061,8 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
             gemini_key=gemini_key,
             product_name=_pname_for_verify,
             brand=brand_for_verify,
-            title=title, src_domain=src_domain
+            title=title, src_domain=src_domain,
+            weight_hint=weight_for_verify  # Change 7
         )
         for src, original, thumbnail, title, src_domain in deduped[:20]
     ]
@@ -1923,7 +2118,8 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                     gemini_key=gemini_key,
                     product_name=_pname_for_verify,
                     brand=brand_for_verify,
-                    title=ttl, src_domain=sdomain
+                    title=ttl, src_domain=sdomain,
+                    weight_hint=weight_for_verify  # Change 7
                   ) for s, orig, thumb, ttl, sdomain in hail],
                 return_exceptions=True
             )
@@ -1934,16 +2130,22 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     # ── Stage 6: Select top images ────────────────────────────────────────────
     selected = display_select(valid_candidates, diag)
 
-    # Image Source Link = the actual product/brand PAGE url (not an image file url)
-    source_links     = []
+    # Change 8: Image Source Link — only include pages confirmed to contain the EAN
+    # This ensures the link actually leads to the correct product page.
+    source_links      = []
     seen_link_domains = set()
     for page_url in retailer_urls:
-        if not page_url:
+        if not page_url or _is_excluded_domain(page_url):
             continue
         dom = page_url.split("/")[2] if page_url.startswith("http") else ""
-        if dom and dom not in seen_link_domains and not _is_excluded_domain(page_url):
-            source_links.append(page_url)
-            seen_link_domains.add(dom)
+        if dom and dom not in seen_link_domains:
+            ean_confirmed = await page_contains_ean(session, page_url, ean)
+            if ean_confirmed:
+                source_links.append(page_url)
+                seen_link_domains.add(dom)
+                diag.log(f"✅ Image Source Link confirmed (EAN in page): {dom}")
+            else:
+                diag.log(f"   ⚠️ Source link skipped — EAN not found on page: {dom}")
         if len(source_links) >= 2:
             break
 
@@ -1954,7 +2156,8 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
 # ORCHESTRATION: run Path A + Path B in parallel, merge results
 # ============================================================================
 
-async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, market, taxonomy_text):
+async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
+                      go_upc_key, market, taxonomy_text):
     ean           = item["ean"]
     ground_truth  = item.get("ground_truth", "")
     force_refresh = item.get("force_refresh", False)
@@ -1971,19 +2174,62 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
         cache_delete(ean, market)
 
     async with sem:
+        # ── Tier 1A: Go-UPC — single call, result shared by both paths ───────
+        go_upc_data = await fetch_go_upc(session, ean, go_upc_key)
+        if go_upc_data:
+            print(f"[Go-UPC] {ean}: {go_upc_data.get('name','')} "
+                  f"| food={go_upc_data.get('is_food')} "
+                  f"| img={'yes' if go_upc_data.get('image_url') else 'no'}")
+
+        # ── Non-food early exit: Go-UPC confirmed this is not food ────────────
+        if go_upc_data and not go_upc_data.get("is_food", True):
+            cat = go_upc_data.get("category", "unknown category")
+            msg = f"Non-food product confirmed by Go-UPC (category: {cat})"
+            empty_diag = ImageDiagnostics(ean)
+            empty_diag.log(f"❌ {msg}")
+            row = {
+                "Image 1": "", "Image 2": "", "Image Source Link": "",
+                "GTIN / EAN": ean, "User Input": ground_truth,
+                "Status": f"⚠️ Not Food — {cat}",
+                "Product Name": go_upc_data.get("name", ""),
+                "Chain of Thought": msg,
+                "Cached": "🔄 Fresh",
+            }
+            return {"row": row, "image_diag": empty_diag, "food_diag": None}
+
         # ── Run both pipelines concurrently ──────────────────────────────────
         food_task  = fetch_basic_info(session, ean, serp_key, ean_token, market,
-                                      user_ground_truth=ground_truth)
+                                      user_ground_truth=ground_truth,
+                                      go_upc_data=go_upc_data)
         image_task = fetch_display_images(session, ean, serp_key, ean_token, market,
-                                           ground_truth=ground_truth, gemini_key=gemini_key)
+                                           ground_truth=ground_truth, gemini_key=gemini_key,
+                                           go_upc_data=go_upc_data)
 
         (name, gemini_images, food_diag, ean_verified), \
         (display_images, image_diag, source_links) = await asyncio.gather(food_task, image_task)
 
+        # ── Change 1: Early exit when no approved source found anything ───────
+        no_sources = (
+            name.startswith("Product with EAN") and
+            not ean_verified and
+            len(gemini_images) == 0 and
+            go_upc_data is None
+        )
+        if no_sources:
+            empty_diag2 = ImageDiagnostics(ean)
+            empty_diag2.log("❌ No approved source indexed this EAN.")
+            row = {
+                "Image 1": "", "Image 2": "", "Image Source Link": "",
+                "GTIN / EAN": ean, "User Input": ground_truth,
+                "Status": "⚠️ Not Found — no approved source indexed this EAN",
+                "Cached": "🔄 Fresh",
+            }
+            return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
+
         # ── Path A: Gemini food extraction ───────────────────────────────────
         data = await asyncio.to_thread(
             run_gemini_sync, ean, name, market, gemini_key,
-            taxonomy_text, gemini_images, ground_truth
+            taxonomy_text, gemini_images, ground_truth, go_upc_data
         )
 
         # ── Path B output ─────────────────────────────────────────────────────
@@ -2011,8 +2257,9 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
             sources = [s.strip() for s in sources.split(",") if s.strip()]
         elif not isinstance(sources, list):
             sources = []
-        # Final safety pass: remove any forbidden domains Gemini may have slipped in
-        sources = [s for s in sources if s and not _is_excluded_domain(s)]
+        # Change 4: keep only real, clickable URLs — filter Vertex grounding redirects
+        # and any forbidden domains Gemini may have slipped in
+        sources = [s for s in sources if s and _is_displayable_url(s)]
         srcs    = (sources + ["", "", "", "", ""])[:5]
 
         # ── Determine real approved sources (filter grounding redirect URLs) ──
@@ -2140,8 +2387,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token, marke
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
 
-async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market,
-                   taxonomy_text, progress_bar, status_text):
+async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, go_upc_key,
+                   market, taxonomy_text, progress_bar, status_text):
     sem       = asyncio.Semaphore(5)
     total     = len(parsed_inputs)
     completed = 0
@@ -2150,7 +2397,7 @@ async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market,
         async def tracked(item):
             nonlocal completed
             res = await process_ean(sem, session, item, serp_key, gemini_key,
-                                     ean_token, market, taxonomy_text)
+                                     ean_token, go_upc_key, market, taxonomy_text)
             completed += 1
             progress_bar.progress(completed / total)
             status_text.text(f"Processed {completed}/{total} items...")
@@ -2189,9 +2436,10 @@ async def run_main(parsed_inputs, serp_key, gemini_key, ean_token, market,
 
 st.title("🔬 Food Data Researcher PRO")
 
-SERP_KEY   = os.environ.get("SERPAPI_KEY", "")
-GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "")
-EAN_TOKEN  = os.environ.get("EAN_SEARCH_TOKEN", "")
+SERP_KEY    = os.environ.get("SERPAPI_KEY", "")
+GEMINI_KEY  = os.environ.get("GEMINI_API_KEY", "")
+EAN_TOKEN   = os.environ.get("EAN_SEARCH_TOKEN", "")
+GO_UPC_KEY  = os.environ.get("GO_UPC_API_KEY", "")
 
 taxonomy_text = load_taxonomy()
 init_cache()
@@ -2210,6 +2458,9 @@ with st.sidebar:
 
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables.")
+    if not GO_UPC_KEY:
+        st.info("ℹ️ GO_UPC_API_KEY not set — Tier 1A barcode lookup disabled. "
+                "Add GO_UPC_API_KEY to Render environment to enable.")
 
     if "Error" in taxonomy_text:
         st.error("⚠️ taxonomy.csv missing from project root!")
@@ -2267,8 +2518,8 @@ if st.button("🚀 Start Deep Research", type="primary"):
         status_text  = st.empty()
         with st.spinner(f"Analyzing {len(parsed_inputs)} products concurrently..."):
             all_data, all_diags = asyncio.run(
-                run_main(parsed_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, market_code,
-                         taxonomy_text, progress_bar, status_text)
+                run_main(parsed_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, GO_UPC_KEY,
+                         market_code, taxonomy_text, progress_bar, status_text)
             )
 
             st.session_state["results_df"]   = pd.DataFrame(all_data)
@@ -2389,7 +2640,7 @@ if "results_df" in st.session_state:
             rerun_status   = st.empty()
             with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
                 rerun_data, _ = asyncio.run(
-                    run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN,
+                    run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, GO_UPC_KEY,
                              market_code, taxonomy_text, rerun_progress, rerun_status)
                 )
                 rerun_df = pd.DataFrame(rerun_data)
