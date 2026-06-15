@@ -248,12 +248,19 @@ def should_cache(status: str) -> bool:
 def _is_displayable_url(url: str) -> bool:
     """
     Change 4 — Returns True only for real, clickable source URLs.
-    Filters out Vertex AI grounding redirects (which 404 immediately)
-    and all hard-excluded domains.  Applied before storing Source 1-5.
+    Filters out:
+    - Vertex AI grounding redirect URLs (which 404 immediately)
+    - google.com/search?q= URLs (Gemini internal search queries leaking out)
+    - google.com/url? redirect wrappers
+    - All hard-excluded marketplace/UGC domains
     """
     if not url or not url.startswith("http"):
         return False
     if "vertexaisearch.cloud.google.com" in url:
+        return False
+    if "google.com/search" in url:
+        return False
+    if "google.com/url?" in url:
         return False
     if _is_excluded_domain(url):
         return False
@@ -262,11 +269,23 @@ def _is_displayable_url(url: str) -> bool:
 
 def _extract_weight_hint(ground_truth: str) -> str:
     """
-    Change 7 — Extract weight/volume hint from ground truth for use in image
-    verification label.  Matches patterns like 100g, 330ml, 1.5L, 250 gr.
+    Change 7 — Extract unit weight/volume hint from ground truth for image
+    verification. Handles pack-size notation by extracting the UNIT size:
+      "4x200ml"      → "200ml"   (unit, not total)
+      "6x330ml"      → "330ml"
+      "(4 Pack) 80g" → "80g"
+      "255g"         → "255g"
     """
     if not ground_truth:
         return ""
+    # Pack notation: NxVolume or N x Volume — extract the unit, not pack total
+    m = re.search(
+        r'\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|cl|l|oz|lb)\b',
+        ground_truth, re.IGNORECASE
+    )
+    if m:
+        return f"{m.group(1)}{m.group(2).lower()}"
+    # Standard single weight/volume
     m = re.search(
         r'\b(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|cl|l|oz|lb)\b',
         ground_truth, re.IGNORECASE
@@ -582,9 +601,13 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             diagnostic_log.append(f"⚠️ EAN-Search failed: {e}")
 
     # ── ATTEMPT 2: Brand-site lookup (if brand token in ground truth) ──
+    # Strip pack notation before using ground truth in search queries so
+    # "Eisberg Be Free Sparkling Rosé (4 Pack), 4x200ml" searches as
+    # "Eisberg Be Free Sparkling Rosé 200ml" and finds the unit listing.
+    _clean_ground_truth = _strip_pack_notation(user_ground_truth) if user_ground_truth else user_ground_truth
     brand_domain = None
     if serp_key and user_ground_truth:
-        brand_candidate = _extract_brand(user_ground_truth)
+        brand_candidate = _extract_brand(_clean_ground_truth)
         if brand_candidate:
             diagnostic_log.append(f"🔍 Brand-site lookup for '{brand_candidate}'...")
             try:
@@ -603,7 +626,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                             if ean_on_page:
                                 if not product_name:
                                     product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
-                                    diagnostic_log.append(f"✅ Brand page EAN verified — name: {product_name}")
+                                    diagnostic_log.append(f"✅ Brand page EAN verified — name: {product_name} (from clean query: {_clean_ground_truth})")
                                 if not ean_verified:
                                     ean_verified = True
                                 if link not in retailer_urls:
@@ -784,23 +807,25 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
     CORE DIRECTIVES:
     0. VALIDATION GATE — TIERED CONFIRMATION:
 
-       FOOD CHECK (mandatory first step): This tool is exclusively for food and drink products for human consumption. If the product you find is NOT food or drink — including household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, pet products, electronics, stationery, or ANY non-food item — set "is_exact_match" to false immediately and do not extract any data.
+       FOOD CHECK (mandatory first step): This tool covers food, drink, and pet food products. If the product you find is clearly NOT in any of these categories — for example household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, electronics, furniture, tools, clothing, or stationery — set "is_exact_match" to false immediately and do not extract any data. NOTE: tinned fish, seafood, and all animal products for human consumption ARE food. Pet food, animal feed, and treats sold for pets are also acceptable — do not reject them.
 
        TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of an approved food product page. This is the strongest possible confirmation. Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
 
        TIER B — Good confidence (only when USER INPUT ground truth is non-empty): The EAN {ean} does NOT appear in page text, BUT all three of the following match the USER INPUT (GROUND TRUTH):
          - Brand name matches the product you found (minor spelling differences allowed)
          - Product name matches closely (key words present, language differences allowed)
-         - Weight or volume matches within 15% of what USER INPUT states
+         - Unit weight or volume matches within 15% of what USER INPUT states
        In this case, accept the product and note in chain_of_thought that EAN was confirmed via name/brand/weight match rather than page text. Set food_info_reliability to "M" at most for Tier B confirmations. If USER INPUT (GROUND TRUTH) is empty, Tier B is NOT available — only Tier A is accepted.
 
        TIER C — Reject immediately (set is_exact_match to false):
-         - Product is not food or drink for human consumption
+         - Product is clearly not food, drink, or pet food (see FOOD CHECK above)
          - Brand OR product name clearly do not match USER INPUT (for a clear, meaningful mismatch — not cosmetic differences)
          - EAN found on page but belongs to a different product
-         - No food product can be found for EAN {ean} on any approved source
+         - No food/pet-food product can be found for EAN {ean} on any approved source
 
        COSMETIC DIFFERENCES: Do NOT fail for minor formatting differences (e.g. 'da 100 gr.' vs '100g', abbreviations, capitalisation, language translation). Only reject for clear, meaningful mismatches. A null result is always better than wrong data.
+
+       PACK SIZE LENIENCY (important): If USER INPUT states a multi-pack format like '4x200ml', '6x330ml', or '(4 Pack) 80g', compare only the UNIT size against what you find online. A product listed as '200ml' MATCHES a USER INPUT of '4x200ml'. A product listed as '80g' MATCHES '(4 Pack) 80g'. Do NOT fail validation because the online listing shows the individual unit while the USER INPUT describes the pack. The barcode on the pack is the same as the barcode on the unit in most retailer systems.
     1. ACCURACY: You have access to Google Search. You MUST prioritise official brand websites and approved tier-1 retailers only.
     2. SOURCE EXCLUSION (HARD CONSTRAINT): The following sources are STRICTLY FORBIDDEN — do NOT use them under any circumstances, even as a last resort:
        - Amazon (any amazon.* domain or subdomain including amazon.com, amazon.co.uk, amazon.de, etc.)
@@ -1668,6 +1693,33 @@ _BRAND_STOPWORDS = {
 }
 
 
+def _strip_pack_notation(text: str) -> str:
+    """
+    Remove pack-size notation from ground truth before using it in search
+    queries or weight comparisons.  Prevents "4x200ml" or "(4 Pack)" from
+    confusing retailer lookups into returning the wrong pack variant.
+    Examples:
+      "Eisberg Be Free Sparkling Rosé (4 Pack), 4x200ml"
+        → "Eisberg Be Free Sparkling Rosé 200ml"
+      "McVities HobNobs 6x255g"
+        → "McVities HobNobs 255g"
+    """
+    if not text:
+        return text
+    # Remove "(N Pack)" / "(Pack of N)" style annotations
+    text = re.sub(r'\(\s*\d+\s*[Pp]ack[^)]*\)', '', text)
+    text = re.sub(r'\(\s*[Pp]ack\s+of\s+\d+[^)]*\)', '', text)
+    # Convert "NxVolume" → "Volume" (keep the unit size, drop the count)
+    text = re.sub(
+        r'\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?\s*(?:g|gr|kg|ml|cl|l|oz|lb))\b',
+        r'\1', text, flags=re.IGNORECASE
+    )
+    # Clean up extra punctuation left behind
+    text = re.sub(r',\s*,', ',', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip().strip(',').strip()
+    return text
+
+
 def _extract_brand(ground_truth: str) -> str:
     """
     Extract a brand token from ground_truth.
@@ -1754,10 +1806,11 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     brand_domain_found  = None
     brand_ean_verified  = False   # True only if page_contains_ean() passed
 
+    _clean_gt = _strip_pack_notation(ground_truth) if ground_truth else ground_truth
     if serp_key and ground_truth:
-        brand_candidate = _extract_brand(ground_truth)
+        brand_candidate = _extract_brand(_clean_gt)
         if brand_candidate:
-            diag.log(f"🔍 Brand-site lookup for '{brand_candidate}'...")
+            diag.log(f"🔍 Brand-site lookup for '{brand_candidate}' (cleaned: '{_clean_gt[:50]}')")
             try:
                 data    = await _serp_get(session, serp_url,
                     params={"q": f"{brand_candidate} {ean}", "gl": gl, "api_key": serp_key})
@@ -2181,21 +2234,12 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                   f"| food={go_upc_data.get('is_food')} "
                   f"| img={'yes' if go_upc_data.get('image_url') else 'no'}")
 
-        # ── Non-food early exit: Go-UPC confirmed this is not food ────────────
-        if go_upc_data and not go_upc_data.get("is_food", True):
-            cat = go_upc_data.get("category", "unknown category")
-            msg = f"Non-food product confirmed by Go-UPC (category: {cat})"
-            empty_diag = ImageDiagnostics(ean)
-            empty_diag.log(f"❌ {msg}")
-            row = {
-                "Image 1": "", "Image 2": "", "Image Source Link": "",
-                "GTIN / EAN": ean, "User Input": ground_truth,
-                "Status": f"⚠️ Not Food — {cat}",
-                "Product Name": go_upc_data.get("name", ""),
-                "Chain of Thought": msg,
-                "Cached": "🔄 Fresh",
-            }
-            return {"row": row, "image_diag": empty_diag, "food_diag": None}
+        # Go-UPC non-food early exit is intentionally disabled.
+        # Go-UPC's category taxonomy is unreliable (e.g. tinned salmon can be
+        # tagged as "Fish Food" for aquariums). The user also sells pet food
+        # which would be incorrectly rejected by a category-based gate.
+        # Gemini's tiered validation gate handles food classification with
+        # much better context and accuracy.
 
         # ── Run both pipelines concurrently ──────────────────────────────────
         food_task  = fetch_basic_info(session, ean, serp_key, ean_token, market,
