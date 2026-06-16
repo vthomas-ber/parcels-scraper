@@ -2254,7 +2254,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         if len(source_links) >= 2:
             break
 
-    return selected, diag, source_links
+    return selected, diag, source_links, retailer_urls
 
 
 # ============================================================================
@@ -2301,8 +2301,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                                            ground_truth=ground_truth, gemini_key=gemini_key,
                                            go_upc_data=go_upc_data)
 
-        (name, gemini_images, food_diag, ean_verified), \
-        (display_images, image_diag, source_links) = await asyncio.gather(food_task, image_task)
+        (name, gemini_images, food_diag, ean_verified),         (display_images, image_diag, source_links, pipeline_urls) = await asyncio.gather(food_task, image_task)
 
         # ── Change 1: Early exit when no approved source found anything ───────
         no_sources = (
@@ -2349,22 +2348,45 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                    for k, v in row.items()}
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
-        # ── Parse sources — merge model claims + grounding refs, strip forbidden ──
-        sources = data.get("sources", [])
-        if isinstance(sources, str):
-            sources = [s.strip() for s in sources.split(",") if s.strip()]
-        elif not isinstance(sources, list):
-            sources = []
-        # Change 4: keep only real, clickable URLs — filter Vertex grounding redirects
-        # and any forbidden domains Gemini may have slipped in
-        sources = [s for s in sources if s and _is_displayable_url(s)]
-        srcs    = (sources + ["", "", "", "", ""])[:5]
+        # ── Build Source 1-5 — prioritise our own verified URLs over Gemini's ────
+        #
+        # Gemini's JSON "sources" field is LLM-generated and unreliable:
+        # URLs can be hallucinated, wrong-format, stale, or point to search
+        # pages rather than product pages.
+        #
+        # Priority order:
+        #   1. source_links  — EAN confirmed by page_contains_ean() ✅ best
+        #   2. pipeline_urls — real SerpAPI organic results (goldmine/brand) ✅ real
+        #   3. Gemini sources — LLM-generated, kept as last resort ⚠️
+        #
+        _gemini_sources = data.get("sources", [])
+        if isinstance(_gemini_sources, str):
+            _gemini_sources = [s.strip() for s in _gemini_sources.split(",") if s.strip()]
+        elif not isinstance(_gemini_sources, list):
+            _gemini_sources = []
+        _gemini_sources = [s for s in _gemini_sources if s and _is_displayable_url(s)]
 
-        # ── Determine real approved sources (filter grounding redirect URLs) ──
+        # Filter pipeline_urls: exclude bare search-results pages
+        _search_patterns = ("/search?", "?q=", "?query=", "?search=",
+                             "?entry=", "?searchTerm=", "?terme=")
+        _pipe_filtered = [
+            u for u in (pipeline_urls or [])
+            if u and _is_displayable_url(u)
+            and not any(p in u.lower() for p in _search_patterns)
+        ]
+
+        # Merge in priority order, deduplicate, cap at 5
+        _all_srcs = list(dict.fromkeys(
+            [u for u in source_links if u and _is_displayable_url(u)] +
+            _pipe_filtered +
+            _gemini_sources
+        ))
+        srcs = (_all_srcs + ["", "", "", "", ""])[:5]
+
+        # Determine real approved sources for reliability gate (unchanged logic)
         real_sources = [
-            s for s in srcs
-            if s and not s.startswith("https://vertexaisearch.cloud.google.com")
-            and not _is_excluded_domain(s)
+            s for s in _all_srcs
+            if s and not _is_excluded_domain(s)
         ]
 
         # ── Validation gate — is_exact_match=False means wrong product ────────
