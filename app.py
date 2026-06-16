@@ -280,14 +280,18 @@ _APPROVED_SOURCE_DOMAINS: frozenset[str] = frozenset({
 
 def _is_displayable_url(url: str) -> bool:
     """
-    Returns True only for real URLs from our approved domain list.
+    Returns True for any real, clickable source URL that is not junk.
 
-    We show NO link rather than an incorrect or broken one, so this
-    filter is intentionally strict:
-    - Must start with http
-    - Must NOT be a Vertex grounding redirect or Google internal URL
-    - Must NOT be from a hard-excluded domain (Amazon, eBay, etc.)
-    - Domain MUST be in _APPROVED_SOURCE_DOMAINS
+    Filters out:
+    - Vertex AI grounding redirects  (these 404 — the actual bug we were solving)
+    - Google internal search/redirect URLs  (Gemini's own search queries leaking out)
+    - Hard-excluded marketplace domains  (Amazon, eBay, OpenFoodFacts)
+
+    Does NOT apply a domain whitelist.  Brand websites, regional retailers,
+    niche food directories, and any other real page Gemini used are all valid
+    sources and should be shown.  The previous whitelist was blocking every URL
+    that wasn't a major supermarket — including the actual product pages for
+    brand websites (hellmanns.com, mcvities.co.uk, nutella.com, etc.).
     """
     if not url or not url.startswith("http"):
         return False
@@ -299,16 +303,7 @@ def _is_displayable_url(url: str) -> bool:
         return False
     if _is_excluded_domain(url):
         return False
-    # Domain whitelist: only show links from known approved sources
-    try:
-        domain = url.split("/")[2].lower()
-        # Strip www. prefix
-        if domain.startswith("www."):
-            domain = domain[4:]
-        return any(domain == d or domain.endswith("." + d)
-                   for d in _APPROVED_SOURCE_DOMAINS)
-    except Exception:
-        return False
+    return True
 
 
 def _extract_weight_hint(ground_truth: str) -> str:
