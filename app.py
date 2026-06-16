@@ -245,14 +245,49 @@ def should_cache(status: str) -> bool:
     return status == "Success"
 
 
+# Approved source domains — the only domains we will display as clickable
+# Source 1-5 links.  Any URL whose domain is not in this set is cleared.
+# Derived from GOLDMINE retailers + common brand/barcode lookup sites.
+_APPROVED_SOURCE_DOMAINS: frozenset[str] = frozenset({
+    # UK
+    "ocado.com", "waitrose.com", "asda.com", "tesco.com",
+    "sainsburys.co.uk", "morrisons.com",
+    # FR
+    "carrefour.fr", "auchan.fr", "coursesu.com",
+    "leclerc.fr", "intermarche.fr", "monoprix.fr",
+    # IT
+    "carrefour.it", "conad.it", "coop.it",
+    "esselunga.it", "eurospin.it", "lidl.it",
+    # DE
+    "rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de",
+    # NL
+    "ah.nl", "jumbo.com", "plus.nl", "dirk.nl",
+    # BE
+    "delhaize.be", "colruyt.be", "carrefour.be", "spar.be", "lidl.be",
+    # AT
+    "billa.at", "spar.at", "gurkerl.at", "hofer.at", "mpreis.at",
+    # DK
+    "nemlig.com", "rema1000.dk", "coop.dk", "salling.dk",
+    # ES
+    "carrefour.es", "mercadona.es", "dia.es",
+    "alcampo.es", "eroski.es", "lidl.es",
+    # PL
+    "carrefour.pl", "auchan.pl", "frisco.pl", "lidl.pl", "kaufland.pl",
+    # Barcode / product databases
+    "barcodelookup.com", "go-upc.com",
+})
+
+
 def _is_displayable_url(url: str) -> bool:
     """
-    Change 4 — Returns True only for real, clickable source URLs.
-    Filters out:
-    - Vertex AI grounding redirect URLs (which 404 immediately)
-    - google.com/search?q= URLs (Gemini internal search queries leaking out)
-    - google.com/url? redirect wrappers
-    - All hard-excluded marketplace/UGC domains
+    Returns True only for real URLs from our approved domain list.
+
+    We show NO link rather than an incorrect or broken one, so this
+    filter is intentionally strict:
+    - Must start with http
+    - Must NOT be a Vertex grounding redirect or Google internal URL
+    - Must NOT be from a hard-excluded domain (Amazon, eBay, etc.)
+    - Domain MUST be in _APPROVED_SOURCE_DOMAINS
     """
     if not url or not url.startswith("http"):
         return False
@@ -264,7 +299,16 @@ def _is_displayable_url(url: str) -> bool:
         return False
     if _is_excluded_domain(url):
         return False
-    return True
+    # Domain whitelist: only show links from known approved sources
+    try:
+        domain = url.split("/")[2].lower()
+        # Strip www. prefix
+        if domain.startswith("www."):
+            domain = domain[4:]
+        return any(domain == d or domain.endswith("." + d)
+                   for d in _APPROVED_SOURCE_DOMAINS)
+    except Exception:
+        return False
 
 
 def _extract_weight_hint(ground_truth: str) -> str:
@@ -2108,6 +2152,19 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
 
     # ── Stage 4: Evaluate candidates ─────────────────────────────────────────
     _pname_for_verify = product_name or ""
+    _name_known = bool(_pname_for_verify) and not _pname_for_verify.startswith("Product with EAN")
+
+    # When product name is unknown, only trust Go-UPC images (barcode-keyed).
+    # Without a name, the vision verifier can't distinguish the right product
+    # from a tin of foil, so we skip unverifiable candidates entirely.
+    if not _name_known:
+        deduped = [(s, o, t, ti, sd) for s, o, t, ti, sd in deduped
+                   if s == "go_upc_tier1"]
+        if deduped:
+            diag.log("ℹ️ Product name unknown — only Go-UPC Tier 1 image shown.")
+        else:
+            diag.log("ℹ️ Product name unknown and no Go-UPC image — no images displayed.")
+
     eval_tasks = [
         display_evaluate_candidate(
             session, src, original, thumbnail, diag,
@@ -2293,6 +2350,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 "Cached": "🔄 Fresh"
             }
             # Errors are never cached — they will be retried on next lookup
+            row = {k: ("" if (v is None or v == "null" or v == "None") else v)
+                   for k, v in row.items()}
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # ── Parse sources — merge model claims + grounding refs, strip forbidden ──
@@ -2351,6 +2410,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             }
             # Failed validation is never cached — the product may be retried with
             # corrected ground truth
+            row = {k: ("" if (v is None or v == "null" or v == "None") else v)
+                   for k, v in row.items()}
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # ── Determine final status ────────────────────────────────────────────
@@ -2428,6 +2489,10 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         if should_cache(final_status):
             cache_set(ean, market, row, status=final_status, confidence=1.0)
 
+        # Sanitise: replace Python None and the string "null" with ""
+        # so Streamlit never renders the word "None" in any cell.
+        row = {k: ("" if (v is None or v == "null" or v == "None") else v)
+               for k, v in row.items()}
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
 
