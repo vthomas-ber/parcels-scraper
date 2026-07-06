@@ -218,11 +218,21 @@ def barcode_matches(returned_barcode: str, queried_ean: str) -> bool:
             == str(queried_ean).strip().lstrip("0"))
 
 
-async def page_contains_ean(session, url: str, ean: str) -> bool:
+async def page_contains_ean(session, url: str, ean: str,
+                            ground_truth: str = "") -> bool:
     """
-    Fetch the first 200 KB of a page and check whether the EAN appears in
-    the raw HTML.  Used to verify a brand/retailer page actually references
-    the product before we trust OG/JSON-LD images from it.
+    Verify that a page is genuinely ABOUT the queried EAN — not merely a page
+    where the digit string happens to appear (article numbers, order codes,
+    and delivery lists on unrelated shops produce 13-digit false positives).
+
+    STRONG evidence (always accepted):
+      - EAN within a labeled GTIN context: JSON-LD/microdata gtin fields, or
+        a nearby label like EAN / GTIN / Barcode / Strichcode / UPC.
+    WEAK evidence (bare digit occurrence anywhere in HTML):
+      - Accepted ONLY if the page <title>/og:title overlaps the ground truth
+        (≥40% of significant tokens). Without ground truth, weak evidence is
+        rejected — better a Needs Review than a confidently wrong source.
+
     Fails closed: returns False on any network or parsing error.
     """
     _ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -232,19 +242,37 @@ async def page_contains_ean(session, url: str, ean: str) -> bool:
         async with session.get(url, headers={"User-Agent": _ua}, timeout=8) as r:
             if r.status != 200:
                 return False
-            raw  = await r.content.read(400_000)      # max 400 KB — JSON-LD often sits late in <body>
+            raw  = await r.content.read(400_000)
             text = raw.decode("utf-8", errors="ignore")
             stripped = ean.lstrip("0")
-            # Direct occurrence in any zero-padding variant (GTIN-13/14 padding)
-            variants = {ean, stripped, ean.zfill(13), ean.zfill(14)}
-            if any(v and v in text for v in variants):
+
+            # ── STRONG: labeled GTIN context ─────────────────────────────────
+            # JSON-LD / microdata / meta gtin-sku fields
+            if re.search(rf'(gtin\d*|"sku"|itemprop=["\']gtin)[\s"\':=]+["\']?0*{re.escape(stripped)}',
+                         text, re.IGNORECASE):
                 return True
-            # JSON-LD / microdata: "gtin13":"000123...", gtin: '123', itemprop="gtin13"
-            # Modern retailers render the visible page client-side but almost
-            # always ship the GTIN in structured data within the initial payload.
-            return bool(re.search(
-                rf'(gtin\d*|"sku"|itemprop=["\']gtin)[\s"\':=]+["\']?0*{re.escape(stripped)}',
-                text, re.IGNORECASE))
+            # Visible label within 30 chars before the number:
+            # "EAN: 4260614723382", "GTIN Stück: ...", "Strichcode ..."
+            if re.search(rf'(ean|gtin|barcode|strichcode|streepjescode|'
+                         rf'codice\s*a\s*barre|c[oó]digo\s*de\s*barras|upc)'
+                         rf'[^0-9]{{0,30}}0*{re.escape(stripped)}',
+                         text, re.IGNORECASE):
+                return True
+
+            # ── WEAK: bare occurrence — requires title cross-check ──────────
+            variants = {ean, stripped, ean.zfill(13), ean.zfill(14)}
+            if not any(v and v in text for v in variants):
+                return False
+            if not ground_truth:
+                return False   # bare digits with nothing to cross-check → reject
+            m = (re.search(r'<meta[^>]+og:title[^>]+content=["\']([^"\']+)', text, re.I)
+                 or re.search(r'<title[^>]*>([^<]+)</title>', text, re.I))
+            page_title = m.group(1).lower() if m else ""
+            gt_tokens  = {t.lower() for t in ground_truth.split() if len(t) > 3}
+            if not gt_tokens or not page_title:
+                return False
+            overlap = sum(1 for t in gt_tokens if t in page_title) / len(gt_tokens)
+            return overlap >= 0.4
     except Exception:
         return False
 
@@ -765,7 +793,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                             continue
                         if _brand_matches_domain(brand_candidate, domain):
                             # Only trust this page if the EAN appears in its HTML
-                            ean_on_page = await page_contains_ean(session, link, ean)
+                            ean_on_page = await page_contains_ean(session, link, ean, _clean_ground_truth)
                             if ean_on_page:
                                 if not product_name:
                                     product_name = res.get("title", "").split("-")[0].split("|")[0].strip()
@@ -807,7 +835,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                 if is_garbage_name(title):
                     continue
                 ean_in_snippet = ean in snippet or ean.lstrip("0") in snippet
-                if ean_in_snippet or await page_contains_ean(session, link, ean):
+                if ean_in_snippet or await page_contains_ean(session, link, ean, _clean_ground_truth):
                     product_name = title
                     ean_verified = True
                     if link not in retailer_urls:
@@ -863,11 +891,12 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             organic2 = data2.get("organic_results", []) if data2 else []
             if organic2:
                 candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                if not is_garbage_name(candidate):
+                if not is_garbage_name(candidate) and _result_matches_gt(organic2[0], _clean_ground_truth):
                     product_name = candidate
                     diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
                 new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
-                             and not _is_excluded_domain(res.get("link", ""))]
+                             and not _is_excluded_domain(res.get("link", ""))
+                             and _result_matches_gt(res, _clean_ground_truth)]
                 for u in new_urls2:
                     if u not in retailer_urls:
                         retailer_urls.append(u)
@@ -902,7 +931,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                     title = res.get("title", "").split("-")[0].split("|")[0].strip()
                     if is_garbage_name(title):
                         continue
-                    if await page_contains_ean(session, link, ean):
+                    if await page_contains_ean(session, link, ean, _clean_ground_truth):
                         product_name = title
                         ean_verified = True
                         if link not in retailer_urls:
@@ -1434,10 +1463,33 @@ EAN_SEARCH_GARBAGE_PATTERNS = [
 ]
 
 
+def _result_matches_gt(res: dict, ground_truth: str) -> bool:
+    """
+    Relevance filter for organic search results found via bare-number queries.
+    Bare-GTIN searches match ANY page where the digit string appears — article
+    numbers and order codes on unrelated shops (electronics, welding supplies,
+    catering catalogues) are the classic false positives. When ground truth is
+    available, require ≥30% of its significant tokens in the result's
+    title+snippet before treating the link as a candidate source.
+    Without ground truth, all results pass (nothing to compare against).
+    """
+    if not ground_truth:
+        return True
+    gt_tokens = {t.lower() for t in ground_truth.split() if len(t) > 3}
+    if not gt_tokens:
+        return True
+    haystack = (res.get("title", "") + " " + res.get("snippet", "")).lower()
+    return sum(1 for t in gt_tokens if t in haystack) / len(gt_tokens) >= 0.3
+
+
 def is_garbage_name(name: str) -> bool:
     if not name or len(name.strip()) < 3:
         return True
     name_lower = name.lower().strip()
+    # URLs / domains are never product names (search-result titles are
+    # sometimes the bare URL — these were leaking into the Product Name column)
+    if name_lower.startswith("http") or "://" in name_lower or "www." in name_lower:
+        return True
     return any(re.search(p, name_lower) for p in EAN_SEARCH_GARBAGE_PATTERNS)
 
 
@@ -2131,7 +2183,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                                 continue
                             if _brand_matches_domain(brand_candidate, domain):
                                 # Verify the page actually contains the EAN in its HTML
-                                ean_on_page = await page_contains_ean(session, link, ean)
+                                ean_on_page = await page_contains_ean(session, link, ean, _clean_gt)
                                 if ean_on_page:
                                     brand_ean_verified = True
                                     diag.log(f"✅ Brand page EAN verified: {domain}")
@@ -2239,12 +2291,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
             if organic:
                 if not product_name:
                     candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    if not is_garbage_name(candidate):
+                    if not is_garbage_name(candidate) and _result_matches_gt(organic[0], _clean_gt):
                         product_name = candidate
                         diag.log(f"✅ Global GTIN name (unverified): {product_name}")
                 new_urls = [
                     res.get("link") for res in organic[:5]
                     if "link" in res and not _is_excluded_domain(res.get("link", ""))
+                    and _result_matches_gt(res, _clean_gt)
                 ]
                 for u in new_urls:
                     if u not in retailer_urls:
@@ -2280,7 +2333,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                     title = res.get("title", "").split("-")[0].split("|")[0].strip()
                     if is_garbage_name(title):
                         continue
-                    if await page_contains_ean(session, link, ean):
+                    if await page_contains_ean(session, link, ean, _clean_gt):
                         if not product_name:
                             product_name = title
                         if link not in retailer_urls:
@@ -2560,7 +2613,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
             continue
         dom = page_url.split("/")[2] if page_url.startswith("http") else ""
         if dom and dom not in seen_link_domains:
-            ean_confirmed = await page_contains_ean(session, page_url, ean)
+            ean_confirmed = await page_contains_ean(session, page_url, ean, _clean_gt)
             if ean_confirmed:
                 source_links.append(page_url)
                 seen_link_domains.add(dom)
@@ -2736,14 +2789,12 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             _all_srcs = [u for u in _all_srcs if u in _exempt or u in _alive]
         srcs = (_all_srcs + ["", "", "", "", ""])[:5]
 
-        # Same gate for output image URLs (durable ≠ alive; retailer CDNs can
-        # 403 hotlinks even on stable URLs).
-        _img_alive = await asyncio.gather(*[_url_alive(session, u) if u else _false_coro()
-                                            for u in imgs])
-        for _i, (_u, _ok) in enumerate(zip(imgs, _img_alive)):
-            if _u and not _ok:
-                image_diag.log(f"⚠️ Image {_i+1} URL dropped (liveness check failed): {_u[:80]}")
-                imgs[_i] = ""
+        # NOTE: no liveness HEAD-check on image URLs. The display pipeline
+        # downloaded, inspected, and vision-verified these exact bytes moments
+        # ago — that download IS the liveness proof. A follow-up HEAD often
+        # gets 403 from bot-protection even though the image renders fine in
+        # a browser, so a fail-closed check here wrongly blanks valid images.
+        # (The durable-URL gate above still removes expiring CDN thumbnails.)
 
         # Determine real approved sources for reliability gate (unchanged logic)
         real_sources = [
@@ -2784,6 +2835,12 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
             # Images are suppressed: Path B searched under the wrong product
             # name, so any images found belong to the wrong product.
+            # Failed validation → suppress ALL unverified sources. The search
+            # candidates that led here are by definition suspect (bare-number
+            # matches on unrelated shops). Only pages that passed strict
+            # on-page EAN confirmation are worth showing for manual review.
+            _fv_srcs = ([u for u in source_links if u and _is_displayable_url(u)]
+                        + ["", "", "", "", ""])[:5]
             row = {
                 "Image 1": "",
                 "Image 2": "",
@@ -2812,8 +2869,8 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "",
                 "Of Which Sugars (g)": "", "Protein (g)": "",
                 "Fiber (g)": "", "Salt (g)": "",
-                "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2],
-                "Source 4": srcs[3], "Source 5": srcs[4],
+                "Source 1": _fv_srcs[0], "Source 2": _fv_srcs[1], "Source 3": _fv_srcs[2],
+                "Source 4": _fv_srcs[3], "Source 5": _fv_srcs[4],
                 "Cached": "🔄 Fresh"
             }
             # Failed validation is never cached — the product may be retried with
