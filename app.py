@@ -277,6 +277,7 @@ _APPROVED_SOURCE_DOMAINS: frozenset[str] = frozenset({
     "esselunga.it", "eurospin.it", "lidl.it",
     # DE
     "rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de",
+    "budni.de", "ecoinform.de",   # drugstore chain + structured organic/GTIN database
     # NL
     "ah.nl", "jumbo.com", "plus.nl", "dirk.nl",
     # BE
@@ -486,7 +487,8 @@ GOLDMINE = {
     "BE": ("site:delhaize.be OR site:colruyt.be OR site:carrefour.be "
            "OR site:spar.be OR site:lidl.be"),
     "DE": ("site:rewe.de OR site:edeka.de OR site:kaufland.de "
-           "OR site:dm.de OR site:rossmann.de OR site:metro.de"),
+           "OR site:dm.de OR site:rossmann.de OR site:metro.de "
+           "OR site:budni.de OR site:ecoinform.de"),
     "AT": ("site:billa.at OR site:spar.at OR site:gurkerl.at "
            "OR site:hofer.at OR site:mpreis.at"),
     "DK": ("site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk "
@@ -785,6 +787,37 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             except Exception as e:
                 diagnostic_log.append(f"⚠️ Brand-site lookup failed: {e}")
 
+    # ── ATTEMPT 2.5: Combined ground-truth + EAN query ────────────────────────
+    # The single most effective manual query ("Kokos Curry Suppe 4260614723382")
+    # surfaces niche retailers and GTIN databases that EAN-only goldmine queries
+    # miss. Accept a result when the EAN appears in the SNIPPET (Google indexed
+    # the GTIN on-page — Tier A-grade evidence) or the page itself confirms it.
+    if not product_name and serp_key and _clean_ground_truth:
+        diagnostic_log.append("🔍 Combined name+EAN query...")
+        try:
+            data_c = await _serp_get(session, serp_url,
+                params={"q": f"{_clean_ground_truth} {ean}", "gl": gl, "api_key": serp_key})
+            organic_c = data_c.get("organic_results", []) if data_c else []
+            for res in organic_c[:5]:
+                link = res.get("link", "")
+                if not link or _is_excluded_domain(link):
+                    continue
+                title   = res.get("title", "").split("-")[0].split("|")[0].strip()
+                snippet = res.get("snippet", "") or ""
+                if is_garbage_name(title):
+                    continue
+                ean_in_snippet = ean in snippet or ean.lstrip("0") in snippet
+                if ean_in_snippet or await page_contains_ean(session, link, ean):
+                    product_name = title
+                    ean_verified = True
+                    if link not in retailer_urls:
+                        retailer_urls.insert(0, link)
+                    diagnostic_log.append(
+                        f"✅ Name+EAN query verified ({'snippet' if ean_in_snippet else 'page'}): {title}")
+                    break
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ Combined name+EAN query failed: {e}")
+
     # Track SerpAPI hard failures so "search failed" is never reported as
     # "not found". process_ean inspects this flag via the returned diag log.
     search_failed = False
@@ -945,9 +978,14 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             if img and _is_valid_image_url(img) and img not in candidate_image_urls:
                 candidate_image_urls.append(img)
 
-    # Stage C: Google Images — secondary fallback only
+    # Stage C: Google Images — FALLBACK tier only.
+    # Bare-number image searches routinely return unrelated junk (toys,
+    # cosmetics, random hits). These must never be presented to Gemini as
+    # "the product" unless the product identity is independently verified —
+    # a wrong image actively poisons Gemini's validation gate.
+    fallback_image_urls = []
     if serp_key:
-        diagnostic_log.append("🖼️ Google Images (secondary fallback for Gemini)...")
+        diagnostic_log.append("🖼️ Google Images (fallback tier for Gemini)...")
         _mkt_excl_a = ("-site:amazon.com -site:amazon.co.uk -site:amazon.de "
                        "-site:amazon.fr -site:ebay.com -site:ebay.co.uk")
         for img_q in [f'"{ean}" {_mkt_excl_a}',
@@ -957,17 +995,29 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             if img_data:
                 for item in img_data.get("images_results", [])[:6]:
                     url = item.get("original", "")
-                    if _is_valid_image_url(url) and url not in candidate_image_urls:
-                        candidate_image_urls.append(url)
+                    if (_is_valid_image_url(url) and url not in candidate_image_urls
+                            and url not in fallback_image_urls):
+                        fallback_image_urls.append(url)
 
     if registry_image_url and _is_valid_image_url(registry_image_url) and registry_image_url not in candidate_image_urls:
         candidate_image_urls.append(registry_image_url)
 
     # ── DOWNLOAD, SIZE, AND DEDUPLICATE IMAGES (for Gemini) ──
+    # Trusted tier (Go-UPC, Shopping, retailer OG, registry) always eligible.
+    # Fallback tier (Google Images) only eligible when the identity is
+    # EAN-verified — otherwise Gemini receives ZERO images rather than junk.
     final_downloaded_images = []
     seen_b64_prefixes = []
 
-    for url in candidate_image_urls:
+    _download_order = list(candidate_image_urls)
+    if ean_verified:
+        _download_order += fallback_image_urls
+    elif fallback_image_urls:
+        diagnostic_log.append(
+            f"🛡️ {len(fallback_image_urls)} fallback image(s) WITHHELD from Gemini "
+            f"(identity not EAN-verified — junk images would poison validation).")
+
+    for url in _download_order:
         if len(final_downloaded_images) >= 2:
             break
         img_payload = await fetch_image_bytes_simple(session, url)
@@ -1023,7 +1073,9 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
     CORE DIRECTIVES:
     0. VALIDATION GATE — TIERED CONFIRMATION:
 
-       FOOD CHECK (mandatory first step): This tool covers food, drink, and pet food products. If the product you find is clearly NOT in any of these categories — for example household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, electronics, furniture, tools, clothing, or stationery — set "is_exact_match" to false immediately and do not extract any data. NOTE: tinned fish, seafood, and all animal products for human consumption ARE food. Pet food, animal feed, and treats sold for pets are also acceptable — do not reject them.
+       FOOD CHECK (mandatory first step): This tool covers food, drink, and pet food products. If the product you find VIA TEXT SEARCH is clearly NOT in any of these categories — for example household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, electronics, furniture, tools, clothing, or stationery — set "is_exact_match" to false immediately and do not extract any data. This check applies to the product identified through web search of text sources, NEVER to attached images (see directive 6 — attached images can be scrape noise). NOTE: tinned fish, seafood, and all animal products for human consumption ARE food. Pet food, animal feed, and treats sold for pets are also acceptable — do not reject them.
+
+       SEARCH STRATEGY: If USER INPUT (GROUND TRUTH) is provided, your FIRST search query MUST be the combined form: "{user_ground_truth} {ean}". This surfaces niche retailers and GTIN databases that a bare-barcode search misses. Only if that yields nothing, fall back to searching the EAN alone and the product name alone.
 
        TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of an approved food product page. This is the strongest possible confirmation. Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
 
@@ -1070,7 +1122,10 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
             * "Powdered Drink Mix / Instant Drink" → Drinks > ...
             When in doubt for powders, ask: "Is this product's primary purpose to be consumed as a drink, used as a cooking ingredient, or taken as a supplement?" Let that answer determine L1.
         - Solid food items, snacks, and meals → Food.
-    6. IMAGE VISION: I have attached images of the product. Read ALL visible text including nutrition panel, ingredients list, manufacturer address, certifications, and dietary logos to cross-reference with your web search.
+    6. IMAGE VISION (ADVISORY ONLY): Zero or more images may be attached. These are SCRAPED CANDIDATES from web search — they usually show the product but can occasionally be unrelated noise (a different product, a logo, a random search hit). Rules:
+       - If an image clearly shows the correct product: read ALL visible text (nutrition panel, ingredients, manufacturer address, certifications, dietary logos) and cross-reference with your web search.
+       - If an image appears unrelated to the product name/EAN: IGNORE that image entirely. An unrelated attached image is scrape noise, NOT evidence about the product. NEVER set 'is_exact_match' to false, and NEVER apply the FOOD CHECK rejection, based on attached images alone. Validation decisions must rest on your own web search of TEXT sources (Tier A/B evidence). Note this in chain_of_thought (e.g. "attached images ignored — unrelated to product").
+       - If no images are attached, proceed on text sources alone.
     7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
     8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other approved retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 approved site or if the source is uncertain. Explain your choice in the reliability_reasoning field.
     9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. Treat this as a mandatory True/False checklist for every single tag to ensure maximum consistency across outputs.
@@ -2174,6 +2229,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         diag.log(f"🔍 Name-based fallback: '{_clean_gt[:60]}'...")
         _nb_goldmine = GOLDMINE.get(market_upper, "").strip()
         _nb_queries  = [q for q in (
+            f'{_clean_gt} {ean}',                                  # combined — strongest
             f'{_nb_goldmine} "{_clean_gt}"' if _nb_goldmine else "",
             f'"{_clean_gt}"',
         ) if q]
