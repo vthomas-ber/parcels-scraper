@@ -1034,7 +1034,8 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
 
 
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
-                    image_bytes_list, user_ground_truth, go_upc_data=None):
+                    image_bytes_list, user_ground_truth, go_upc_data=None,
+                    verified_pages=None, candidate_pages=None, ean_verified=False):
     """
     Path A: Sends the resolved product name + images to Gemini for structured
     food data extraction.  Uses Google Search grounding so Gemini can reach
@@ -1061,12 +1062,45 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
             _parts.append(f"Ingredients reference: {go_upc_data['ingredients'][:400]}")
         _go_upc_ctx = "\n".join(_parts)
 
+    # Build pipeline-verification evidence block. This is the bridge between
+    # Python-side verification and Gemini: pages listed here were FETCHED and
+    # the EAN was found in their HTML/structured data. Gemini must treat this
+    # as established fact, not re-litigate it with its own (weaker) search.
+    _verified_pages  = [u for u in (verified_pages or []) if u][:4]
+    _candidate_pages = [u for u in (candidate_pages or []) if u
+                        and u not in _verified_pages][:4]
+    if _verified_pages:
+        _evidence_ctx = (
+            "TIER A IS ALREADY SATISFIED — PRE-VERIFIED BY THE PIPELINE.\n"
+            f"    The following pages were fetched and CONFIRMED to contain EAN {ean} "
+            "in their HTML or structured data:\n    "
+            + "\n    ".join(f"- {u}" for u in _verified_pages)
+            + "\n    Treat these as your PRIMARY sources: browse them and extract the product data. "
+            "Do NOT set 'is_exact_match' to false because your own search cannot re-find the EAN — "
+            "the on-page confirmation above supersedes your search results."
+        )
+    elif ean_verified:
+        _evidence_ctx = (
+            f"IDENTITY PRE-VERIFIED: the EAN {ean} was matched to the product name "
+            f"'{product_name}' via a barcode registry or an EAN-confirmed page. "
+            "Treat the product identity as established; focus your search on finding "
+            "the richest data for this product rather than re-proving the EAN link."
+        )
+    else:
+        _evidence_ctx = "No pipeline-side EAN verification available — apply the full validation gate below."
+    if _candidate_pages:
+        _evidence_ctx += (
+            "\n    Additional candidate pages found by the pipeline (unverified, may help):\n    "
+            + "\n    ".join(f"- {u}" for u in _candidate_pages))
+
     prompt = f"""
     You are the Lead Food Product Researcher.
     TARGET EAN: {ean}
     ONLINE PRODUCT NAME FOUND: {product_name}
     USER INPUT (GROUND TRUTH): {user_ground_truth if user_ground_truth else "None provided (Proceed normally)"}
     MARKET: {market_code}
+    PIPELINE VERIFICATION STATUS:
+    {_evidence_ctx}
     BARCODE DATABASE CONTEXT (search anchoring only — do NOT cite as output source):
     {_go_upc_ctx if _go_upc_ctx else "No additional context available."}
 
@@ -1077,13 +1111,13 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
 
        SEARCH STRATEGY: If USER INPUT (GROUND TRUTH) is provided, your FIRST search query MUST be the combined form: "{user_ground_truth} {ean}". This surfaces niche retailers and GTIN databases that a bare-barcode search misses. Only if that yields nothing, fall back to searching the EAN alone and the product name alone.
 
-       TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of an approved food product page. This is the strongest possible confirmation. Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
+       TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of a food product page — OR the PIPELINE VERIFICATION STATUS above states Tier A is already satisfied (pre-verified pages count as full Tier A evidence even if your own search cannot re-confirm them). Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
 
-       TIER B — Good confidence (only when USER INPUT ground truth is non-empty): The EAN {ean} does NOT appear in page text, BUT all three of the following match the USER INPUT (GROUND TRUTH):
-         - Brand name matches the product you found (minor spelling differences allowed)
+       TIER B — Good confidence (only when USER INPUT ground truth is non-empty): The EAN {ean} does NOT appear in page text, BUT the product you found matches every field THAT IS PRESENT in the USER INPUT (GROUND TRUTH):
+         - Brand name matches, IF the USER INPUT contains a brand (minor spelling differences allowed)
          - Product name matches closely (key words present, language differences allowed)
-         - Unit weight or volume matches within 15% of what USER INPUT states
-       In this case, accept the product and note in chain_of_thought that EAN was confirmed via name/brand/weight match rather than page text. Set food_info_reliability to "M" at most for Tier B confirmations. If USER INPUT (GROUND TRUTH) is empty, Tier B is NOT available — only Tier A is accepted.
+         - Unit weight or volume matches within 15%, IF the USER INPUT contains a weight/volume
+       Fields ABSENT from the USER INPUT are WAIVED — a missing weight in USER INPUT is not a mismatch and must NOT block Tier B. If only a product name was provided, a close name match alone satisfies Tier B. Note in chain_of_thought which fields were compared and which were waived. Set food_info_reliability to "M" at most for Tier B confirmations. If USER INPUT (GROUND TRUTH) is empty, Tier B is NOT available — only Tier A is accepted.
 
        TIER C — Reject immediately (set is_exact_match to false):
          - Product is clearly not food, drink, or pet food (see FOOD CHECK above)
@@ -1094,7 +1128,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
        COSMETIC DIFFERENCES: Do NOT fail for minor formatting differences (e.g. 'da 100 gr.' vs '100g', abbreviations, capitalisation, language translation). Only reject for clear, meaningful mismatches. A null result is always better than wrong data.
 
        PACK SIZE LENIENCY (important): If USER INPUT states a multi-pack format like '4x200ml', '6x330ml', or '(4 Pack) 80g', compare only the UNIT size against what you find online. A product listed as '200ml' MATCHES a USER INPUT of '4x200ml'. A product listed as '80g' MATCHES '(4 Pack) 80g'. Do NOT fail validation because the online listing shows the individual unit while the USER INPUT describes the pack. The barcode on the pack is the same as the barcode on the unit in most retailer systems.
-    1. ACCURACY: You have access to Google Search. You MUST prioritise official brand websites and approved tier-1 retailers only.
+    1. ACCURACY: You have access to Google Search. PREFER official brand websites, tier-1 retailers ({goldmine_sites}), and structured GTIN databases — but you MAY use ANY real product page (regional retailers, organic/specialty shops, niche food directories) to find and confirm the product. Source quality determines the RELIABILITY grade, not whether the product can be found at all. Only the sources in rule 2 are forbidden.
     2. SOURCE EXCLUSION (HARD CONSTRAINT): The following sources are STRICTLY FORBIDDEN — do NOT use them under any circumstances, even as a last resort:
        - Amazon (any amazon.* domain or subdomain including amazon.com, amazon.co.uk, amazon.de, etc.)
        - eBay (any ebay.* domain or subdomain including ebay.com, ebay.co.uk, ebay.de, etc.)
@@ -2611,9 +2645,12 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # ── Path A: Gemini food extraction ───────────────────────────────────
+        # Pass pipeline verification through: source_links are pages FETCHED
+        # and confirmed to contain the EAN; pipeline_urls are real SERP hits.
         data = await asyncio.to_thread(
             run_gemini_sync, ean, name, market, gemini_key,
-            taxonomy_text, gemini_images, ground_truth, go_upc_data
+            taxonomy_text, gemini_images, ground_truth, go_upc_data,
+            source_links, pipeline_urls, ean_verified
         )
 
         # ── Path B output ─────────────────────────────────────────────────────
@@ -2716,6 +2753,35 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
 
         # ── Validation gate — is_exact_match=False means wrong product ────────
         if data.get("is_exact_match") is False:
+            # Conflict guard: if the PIPELINE independently verified the EAN
+            # (on-page confirmation or barcode registry), a Gemini veto is a
+            # disagreement between components, not proof of a wrong product.
+            # Surface it as Needs Review with both positions visible, instead
+            # of a hard Failed Validation that buries pipeline evidence.
+            _pipeline_verified = bool(source_links) or ean_verified
+            if _pipeline_verified:
+                row = {
+                    "Image 1": imgs[0],
+                    "Image 2": imgs[1],
+                    "Image Source Link": img_src_links[0],
+                    "Status": "⚠️ Needs Review — pipeline verified EAN but AI could not confirm",
+                    "GTIN / EAN": ean,
+                    "User Input": ground_truth,
+                    "Product Name": name,
+                    "Info Reliability": "L",
+                    "Reliability Reasoning": (
+                        f"CONFLICT: The pipeline confirmed EAN {ean} "
+                        f"{'on-page at: ' + ', '.join(source_links[:2]) if source_links else 'via barcode registry'}. "
+                        f"Gemini's independent search could not confirm and voted is_exact_match=false. "
+                        f"Manual check of the verified link(s) recommended."),
+                    "Chain of Thought": data.get("chain_of_thought", ""),
+                    "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2],
+                    "Source 4": srcs[3], "Source 5": srcs[4],
+                    "Cached": "🔄 Fresh",
+                }
+                row = {k: ("" if (v is None or v == "null" or v == "None") else v)
+                       for k, v in row.items()}
+                return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
             # Images are suppressed: Path B searched under the wrong product
             # name, so any images found belong to the wrong product.
             row = {
