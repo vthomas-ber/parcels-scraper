@@ -20,6 +20,13 @@ except ImportError:
 
 st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
+# Styled DMF Excel export (color-coded clusters, legend sheet, hidden audit cols)
+try:
+    from xlsx_export import build_dmf_workbook
+    XLSX_EXPORT_OK = True
+except ImportError:
+    XLSX_EXPORT_OK = False
+
 # ============================================================================
 # SQLITE CACHE
 # ============================================================================
@@ -225,9 +232,19 @@ async def page_contains_ean(session, url: str, ean: str) -> bool:
         async with session.get(url, headers={"User-Agent": _ua}, timeout=8) as r:
             if r.status != 200:
                 return False
-            raw  = await r.content.read(200_000)      # max 200 KB
+            raw  = await r.content.read(400_000)      # max 400 KB — JSON-LD often sits late in <body>
             text = raw.decode("utf-8", errors="ignore")
-            return ean in text or ean.lstrip("0") in text
+            stripped = ean.lstrip("0")
+            # Direct occurrence in any zero-padding variant (GTIN-13/14 padding)
+            variants = {ean, stripped, ean.zfill(13), ean.zfill(14)}
+            if any(v and v in text for v in variants):
+                return True
+            # JSON-LD / microdata: "gtin13":"000123...", gtin: '123', itemprop="gtin13"
+            # Modern retailers render the visible page client-side but almost
+            # always ship the GTIN in structured data within the initial payload.
+            return bool(re.search(
+                rf'(gtin\d*|"sku"|itemprop=["\']gtin)[\s"\':=]+["\']?0*{re.escape(stripped)}',
+                text, re.IGNORECASE))
     except Exception:
         return False
 
@@ -304,6 +321,60 @@ def _is_displayable_url(url: str) -> bool:
     if _is_excluded_domain(url):
         return False
     return True
+
+
+# ============================================================================
+# OUTPUT LINK QUALITY GATES
+# Ephemeral CDN URLs render fine during the session, then die — Google
+# Shopping thumbnails (encrypted-tbn*.gstatic.com) expire within hours/days.
+# They are fine as Gemini INPUT but must never be exported as OUTPUT links.
+# ============================================================================
+
+_EPHEMERAL_URL_TOKENS = (
+    "encrypted-tbn",                 # Google Shopping / Images thumbnails — expire
+    "gstatic.com/shopping",
+    "googleusercontent.com/img",
+    "tbn:", "tbn0.", "tbn1.", "tbn2.", "tbn3.",
+)
+
+
+def _is_durable_url(url: str) -> bool:
+    """True if the URL is safe to export as a long-lived link."""
+    if not url or not url.startswith("http"):
+        return False
+    u = url.lower()
+    return not any(t in u for t in _EPHEMERAL_URL_TOKENS)
+
+
+async def _url_alive(session, url: str) -> bool:
+    """
+    Lightweight liveness check applied to final output links only.
+    HEAD first; some CDNs block HEAD (403/405), so fall back to a GET whose
+    body we never read. Fails open on network errors is NOT wanted here —
+    a link we cannot verify is a link we should not ship, so fail closed.
+    """
+    if not url or not url.startswith("http"):
+        return False
+    _ua = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/122.0.0.0 Safari/537.36")}
+    try:
+        async with session.head(url, headers=_ua, timeout=6,
+                                allow_redirects=True) as r:
+            if r.status < 400:
+                return True
+            if r.status in (403, 405):        # HEAD blocked — verify with GET
+                async with session.get(url, headers=_ua, timeout=6,
+                                       allow_redirects=True) as g:
+                    return g.status < 400
+            return False
+    except Exception:
+        return False
+
+
+async def _false_coro() -> bool:
+    """Awaitable False — placeholder for empty slots in gather() batches."""
+    return False
 
 
 def _extract_weight_hint(ground_truth: str) -> str:
@@ -542,36 +613,67 @@ async def fetch_image_bytes_simple(session, url):
 
 
 
+# Global SerpAPI concurrency cap. Each EAN fires 4-7 SerpAPI calls; with the
+# per-EAN semaphore at 5 that meant 20-35 concurrent SerpAPI requests and
+# silent 429s that surfaced as "Not Found". Lazily created inside the running
+# event loop (asyncio.run creates a fresh loop per batch).
+_SERP_SEM: asyncio.Semaphore | None = None
+_SERP_SEM_LOOP: object = None
+
+
+def _serp_error(data) -> int | None:
+    """Return the HTTP error code if `data` is a _serp_get error sentinel."""
+    if isinstance(data, dict) and "_error" in data:
+        return data["_error"]
+    return None
+
+
 async def _serp_get(session, url: str, params: dict, timeout: int = 15,
                     max_retries: int = 2) -> dict | None:
     """
-    SerpAPI GET with automatic 429 backoff-retry.
-    Returns the parsed JSON dict, or None on persistent failure.
-    Converts concurrent burst failures into safe sequential retries.
+    SerpAPI GET with automatic backoff-retry on 429 AND 5xx, behind a global
+    concurrency semaphore.
+
+    Returns:
+      dict                  — parsed JSON on success
+      {"_error": <status>}  — sentinel after exhausted retries / HTTP error,
+                              so callers can distinguish "search failed"
+                              from "search returned no results".
+                              (.get("organic_results", []) etc. still safely
+                              return [] on the sentinel.)
+      None                  — network-level failure (timeout, DNS, ...)
 
     Backoff schedule: 3 s after attempt 1, 6 s after attempt 2.
     """
-    for attempt in range(max_retries + 1):
-        try:
-            async with session.get(url, params=params, timeout=timeout) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-                if resp.status == 429:
-                    if attempt < max_retries:
-                        wait = 3 * (attempt + 1)   # 3 s, 6 s
-                        await asyncio.sleep(wait)
-                        continue
-                    return None   # exhausted retries
-                # Other HTTP error (403, 5xx…) — don't retry
+    global _SERP_SEM, _SERP_SEM_LOOP
+    loop = asyncio.get_running_loop()
+    if _SERP_SEM is None or _SERP_SEM_LOOP is not loop:
+        _SERP_SEM      = asyncio.Semaphore(8)
+        _SERP_SEM_LOOP = loop
+
+    async with _SERP_SEM:
+        last_status = None
+        for attempt in range(max_retries + 1):
+            try:
+                async with session.get(url, params=params, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    last_status = resp.status
+                    if resp.status == 429 or resp.status >= 500:
+                        if attempt < max_retries:
+                            await asyncio.sleep(3 * (attempt + 1))   # 3 s, 6 s
+                            continue
+                        return {"_error": resp.status}
+                    # Other HTTP error (403, 404…) — don't retry
+                    return {"_error": resp.status}
+            except asyncio.TimeoutError:
+                if attempt < max_retries:
+                    await asyncio.sleep(1)
+                    continue
                 return None
-        except asyncio.TimeoutError:
-            if attempt < max_retries:
-                await asyncio.sleep(1)
-                continue
-            return None
-        except Exception:
-            return None
-    return None
+            except Exception:
+                return None
+        return {"_error": last_status} if last_status else None
 
 
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
@@ -683,6 +785,10 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             except Exception as e:
                 diagnostic_log.append(f"⚠️ Brand-site lookup failed: {e}")
 
+    # Track SerpAPI hard failures so "search failed" is never reported as
+    # "not found". process_ean inspects this flag via the returned diag log.
+    search_failed = False
+
     # ── ATTEMPT 3: SerpAPI goldmine (tier-1 retailers for this market) ──
     if not product_name and serp_key:
         diagnostic_log.append("🔍 Goldmine Google Search for Name...")
@@ -690,6 +796,9 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         try:
             data = await _serp_get(session, serp_url,
                 params={"q": f"{goldmine} {ean}", "gl": gl, "api_key": serp_key})
+            if _serp_error(data):
+                search_failed = True
+                diagnostic_log.append(f"❌ SERP_FAILED Goldmine: HTTP {_serp_error(data)}")
             organic = data.get("organic_results", []) if data else []
             if organic:
                 product_name = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
@@ -703,24 +812,89 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                 for u in new_urls:
                     if u not in retailer_urls:
                         retailer_urls.append(u)
-            else:
-                # ── ATTEMPT 4: Bare GTIN global fallback (low-confidence) ──
-                diagnostic_log.append("⚠️ Goldmine returned nothing — bare GTIN global fallback (low confidence)...")
-                data2   = await _serp_get(session, serp_url,
-                    params={"q": str(ean), "gl": gl, "api_key": serp_key})
-                organic2 = data2.get("organic_results", []) if data2 else []
-                if organic2:
-                    candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    if not is_garbage_name(candidate):
-                        product_name = candidate
-                        diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
-                    new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
-                                 and not _is_excluded_domain(res.get("link", ""))]
-                    for u in new_urls2:
-                        if u not in retailer_urls:
-                            retailer_urls.append(u)
         except Exception as e:
             diagnostic_log.append(f"⚠️ Google text search failed: {e}")
+
+    # ── ATTEMPT 4: Bare GTIN global fallback (low-confidence) ──
+    # Previously nested inside "goldmine returned zero results", which meant it
+    # never ran when goldmine returned junk. Now fires whenever the name is
+    # still unresolved after Attempt 3.
+    if not product_name and serp_key:
+        diagnostic_log.append("⚠️ Name still unresolved — bare GTIN global fallback (low confidence)...")
+        try:
+            data2 = await _serp_get(session, serp_url,
+                params={"q": str(ean), "gl": gl, "api_key": serp_key})
+            if _serp_error(data2):
+                search_failed = True
+                diagnostic_log.append(f"❌ SERP_FAILED Bare GTIN: HTTP {_serp_error(data2)}")
+            organic2 = data2.get("organic_results", []) if data2 else []
+            if organic2:
+                candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
+                if not is_garbage_name(candidate):
+                    product_name = candidate
+                    diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
+                new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
+                             and not _is_excluded_domain(res.get("link", ""))]
+                for u in new_urls2:
+                    if u not in retailer_urls:
+                        retailer_urls.append(u)
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ Bare GTIN search failed: {e}")
+
+    # ── ATTEMPT 5: Name-based fallback (mirrors the manual workflow) ──
+    # EAN-keyed queries found nothing, but the user supplied ground truth.
+    # Search by product NAME, then verify candidates by looking for the EAN
+    # on the page. Verified hits earn Tier-2 trust (ean_verified=True);
+    # fuzzy title matches are accepted UNVERIFIED and are routed to
+    # Needs Review by the existing reliability gate downstream.
+    if not product_name and serp_key and _clean_ground_truth:
+        diagnostic_log.append(f"🔍 Name-based fallback: searching by ground truth '{_clean_ground_truth[:60]}'...")
+        _name_goldmine = GOLDMINE.get(market_upper, "").strip()
+        _name_queries  = [q for q in (
+            f'{_name_goldmine} "{_clean_ground_truth}"' if _name_goldmine else "",
+            f'"{_clean_ground_truth}"',
+        ) if q]
+        try:
+            for _nq in _name_queries:
+                data3 = await _serp_get(session, serp_url,
+                    params={"q": _nq, "gl": gl, "api_key": serp_key})
+                if _serp_error(data3):
+                    search_failed = True
+                    diagnostic_log.append(f"❌ SERP_FAILED Name fallback: HTTP {_serp_error(data3)}")
+                organic3 = data3.get("organic_results", []) if data3 else []
+                for res in organic3[:4]:
+                    link = res.get("link", "")
+                    if not link or _is_excluded_domain(link):
+                        continue
+                    title = res.get("title", "").split("-")[0].split("|")[0].strip()
+                    if is_garbage_name(title):
+                        continue
+                    if await page_contains_ean(session, link, ean):
+                        product_name = title
+                        ean_verified = True
+                        if link not in retailer_urls:
+                            retailer_urls.insert(0, link)
+                        diagnostic_log.append(f"✅ Name-fallback EAN-VERIFIED on page: {title}")
+                        break
+                    # Fuzzy acceptance: ≥60% of significant ground-truth tokens
+                    # present in the result title → accept as unverified.
+                    gt_tokens = {t.lower() for t in _clean_ground_truth.split() if len(t) > 3}
+                    if gt_tokens:
+                        hit_ratio = sum(1 for t in gt_tokens if t in title.lower()) / len(gt_tokens)
+                        if hit_ratio >= 0.6:
+                            product_name = title      # unverified — reliability gate handles it
+                            if link not in retailer_urls:
+                                retailer_urls.append(link)
+                            diagnostic_log.append(
+                                f"⚠️ Name-fallback fuzzy match (unverified, {hit_ratio:.0%} token overlap): {title}")
+                            break
+                if product_name:
+                    break
+        except Exception as e:
+            diagnostic_log.append(f"⚠️ Name-based fallback failed: {e}")
+
+    if search_failed:
+        diagnostic_log.append("SERP_FAILED_FLAG")   # machine-readable marker for process_ean
 
     if not product_name:
         diagnostic_log.append("⚠️ Name not found via any source — Gemini will attempt EAN-grounded search.")
@@ -729,10 +903,13 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         # Change 5: guard resolved name against obviously non-food titles
         if not _title_looks_like_food(product_name, ""):
             diagnostic_log.append(
-                f"⚠️ Resolved name '{product_name}' appears non-food — treating as not found."
+                f"⚠️ Resolved name '{product_name}' appears non-food — name discarded."
             )
             product_name = f"Product with EAN {ean}"
-            ean_verified = False  # non-food name cannot count as a verified identity
+            # NOTE: ean_verified is deliberately NOT reset here. A barcode-registry
+            # or on-page EAN verification is a source-level fact; a title heuristic
+            # disliking the NAME must not destroy source trust (the user also
+            # processes non-food SKUs like pet food, which this gate misfires on).
 
     # ── GATHER CANDIDATE IMAGES FOR GEMINI ───────────────────────────────────
     # Stage A: Google Shopping — primary EAN-anchored image source.
@@ -1988,6 +2165,55 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         except Exception as e:
             diag.log(f"⚠️ Global search failed: {e}")
 
+    # ── Stage 1D: Name-based fallback (mirrors manual workflow) ──────────────
+    # EAN-keyed queries produced neither a name nor retailer pages, but ground
+    # truth exists. Search by NAME restricted to the market goldmine; verified
+    # pages (EAN found on page) become high-trust jsonld_retailer sources,
+    # fuzzy matches become og_retailer (lower trust, higher vision threshold).
+    if serp_key and _clean_gt and (not product_name or not retailer_urls):
+        diag.log(f"🔍 Name-based fallback: '{_clean_gt[:60]}'...")
+        _nb_goldmine = GOLDMINE.get(market_upper, "").strip()
+        _nb_queries  = [q for q in (
+            f'{_nb_goldmine} "{_clean_gt}"' if _nb_goldmine else "",
+            f'"{_clean_gt}"',
+        ) if q]
+        try:
+            for _nq in _nb_queries:
+                data_nb = await _serp_get(session, serp_url,
+                    params={"q": _nq, "gl": gl, "api_key": serp_key})
+                organic_nb = data_nb.get("organic_results", []) if data_nb else []
+                found_here = False
+                for res in organic_nb[:4]:
+                    link = res.get("link", "")
+                    if not link or _is_excluded_domain(link):
+                        continue
+                    title = res.get("title", "").split("-")[0].split("|")[0].strip()
+                    if is_garbage_name(title):
+                        continue
+                    if await page_contains_ean(session, link, ean):
+                        if not product_name:
+                            product_name = title
+                        if link not in retailer_urls:
+                            retailer_urls.insert(0, link)
+                        diag.log(f"✅ Name-fallback page EAN-VERIFIED: {link[:80]}")
+                        found_here = True
+                        break
+                    gt_tokens = {t.lower() for t in _clean_gt.split() if len(t) > 3}
+                    if gt_tokens:
+                        hit_ratio = sum(1 for t in gt_tokens if t in title.lower()) / len(gt_tokens)
+                        if hit_ratio >= 0.6:
+                            if not product_name:
+                                product_name = title
+                            if link not in retailer_urls:
+                                retailer_urls.append(link)
+                            diag.log(f"⚠️ Name-fallback fuzzy match ({hit_ratio:.0%}): {link[:80]}")
+                            found_here = True
+                            break
+                if found_here:
+                    break
+        except Exception as e:
+            diag.log(f"⚠️ Name-based fallback failed: {e}")
+
     # ── Stage 2a: Google Shopping (primary EAN-anchored image source) ───────────
     # Google Shopping matches on GTIN/barcode and returns retailer-submitted
     # product images.  These are directly tied to a product listing, not
@@ -2311,12 +2537,19 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             go_upc_data is None
         )
         if no_sources:
-            empty_diag2 = ImageDiagnostics(ean)
-            empty_diag2.log("❌ No approved source indexed this EAN.")
+            # If any SerpAPI call hard-failed (429/5xx after retries), this row
+            # is INCONCLUSIVE, not "Not Found" — surface that so users re-run
+            # instead of trusting a quota failure as a genuine miss.
+            if "SERP_FAILED_FLAG" in (food_diag or ""):
+                nf_status = "⚠️ Search Failed — quota/rate-limit hit, please re-run"
+            else:
+                nf_status = "⚠️ Not Found — no approved source indexed this EAN"
+                if not ground_truth:
+                    nf_status += " (tip: add the product name to the input line to enable name-based fallback)"
             row = {
                 "Image 1": "", "Image 2": "", "Image Source Link": "",
                 "GTIN / EAN": ean, "User Input": ground_truth,
-                "Status": "⚠️ Not Found — no approved source indexed this EAN",
+                "Status": nf_status,
                 "Cached": "🔄 Fresh",
             }
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
@@ -2328,7 +2561,17 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         )
 
         # ── Path B output ─────────────────────────────────────────────────────
-        display_urls  = [img["url"] for img in display_images]
+        # Durable-URL gate: ephemeral CDN thumbnails (encrypted-tbn*.gstatic.com
+        # etc.) render fine NOW but expire within hours/days — they are the main
+        # cause of "broken image links" in shared exports. Blank them here; the
+        # EAN-confirmed Image Source Link still gives users a working page.
+        display_urls = []
+        for img in display_images:
+            u = img["url"]
+            if _is_durable_url(u):
+                display_urls.append(u)
+            else:
+                image_diag.log(f"⚠️ Image URL dropped from output (ephemeral CDN): {u[:80]}")
         imgs          = (display_urls + ["", ""])[:2]
         img_src_links = (source_links + ["", ""])[:2]
 
@@ -2375,13 +2618,39 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             and not any(p in u.lower() for p in _search_patterns)
         ]
 
-        # Merge in priority order, deduplicate, cap at 5
+        # Merge in priority order, deduplicate, cap for liveness checking.
+        # Gemini sources are LLM-generated and the main origin of dead links —
+        # they are kept ONLY if they survive the liveness check below.
         _all_srcs = list(dict.fromkeys(
             [u for u in source_links if u and _is_displayable_url(u)] +
             _pipe_filtered +
             _gemini_sources
-        ))
+        ))[:8]
+
+        # ── Liveness gate: never ship a link we could not verify ─────────────
+        # HEAD (GET fallback) each candidate concurrently; drop dead ones.
+        # source_links were already EAN-confirmed via full page fetch, so they
+        # are exempt (they were alive seconds ago) — everything else must pass.
+        _exempt = set(source_links)
+        _to_check = [u for u in _all_srcs if u not in _exempt]
+        if _to_check:
+            _alive_flags = await asyncio.gather(
+                *[_url_alive(session, u) for u in _to_check])
+            _alive = {u for u, ok in zip(_to_check, _alive_flags) if ok}
+            _dropped = [u for u in _to_check if u not in _alive]
+            for u in _dropped:
+                image_diag.log(f"⚠️ Source link dropped (liveness check failed): {u[:80]}")
+            _all_srcs = [u for u in _all_srcs if u in _exempt or u in _alive]
         srcs = (_all_srcs + ["", "", "", "", ""])[:5]
+
+        # Same gate for output image URLs (durable ≠ alive; retailer CDNs can
+        # 403 hotlinks even on stable URLs).
+        _img_alive = await asyncio.gather(*[_url_alive(session, u) if u else _false_coro()
+                                            for u in imgs])
+        for _i, (_u, _ok) in enumerate(zip(imgs, _img_alive)):
+            if _u and not _ok:
+                image_diag.log(f"⚠️ Image {_i+1} URL dropped (liveness check failed): {_u[:80]}")
+                imgs[_i] = ""
 
         # Determine real approved sources for reliability gate (unchanged logic)
         real_sources = [
@@ -2748,6 +3017,26 @@ if "results_df" in st.session_state:
         width='stretch',
         hide_index=True
     )
+
+    # ── DMF-ready Excel export ────────────────────────────────────────────────
+    # Two-sheet workbook: "DMF Upload" (color-coded clusters, audit columns
+    # hidden but expandable) + "Legend" (color key, status & reliability tiers).
+    if XLSX_EXPORT_OK:
+        try:
+            _export_df = st.session_state["results_df"].copy()
+            _export_df = _export_df.drop(columns=["Re-run?"], errors="ignore")
+            xlsx_bytes = build_dmf_workbook(_export_df)
+            st.download_button(
+                "⬇️ Download DMF-ready Excel (color-coded + legend)",
+                data=xlsx_bytes,
+                file_name=f"dmf_export_{market_code}_{time.strftime('%Y%m%d_%H%M')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+        except Exception as _e:
+            st.warning(f"Excel export unavailable: {_e}")
+    else:
+        st.info("💡 Add xlsx_export.py (and `pip install openpyxl`) to enable the "
+                "color-coded DMF Excel download.")
 
     # Re-run selected rows
     rerun_rows = edited_df[edited_df["Re-run?"] == True]
