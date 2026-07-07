@@ -1243,6 +1243,7 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
     SCHEMA:
     {{
         "is_exact_match": true or false,
+        "rejection_reason": "If is_exact_match is false, one of: 'non_food' (product is not food/drink/pet food per FOOD CHECK), 'mismatch' (a different product than the EAN/input), or 'unconfirmed' (could not confirm). Empty string if is_exact_match is true.",
         "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images. Include which sources you used and confirm EAN match.",
         "food_info_reliability": "H, M, or L",
         "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
@@ -1480,6 +1481,122 @@ def _result_matches_gt(res: dict, ground_truth: str) -> bool:
         return True
     haystack = (res.get("title", "") + " " + res.get("snippet", "")).lower()
     return sum(1 for t in gt_tokens if t in haystack) / len(gt_tokens) >= 0.3
+
+
+# ============================================================================
+# ROUTE A / ROUTE B PAGE VERIFICATION
+# A page qualifies as a trusted source for the link, food data, and image if:
+#   Route A — the EAN is confirmed on the page (labelled GTIN context)   → strong
+#   Route B — the product name matches a trusted anchor (user input OR
+#             the EAN-database/registry name) by >=80% token overlap,
+#             with no conflicting weight/size                            → flagged
+# Route B pages are shown/used but flagged and cap the row's reliability at M.
+# ============================================================================
+
+_NAME_MATCH_THRESHOLD = 0.80   # per feedback: name must match >=80%
+
+
+def _sig_tokens(s: str) -> set:
+    """Significant (>3 char) lowercased tokens, punctuation stripped."""
+    if not s:
+        return set()
+    cleaned = re.sub(r"[^\w\s]", " ", s.lower())
+    return {t for t in cleaned.split() if len(t) > 3}
+
+
+def _name_match_ratio(anchor: str, text: str) -> float:
+    """Fraction of the anchor's significant tokens present in `text`."""
+    a = _sig_tokens(anchor)
+    if not a:
+        return 0.0
+    hay = text.lower()
+    return sum(1 for t in a if t in hay) / len(a)
+
+
+def _best_name_ratio(anchors: list[str], text: str) -> float:
+    """Best token-overlap across all trusted anchors (user input, registry)."""
+    return max((_name_match_ratio(a, text) for a in anchors if a), default=0.0)
+
+
+def _weights_conflict(anchors: list[str], text: str) -> bool:
+    """
+    True only when an anchor states a weight AND the page states a DIFFERENT
+    weight. Missing weight on either side is not a conflict (feedback: match
+    other details only when present). Prevents 5kg-vs-500g variant mix-ups.
+    """
+    text_w = _extract_weight_hint(text)
+    if not text_w:
+        return False
+    for a in anchors:
+        aw = _extract_weight_hint(a)
+        if aw and aw != text_w:
+            return True
+    return False
+
+
+async def classify_page(session, url: str, ean: str, anchors: list[str]):
+    """
+    Fetch a candidate page ONCE and classify it as a trusted source.
+
+    Returns (route, images) where:
+      route  = "A"  → EAN confirmed on page (strong)
+             = "B"  → name matches a trusted anchor >=80%, no weight conflict
+             = None → not trustworthy; caller should skip it
+      images = list of (source_tag, image_url) scraped from the page (og/JSON-LD),
+               so the caller can reuse the same verified page for the image.
+
+    Fails closed (returns (None, [])) on any network/parse error.
+    """
+    if not url or not url.startswith("http") or _is_excluded_domain(url):
+        return None, []
+    _ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+           "AppleWebKit/537.36 (KHTML, like Gecko) "
+           "Chrome/122.0.0.0 Safari/537.36")
+    try:
+        async with session.get(url, headers={"User-Agent": _ua}, timeout=8) as r:
+            if r.status != 200:
+                return None, []
+            raw  = await r.content.read(400_000)
+            text = raw.decode("utf-8", errors="ignore")
+    except Exception:
+        return None, []
+
+    stripped = ean.lstrip("0")
+    route = None
+
+    # ── Route A: EAN in a labelled GTIN context ──────────────────────────────
+    if re.search(rf'(gtin\d*|"sku"|itemprop=["\']gtin)[\s"\':=]+["\']?0*{re.escape(stripped)}',
+                 text, re.IGNORECASE) or \
+       re.search(rf'(ean|gtin|barcode|strichcode|streepjescode|'
+                 rf'codice\s*a\s*barre|c[oó]digo\s*de\s*barras|upc)'
+                 rf'[^0-9]{{0,30}}0*{re.escape(stripped)}', text, re.IGNORECASE):
+        route = "A"
+    else:
+        # ── Route B: name match against trusted anchors ──────────────────────
+        # Compare anchors to the page title / og:title / h1 (identity fields),
+        # not the whole body (which contains menus, related products, etc.).
+        title_bits = []
+        m = re.search(r'<meta[^>]+og:title[^>]+content=["\']([^"\']+)', text, re.I)
+        if m: title_bits.append(m.group(1))
+        m = re.search(r'<title[^>]*>([^<]+)</title>', text, re.I)
+        if m: title_bits.append(m.group(1))
+        m = re.search(r'<h1[^>]*>(.*?)</h1>', text, re.I | re.S)
+        if m: title_bits.append(re.sub(r"<[^>]+>", " ", m.group(1)))
+        page_identity = " ".join(title_bits)
+        if page_identity and anchors:
+            ratio = _best_name_ratio(anchors, page_identity)
+            if ratio >= _NAME_MATCH_THRESHOLD and not _weights_conflict(anchors, page_identity):
+                route = "B"
+
+    if route is None:
+        return None, []
+
+    # Scrape images from the (now-trusted) page so the caller can reuse it.
+    try:
+        images = await display_extract_from_page(session, url)
+    except Exception:
+        images = []
+    return route, images
 
 
 def is_garbage_name(name: str) -> bool:
@@ -2604,40 +2721,42 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     # ── Stage 6: Select top images ────────────────────────────────────────────
     selected = display_select(valid_candidates, diag)
 
-    # Change 8: Image Source Link — only include pages confirmed to contain the EAN
-    # This ensures the link actually leads to the correct product page.
-    source_links      = []
+    # ── Stage 7: Unified Route A / Route B source verification ────────────────
+    # A page becomes a trusted source (for its link AND, if we still need one,
+    # its image) when EITHER the EAN is confirmed on it (Route A) OR its name
+    # matches a trusted anchor — user input OR the EAN-database/registry name —
+    # by >=80% (Route B). Route B pages are flagged; the row caps at M.
+    #
+    # This fixes: name-matched pages (e.g. Ökostern Nudeln on eekenhof-shop,
+    # which carry NO EAN) now supply both the link and the image, exactly as
+    # they already supply the food data.
+    _registry_name = ""
+    if go_upc_data and go_upc_data.get("name") and not is_garbage_name(go_upc_data["name"]):
+        _registry_name = go_upc_data["name"]
+    _anchors = [a for a in (_clean_gt, _registry_name) if a]
+
+    source_links      = []          # list[str] (order preserved)
+    source_routes     = {}          # url -> "A" | "B"
     seen_link_domains = set()
     for page_url in retailer_urls:
+        if len(source_links) >= 2:
+            break
         if not page_url or _is_excluded_domain(page_url):
             continue
         dom = page_url.split("/")[2] if page_url.startswith("http") else ""
-        if dom and dom not in seen_link_domains:
-            ean_confirmed = await page_contains_ean(session, page_url, ean, _clean_gt)
-            if ean_confirmed:
-                source_links.append(page_url)
-                seen_link_domains.add(dom)
-                diag.log(f"✅ Image Source Link confirmed (EAN in page): {dom}")
-            else:
-                diag.log(f"   ⚠️ Source link skipped — EAN not found on page: {dom}")
-        if len(source_links) >= 2:
-            break
+        if not dom or dom in seen_link_domains:
+            continue
+        route, page_imgs = await classify_page(session, page_url, ean, _anchors)
+        if route is None:
+            diag.log(f"   ⚠️ Source link skipped — neither EAN nor name match: {dom}")
+            continue
+        source_links.append(page_url)
+        source_routes[page_url] = route
+        seen_link_domains.add(dom)
+        diag.log(f"✅ Source link ({'EAN-verified' if route=='A' else 'name-matched'}): {dom}")
 
-    # ── Stage 7: Rescue image from a VERIFIED source page ─────────────────────
-    # If image search found nothing but we DO have an EAN-confirmed page (e.g.
-    # the Byodo oil on bioaufvorrat.de: data was found there, but Path B's
-    # separate image search never looked at that page), mine that verified
-    # page's own og:image / JSON-LD product image. Because the page's EAN is
-    # confirmed, its main product image is trustworthy without extra vision
-    # gating — the page identity IS the verification.
-    if not selected and source_links:
-        diag.log("🖼️ Stage 7: no image from search — mining verified source page(s).")
-        for page_url in source_links:
-            try:
-                page_imgs = await display_extract_from_page(session, page_url)
-            except Exception as e:
-                diag.log(f"   ⚠️ Verified-page image extract failed: {e}")
-                continue
+        # If we have no image yet, mine THIS verified page's own image.
+        if not selected and page_imgs:
             for src_tag, img_url in page_imgs:
                 if not _is_valid_image_url(img_url) or _is_excluded_domain(img_url):
                     continue
@@ -2647,22 +2766,28 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                 inspection = display_inspect_image(payload["data"])
                 if not inspection["ok"]:
                     continue
+                safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
+                # Route A page image → trust (page identity is the verification).
+                # Route B page image → vision-verify (name match is weaker; a
+                # wrong-variant page could carry a plausible-but-wrong picture).
+                if route == "B" and gemini_key and product_name and \
+                        not str(product_name).startswith("Product with EAN"):
+                    vscore = await asyncio.to_thread(
+                        verify_image_with_gemini, payload["data"], safe_mime,
+                        product_name, brand_for_verify, gemini_key, weight_for_verify)
+                    if vscore is not None and 0 <= vscore < IMAGE_MATCH_THRESHOLD_TRUSTED:
+                        diag.log(f"   ⚠️ Route-B page image rejected by vision ({vscore:.2f}): {dom}")
+                        continue
                 selected.append({
-                    "url":        img_url,
-                    "mime":       _safe_mime(payload["mime"], payload["data"]) or "image/jpeg",
-                    "data":       payload["data"],
-                    "source":     f"verified_page_{src_tag}",
-                    "inspection": inspection,
-                    "phash":      display_compute_phash(payload["data"]),
-                    "display":    True,
-                    "match":      0.5,
+                    "url": img_url, "mime": safe_mime, "data": payload["data"],
+                    "source": f"route{route}_page_{src_tag}", "inspection": inspection,
+                    "phash": display_compute_phash(payload["data"]),
+                    "display": True, "match": 0.5,
                 })
-                diag.log(f"   ✅ Rescued image from verified page: {img_url[:80]}")
-                break
-            if selected:
+                diag.log(f"   ✅ Image sourced from {'EAN' if route=='A' else 'name'}-matched page: {dom}")
                 break
 
-    return selected, diag, source_links, retailer_urls
+    return selected, diag, source_links, retailer_urls, source_routes
 
 
 # ============================================================================
@@ -2709,17 +2834,23 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                                            ground_truth=ground_truth, gemini_key=gemini_key,
                                            go_upc_data=go_upc_data)
 
-        (name, gemini_images, food_diag, ean_verified, food_retailer_urls),         (display_images, image_diag, source_links, pipeline_urls) = await asyncio.gather(food_task, image_task)
+        (name, gemini_images, food_diag, ean_verified, food_retailer_urls),         (display_images, image_diag, source_links, pipeline_urls, source_routes) = await asyncio.gather(food_task, image_task)
 
         # Path A discovered and verified its own retailer pages (e.g. the Byodo
-        # oil on bioaufvorrat.de) that Path B's separate image search may never
-        # have seen. Share them so both source links AND image rescue can use
-        # them. They are re-confirmed on-page below before being trusted.
+        # oil on bioaufvorrat.de, or the Ökostern Nudeln on eekenhof-shop found
+        # by NAME) that Path B's separate search may never have seen. Share and
+        # classify them with the SAME Route A/B logic so a page found by name
+        # (Route B) still supplies its link and image — flagged, capping M.
         for _u in (food_retailer_urls or []):
             if _u and _u not in (pipeline_urls or []):
                 pipeline_urls.append(_u)
-        # Promote any Path-A page that confirms the EAN into source_links so it
-        # can serve as a verified Image Source Link and image-rescue target.
+
+        _registry_name_pa = ""
+        if go_upc_data and go_upc_data.get("name") and not is_garbage_name(go_upc_data["name"]):
+            _registry_name_pa = go_upc_data["name"]
+        _clean_gt_pa = _strip_pack_notation(ground_truth) if ground_truth else ground_truth
+        _anchors_pa = [a for a in (_clean_gt_pa, _registry_name_pa) if a]
+
         _existing_src_domains = {s.split("/")[2] for s in source_links if s.startswith("http")}
         for _u in (food_retailer_urls or []):
             if len(source_links) >= 2:
@@ -2729,35 +2860,42 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             _dom = _u.split("/")[2]
             if _dom in _existing_src_domains:
                 continue
-            _clean_gt_pa = _strip_pack_notation(ground_truth) if ground_truth else ground_truth
-            if await page_contains_ean(session, _u, ean, _clean_gt_pa):
-                source_links.append(_u)
-                _existing_src_domains.add(_dom)
-                image_diag.log(f"✅ Promoted Path-A verified page to source: {_dom}")
-                # If we still have no image, mine this verified page for one.
-                if not display_images:
-                    try:
-                        for _tag, _img in await display_extract_from_page(session, _u):
-                            if not _is_valid_image_url(_img) or _is_excluded_domain(_img):
-                                continue
-                            _pl = await display_fetch_image_bytes(session, _img)
-                            if not _pl or "error" in _pl:
-                                continue
-                            _insp = display_inspect_image(_pl["data"])
-                            if not _insp["ok"]:
-                                continue
-                            display_images.append({
-                                "url": _img,
-                                "mime": _safe_mime(_pl["mime"], _pl["data"]) or "image/jpeg",
-                                "data": _pl["data"], "source": f"pathA_{_tag}",
-                                "inspection": _insp,
-                                "phash": display_compute_phash(_pl["data"]),
-                                "display": True, "match": 0.5,
-                            })
-                            image_diag.log(f"   ✅ Rescued image from Path-A page: {_img[:70]}")
-                            break
-                    except Exception as _e:
-                        image_diag.log(f"   ⚠️ Path-A image rescue failed: {_e}")
+            _route_pa, _page_imgs_pa = await classify_page(session, _u, ean, _anchors_pa)
+            if _route_pa is None:
+                continue
+            source_links.append(_u)
+            source_routes[_u] = _route_pa
+            _existing_src_domains.add(_dom)
+            image_diag.log(f"✅ Promoted Path-A page ({'EAN' if _route_pa=='A' else 'name'}-matched): {_dom}")
+            # If we still have no image, mine this verified page for one.
+            if not display_images and _page_imgs_pa:
+                for _tag, _img in _page_imgs_pa:
+                    if not _is_valid_image_url(_img) or _is_excluded_domain(_img):
+                        continue
+                    _pl = await display_fetch_image_bytes(session, _img)
+                    if not _pl or "error" in _pl:
+                        continue
+                    _insp = display_inspect_image(_pl["data"])
+                    if not _insp["ok"]:
+                        continue
+                    _smime = _safe_mime(_pl["mime"], _pl["data"]) or "image/jpeg"
+                    # Route B image → vision-verify (name match is weaker).
+                    if _route_pa == "B" and gemini_key and name and \
+                            not str(name).startswith("Product with EAN"):
+                        _vs = await asyncio.to_thread(
+                            verify_image_with_gemini, _pl["data"], _smime,
+                            name, "", gemini_key, "")
+                        if _vs is not None and 0 <= _vs < IMAGE_MATCH_THRESHOLD_TRUSTED:
+                            image_diag.log(f"   ⚠️ Route-B Path-A image rejected by vision: {_dom}")
+                            continue
+                    display_images.append({
+                        "url": _img, "mime": _smime, "data": _pl["data"],
+                        "source": f"pathA_route{_route_pa}_{_tag}", "inspection": _insp,
+                        "phash": display_compute_phash(_pl["data"]),
+                        "display": True, "match": 0.5,
+                    })
+                    image_diag.log(f"   ✅ Image from Path-A {'EAN' if _route_pa=='A' else 'name'}-matched page: {_dom}")
+                    break
 
         # ── Change 1: Early exit when no approved source found anything ───────
         no_sources = (
@@ -2848,11 +2986,28 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             and not any(p in u.lower() for p in _search_patterns)
         ]
 
-        # Output = verified pages only.
+        # Output = verified pages only (Route A EAN-confirmed OR Route B name-matched).
         _verified_srcs = list(dict.fromkeys(
             [u for u in source_links if u and _is_displayable_url(u)]
         ))
         srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
+
+        # ── Link Basis flag (feedback: flag name-matched links) ──────────────
+        # Summarise how the shown links were verified so reviewers see at a
+        # glance whether a link is barcode-confirmed or only name-matched.
+        _routes_shown = [source_routes.get(u) for u in _verified_srcs]
+        _has_A = "A" in _routes_shown
+        _has_B = "B" in _routes_shown
+        if _has_A and _has_B:
+            link_basis = "EAN + Name ⚠️"
+        elif _has_A:
+            link_basis = "EAN-verified"
+        elif _has_B:
+            link_basis = "Name-matched ⚠️"
+        else:
+            link_basis = ""
+        # Route-B-only support means no barcode confirmation → cap confidence.
+        _only_name_matched = _has_B and not _has_A and not ean_verified
 
         # Unverified candidates are retained for AUDIT ONLY (hidden column),
         # so the discovery trail is preserved but never shown as a real source.
@@ -2866,12 +3021,14 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
 
         # ── Validation gate — is_exact_match=False means wrong product ────────
         if data.get("is_exact_match") is False:
-            # Conflict: if the PIPELINE independently confirmed the EAN on-page
-            # (or via barcode registry), trust the pipeline. Rather than a
-            # separate "Needs Review" status (dropped per feedback — H/M/L
-            # already conveys confidence), emit the row as Success graded "L"
-            # so reviewers see low confidence plus the verified link.
-            _pipeline_verified = bool(_verified_srcs) or ean_verified
+            _reject = str(data.get("rejection_reason", "")).strip().lower()
+            # The conflict path (trust the pipeline, show the verified link)
+            # applies ONLY when Gemini merely couldn't CONFIRM the product.
+            # A 'non_food' or 'mismatch' rejection means the product is wrong —
+            # showing its link (e.g. the WETEC screwdriver for a food EAN) is a
+            # bug. Those always hard-fail with ZERO links and ZERO images.
+            _conflict_eligible = _reject in ("", "unconfirmed")
+            _pipeline_verified = _conflict_eligible and (bool(_verified_srcs) or ean_verified)
             if _pipeline_verified:
                 row = {
                     "Image 1": imgs[0],
@@ -2882,6 +3039,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                     "User Input": ground_truth,
                     "Product Name": name,
                     "Info Reliability": "L",
+                    "Link Basis": link_basis,
                     "Reliability Reasoning": (
                         f"Low confidence: pipeline confirmed EAN {ean} "
                         f"{'on-page at ' + ', '.join(_verified_srcs[:2]) if _verified_srcs else 'via barcode registry'}, "
@@ -2898,12 +3056,11 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
             # Images are suppressed: Path B searched under the wrong product
             # name, so any images found belong to the wrong product.
-            # Failed validation → suppress ALL unverified sources. The search
-            # candidates that led here are by definition suspect (bare-number
-            # matches on unrelated shops). Only pages that passed strict
-            # on-page EAN confirmation are worth showing for manual review.
-            _fv_srcs = ([u for u in source_links if u and _is_displayable_url(u)]
-                        + ["", "", "", "", ""])[:5]
+            # Failed validation → the product is wrong. Show ZERO source links
+            # and ZERO images: an EAN-confirmed or name-matched page for the
+            # WRONG product (e.g. a screwdriver returned for a food EAN) must
+            # never be offered as a source.
+            _fv_srcs = ["", "", "", "", ""]
             row = {
                 "Image 1": "",
                 "Image 2": "",
@@ -2958,6 +3115,10 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         # the barcode: cap at M so H always means genuine Tier-1/EAN confirmation.
         if reliability == "H" and not ean_verified and not real_sources:
             reliability = "M"
+        # Route-B-only support (name-matched links, no EAN confirmation) can
+        # never be H — a name match is weaker than a barcode match.
+        if _only_name_matched and reliability == "H":
+            reliability = "M"
 
         final_status = "Success"
 
@@ -2971,6 +3132,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             "User Input": ground_truth,
             "Product Name": name,
             "Info Reliability": reliability,
+            "Link Basis": link_basis,
             "Reliability Reasoning": data.get("reliability_reasoning", ""),
             "Chain of Thought": data.get("chain_of_thought", ""),
             "Category L1": data.get("category_1", ""),
@@ -3114,6 +3276,31 @@ st.markdown("""
 The system will automatically find the EAN (8-14 digits) anywhere in the line. Any other text on that line (Brand, Name, Weight) will be used by the AI to strictly validate if it found the correct product online.
 """)
 
+# ── Always-visible legend (shown on the landing page, above the input) ─────────
+with st.expander("ℹ️ How to read the results — reliability grades, status & links", expanded=True):
+    st.markdown(
+        "**Info Reliability**\n"
+        "- **H (High)** — product confirmed by a Tier-1 source or the EAN was "
+        "verified on the product page. Safe to upload.\n"
+        "- **M (Medium)** — data from a real retailer/brand page, but the barcode "
+        "wasn't independently confirmed. Usually fine; spot-check if critical.\n"
+        "- **L (Low)** — weak or single-source data, or automated checks disagreed. "
+        "Verify against the source link before upload.\n\n"
+        "**Status**\n"
+        "- **Success** — data was extracted; use the H/M/L grade to judge confidence.\n"
+        "- **Failed Validation** — the product found didn't match the EAN; no data shown.\n"
+        "- **Search Failed** — a lookup was rate-limited; re-run the row.\n\n"
+        "**Links** — Source links are shown **only** when the pipeline fetched the page "
+        "and confirmed it belongs to the product, so a shown link always points at the correct item. "
+        "The **Link Basis** column tells you how it was confirmed:\n"
+        "- **EAN-verified** — the barcode was found on the page (strongest).\n"
+        "- **Name-matched ⚠️** — the page matched the product name (≥80%) but carried no barcode; "
+        "the row is capped at **M** because a name match is weaker than a barcode match. "
+        "Common for brand/organic shops that don't publish EANs.\n"
+        "Unverified candidates are kept in the hidden *Source Candidates (audit)* column "
+        "(toggle it on above the results table)."
+    )
+
 ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
 
 if st.button("🚀 Start Deep Research", type="primary"):
@@ -3187,6 +3374,7 @@ if "results_df" in st.session_state:
         "Brand",
         "Status",
         "Info Reliability",
+        "Link Basis",
         "Reliability Reasoning",
         "Chain of Thought",
         "Category L1",
@@ -3235,25 +3423,6 @@ if "results_df" in st.session_state:
     df               = df[existing_ordered + remaining]
 
     st.subheader("📊 Results")
-
-    # ── Reliability legend (feedback #4) ──────────────────────────────────────
-    with st.expander("ℹ️ How to read this table — reliability grades & columns", expanded=False):
-        st.markdown(
-            "**Info Reliability**\n"
-            "- **H (High)** — product confirmed by a Tier-1 source or the EAN was "
-            "verified on the product page. Safe to upload.\n"
-            "- **M (Medium)** — data from a real retailer/brand page, but the barcode "
-            "wasn't independently confirmed. Usually fine; spot-check if critical.\n"
-            "- **L (Low)** — weak or single-source data, or automated checks disagreed. "
-            "Verify against the source link before upload.\n\n"
-            "**Status**\n"
-            "- **Success** — data was extracted; use the H/M/L grade to judge confidence.\n"
-            "- **Failed Validation** — the product found didn't match the EAN; no data shown.\n"
-            "- **Search Failed** — a lookup was rate-limited; re-run the row.\n\n"
-            "**Links** — Source links are shown **only** when the pipeline fetched the page "
-            "and confirmed the EAN on it, so a shown link always points at the correct product. "
-            "Unverified candidates are kept in the hidden *Source Candidates (audit)* column."
-        )
 
     # ── Audit-column visibility toggle (feedback #2) ──────────────────────────
     show_audit = st.checkbox(
