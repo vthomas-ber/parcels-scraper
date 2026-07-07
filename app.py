@@ -1059,7 +1059,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         final_downloaded_images.append(img_payload)
 
     diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} image(s) for Gemini extraction.")
-    return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified
+    return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified, retailer_urls
 
 
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
@@ -2623,6 +2623,45 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         if len(source_links) >= 2:
             break
 
+    # ── Stage 7: Rescue image from a VERIFIED source page ─────────────────────
+    # If image search found nothing but we DO have an EAN-confirmed page (e.g.
+    # the Byodo oil on bioaufvorrat.de: data was found there, but Path B's
+    # separate image search never looked at that page), mine that verified
+    # page's own og:image / JSON-LD product image. Because the page's EAN is
+    # confirmed, its main product image is trustworthy without extra vision
+    # gating — the page identity IS the verification.
+    if not selected and source_links:
+        diag.log("🖼️ Stage 7: no image from search — mining verified source page(s).")
+        for page_url in source_links:
+            try:
+                page_imgs = await display_extract_from_page(session, page_url)
+            except Exception as e:
+                diag.log(f"   ⚠️ Verified-page image extract failed: {e}")
+                continue
+            for src_tag, img_url in page_imgs:
+                if not _is_valid_image_url(img_url) or _is_excluded_domain(img_url):
+                    continue
+                payload = await display_fetch_image_bytes(session, img_url)
+                if not payload or "error" in payload:
+                    continue
+                inspection = display_inspect_image(payload["data"])
+                if not inspection["ok"]:
+                    continue
+                selected.append({
+                    "url":        img_url,
+                    "mime":       _safe_mime(payload["mime"], payload["data"]) or "image/jpeg",
+                    "data":       payload["data"],
+                    "source":     f"verified_page_{src_tag}",
+                    "inspection": inspection,
+                    "phash":      display_compute_phash(payload["data"]),
+                    "display":    True,
+                    "match":      0.5,
+                })
+                diag.log(f"   ✅ Rescued image from verified page: {img_url[:80]}")
+                break
+            if selected:
+                break
+
     return selected, diag, source_links, retailer_urls
 
 
@@ -2670,7 +2709,55 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                                            ground_truth=ground_truth, gemini_key=gemini_key,
                                            go_upc_data=go_upc_data)
 
-        (name, gemini_images, food_diag, ean_verified),         (display_images, image_diag, source_links, pipeline_urls) = await asyncio.gather(food_task, image_task)
+        (name, gemini_images, food_diag, ean_verified, food_retailer_urls),         (display_images, image_diag, source_links, pipeline_urls) = await asyncio.gather(food_task, image_task)
+
+        # Path A discovered and verified its own retailer pages (e.g. the Byodo
+        # oil on bioaufvorrat.de) that Path B's separate image search may never
+        # have seen. Share them so both source links AND image rescue can use
+        # them. They are re-confirmed on-page below before being trusted.
+        for _u in (food_retailer_urls or []):
+            if _u and _u not in (pipeline_urls or []):
+                pipeline_urls.append(_u)
+        # Promote any Path-A page that confirms the EAN into source_links so it
+        # can serve as a verified Image Source Link and image-rescue target.
+        _existing_src_domains = {s.split("/")[2] for s in source_links if s.startswith("http")}
+        for _u in (food_retailer_urls or []):
+            if len(source_links) >= 2:
+                break
+            if not _u or not _u.startswith("http") or _is_excluded_domain(_u):
+                continue
+            _dom = _u.split("/")[2]
+            if _dom in _existing_src_domains:
+                continue
+            _clean_gt_pa = _strip_pack_notation(ground_truth) if ground_truth else ground_truth
+            if await page_contains_ean(session, _u, ean, _clean_gt_pa):
+                source_links.append(_u)
+                _existing_src_domains.add(_dom)
+                image_diag.log(f"✅ Promoted Path-A verified page to source: {_dom}")
+                # If we still have no image, mine this verified page for one.
+                if not display_images:
+                    try:
+                        for _tag, _img in await display_extract_from_page(session, _u):
+                            if not _is_valid_image_url(_img) or _is_excluded_domain(_img):
+                                continue
+                            _pl = await display_fetch_image_bytes(session, _img)
+                            if not _pl or "error" in _pl:
+                                continue
+                            _insp = display_inspect_image(_pl["data"])
+                            if not _insp["ok"]:
+                                continue
+                            display_images.append({
+                                "url": _img,
+                                "mime": _safe_mime(_pl["mime"], _pl["data"]) or "image/jpeg",
+                                "data": _pl["data"], "source": f"pathA_{_tag}",
+                                "inspection": _insp,
+                                "phash": display_compute_phash(_pl["data"]),
+                                "display": True, "match": 0.5,
+                            })
+                            image_diag.log(f"   ✅ Rescued image from Path-A page: {_img[:70]}")
+                            break
+                    except Exception as _e:
+                        image_diag.log(f"   ⚠️ Path-A image rescue failed: {_e}")
 
         # ── Change 1: Early exit when no approved source found anything ───────
         no_sources = (
@@ -2737,17 +2824,15 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                    for k, v in row.items()}
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
-        # ── Build Source 1-5 — prioritise our own verified URLs over Gemini's ────
-        #
-        # Gemini's JSON "sources" field is LLM-generated and unreliable:
-        # URLs can be hallucinated, wrong-format, stale, or point to search
-        # pages rather than product pages.
-        #
-        # Priority order:
-        #   1. source_links  — EAN confirmed by page_contains_ean() ✅ best
-        #   2. pipeline_urls — real SerpAPI organic results (goldmine/brand) ✅ real
-        #   3. Gemini sources — LLM-generated, kept as last resort ⚠️
-        #
+        # ── Build Source 1-5 — VERIFIED-ONLY ─────────────────────────────────
+        # A link reaches the Source columns ONLY if the pipeline fetched it this
+        # run and confirmed the product's EAN on the page (source_links are
+        # exactly those pages). This is the fix for wrong/broken source links:
+        #   • Gemini-returned URLs (hallucinated / stale)      → never in output
+        #   • Unverified SerpAPI hits (right digits, wrong item, e.g. a
+        #     MediaMarkt plug or a tyre listing matching an article number)
+        #                                                      → never in output
+        # Users see FEWER links, but every shown link is live AND correct.
         _gemini_sources = data.get("sources", [])
         if isinstance(_gemini_sources, str):
             _gemini_sources = [s.strip() for s in _gemini_sources.split(",") if s.strip()]
@@ -2755,7 +2840,6 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             _gemini_sources = []
         _gemini_sources = [s for s in _gemini_sources if s and _is_displayable_url(s)]
 
-        # Filter pipeline_urls: exclude bare search-results pages
         _search_patterns = ("/search?", "?q=", "?query=", "?search=",
                              "?entry=", "?searchTerm=", "?terme=")
         _pipe_filtered = [
@@ -2764,70 +2848,49 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             and not any(p in u.lower() for p in _search_patterns)
         ]
 
-        # Merge in priority order, deduplicate, cap for liveness checking.
-        # Gemini sources are LLM-generated and the main origin of dead links —
-        # they are kept ONLY if they survive the liveness check below.
-        _all_srcs = list(dict.fromkeys(
-            [u for u in source_links if u and _is_displayable_url(u)] +
-            _pipe_filtered +
-            _gemini_sources
+        # Output = verified pages only.
+        _verified_srcs = list(dict.fromkeys(
+            [u for u in source_links if u and _is_displayable_url(u)]
+        ))
+        srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
+
+        # Unverified candidates are retained for AUDIT ONLY (hidden column),
+        # so the discovery trail is preserved but never shown as a real source.
+        _audit_candidates = list(dict.fromkeys(
+            [u for u in _pipe_filtered if u not in _verified_srcs] +
+            [u for u in _gemini_sources if u not in _verified_srcs]
         ))[:8]
+        audit_sources = " | ".join(_audit_candidates)
 
-        # ── Liveness gate: never ship a link we could not verify ─────────────
-        # HEAD (GET fallback) each candidate concurrently; drop dead ones.
-        # source_links were already EAN-confirmed via full page fetch, so they
-        # are exempt (they were alive seconds ago) — everything else must pass.
-        _exempt = set(source_links)
-        _to_check = [u for u in _all_srcs if u not in _exempt]
-        if _to_check:
-            _alive_flags = await asyncio.gather(
-                *[_url_alive(session, u) for u in _to_check])
-            _alive = {u for u, ok in zip(_to_check, _alive_flags) if ok}
-            _dropped = [u for u in _to_check if u not in _alive]
-            for u in _dropped:
-                image_diag.log(f"⚠️ Source link dropped (liveness check failed): {u[:80]}")
-            _all_srcs = [u for u in _all_srcs if u in _exempt or u in _alive]
-        srcs = (_all_srcs + ["", "", "", "", ""])[:5]
-
-        # NOTE: no liveness HEAD-check on image URLs. The display pipeline
-        # downloaded, inspected, and vision-verified these exact bytes moments
-        # ago — that download IS the liveness proof. A follow-up HEAD often
-        # gets 403 from bot-protection even though the image renders fine in
-        # a browser, so a fail-closed check here wrongly blanks valid images.
-        # (The durable-URL gate above still removes expiring CDN thumbnails.)
-
-        # Determine real approved sources for reliability gate (unchanged logic)
-        real_sources = [
-            s for s in _all_srcs
-            if s and not _is_excluded_domain(s)
-        ]
+        real_sources = list(_verified_srcs)
 
         # ── Validation gate — is_exact_match=False means wrong product ────────
         if data.get("is_exact_match") is False:
-            # Conflict guard: if the PIPELINE independently verified the EAN
-            # (on-page confirmation or barcode registry), a Gemini veto is a
-            # disagreement between components, not proof of a wrong product.
-            # Surface it as Needs Review with both positions visible, instead
-            # of a hard Failed Validation that buries pipeline evidence.
-            _pipeline_verified = bool(source_links) or ean_verified
+            # Conflict: if the PIPELINE independently confirmed the EAN on-page
+            # (or via barcode registry), trust the pipeline. Rather than a
+            # separate "Needs Review" status (dropped per feedback — H/M/L
+            # already conveys confidence), emit the row as Success graded "L"
+            # so reviewers see low confidence plus the verified link.
+            _pipeline_verified = bool(_verified_srcs) or ean_verified
             if _pipeline_verified:
                 row = {
                     "Image 1": imgs[0],
                     "Image 2": imgs[1],
                     "Image Source Link": img_src_links[0],
-                    "Status": "⚠️ Needs Review — pipeline verified EAN but AI could not confirm",
+                    "Status": "Success",
                     "GTIN / EAN": ean,
                     "User Input": ground_truth,
                     "Product Name": name,
                     "Info Reliability": "L",
                     "Reliability Reasoning": (
-                        f"CONFLICT: The pipeline confirmed EAN {ean} "
-                        f"{'on-page at: ' + ', '.join(source_links[:2]) if source_links else 'via barcode registry'}. "
-                        f"Gemini's independent search could not confirm and voted is_exact_match=false. "
-                        f"Manual check of the verified link(s) recommended."),
+                        f"Low confidence: pipeline confirmed EAN {ean} "
+                        f"{'on-page at ' + ', '.join(_verified_srcs[:2]) if _verified_srcs else 'via barcode registry'}, "
+                        f"but automated extraction could not fully confirm the match. "
+                        f"Verify against the source link before upload."),
                     "Chain of Thought": data.get("chain_of_thought", ""),
                     "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2],
                     "Source 4": srcs[3], "Source 5": srcs[4],
+                    "Source Candidates (audit)": audit_sources,
                     "Cached": "🔄 Fresh",
                 }
                 row = {k: ("" if (v is None or v == "null" or v == "None") else v)
@@ -2871,6 +2934,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 "Fiber (g)": "", "Salt (g)": "",
                 "Source 1": _fv_srcs[0], "Source 2": _fv_srcs[1], "Source 3": _fv_srcs[2],
                 "Source 4": _fv_srcs[3], "Source 5": _fv_srcs[4],
+                "Source Candidates (audit)": audit_sources,
                 "Cached": "🔄 Fresh"
             }
             # Failed validation is never cached — the product may be retried with
@@ -2880,20 +2944,22 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
         # ── Determine final status ────────────────────────────────────────────
-        # Priority: wrong answer < needs review < success.
-        # Rules (most conservative first):
-        #   L reliability         → always Needs Review
-        #   No approved sources   → always Needs Review
-        #   M reliability + no EAN barcode verification → Needs Review
-        #   Otherwise             → Success
-        reliability = data.get("food_info_reliability", "")
+        # "Needs Review" removed per feedback — it was confusing about what
+        # action to take. Status is now binary:
+        #   Failed Validation  → wrong product (handled above)
+        #   Success            → data extracted; confidence conveyed by H/M/L
+        # Reliability grading (unchanged from Gemini) tells the reviewer how
+        # much to trust the row: H = Tier-1/EAN-confirmed, M = real source but
+        # not barcode-confirmed, L = weak/single source. If a product wasn't
+        # found directly in a Tier-1 source, M or L is sufficient signal.
+        reliability = data.get("food_info_reliability", "") or "M"
 
-        if reliability == "L" or not real_sources:
-            final_status = "⚠️ Needs Review"
-        elif reliability == "M" and not ean_verified:
-            final_status = "⚠️ Needs Review"
-        else:
-            final_status = "Success"
+        # Guard against an over-confident H when nothing independently confirmed
+        # the barcode: cap at M so H always means genuine Tier-1/EAN confirmation.
+        if reliability == "H" and not ean_verified and not real_sources:
+            reliability = "M"
+
+        final_status = "Success"
 
         row = {
             "Image 1": imgs[0],
@@ -2947,6 +3013,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             "Source 3": srcs[2],
             "Source 4": srcs[3],
             "Source 5": srcs[4],
+            "Source Candidates (audit)": audit_sources,
             "Cached": "🔄 Fresh"
         }
 
@@ -3160,6 +3227,7 @@ if "results_df" in st.session_state:
         "Source 3",
         "Source 4",
         "Source 5",
+        "Source Candidates (audit)",
     ]
 
     existing_ordered = [c for c in column_order if c in df.columns]
@@ -3167,6 +3235,37 @@ if "results_df" in st.session_state:
     df               = df[existing_ordered + remaining]
 
     st.subheader("📊 Results")
+
+    # ── Reliability legend (feedback #4) ──────────────────────────────────────
+    with st.expander("ℹ️ How to read this table — reliability grades & columns", expanded=False):
+        st.markdown(
+            "**Info Reliability**\n"
+            "- **H (High)** — product confirmed by a Tier-1 source or the EAN was "
+            "verified on the product page. Safe to upload.\n"
+            "- **M (Medium)** — data from a real retailer/brand page, but the barcode "
+            "wasn't independently confirmed. Usually fine; spot-check if critical.\n"
+            "- **L (Low)** — weak or single-source data, or automated checks disagreed. "
+            "Verify against the source link before upload.\n\n"
+            "**Status**\n"
+            "- **Success** — data was extracted; use the H/M/L grade to judge confidence.\n"
+            "- **Failed Validation** — the product found didn't match the EAN; no data shown.\n"
+            "- **Search Failed** — a lookup was rate-limited; re-run the row.\n\n"
+            "**Links** — Source links are shown **only** when the pipeline fetched the page "
+            "and confirmed the EAN on it, so a shown link always points at the correct product. "
+            "Unverified candidates are kept in the hidden *Source Candidates (audit)* column."
+        )
+
+    # ── Audit-column visibility toggle (feedback #2) ──────────────────────────
+    show_audit = st.checkbox(
+        "🔍 Show link / audit columns (Image Source Link, source candidates)",
+        value=False,
+        help="Off by default for a cleaner DMF view. Turn on to see and click "
+             "the underlying image and source URLs.",
+    )
+    _audit_cols = ["Image Source Link", "Source Candidates (audit)"]
+    if not show_audit:
+        df = df.drop(columns=[c for c in _audit_cols if c in df.columns], errors="ignore")
+
     edited_df = st.data_editor(
         df,
         column_config={
@@ -3182,11 +3281,15 @@ if "results_df" in st.session_state:
             ),
             "Image 1":          st.column_config.ImageColumn(),
             "Image 2":          st.column_config.ImageColumn(),
-            "Image Source Link": st.column_config.LinkColumn(
+            **({"Image Source Link": st.column_config.LinkColumn(
                 "Image Source Link",
                 display_text="🔗 Image Source",
                 help="Direct URL to the product image. Click to open if the image above could not be rendered.",
-            ),
+            )} if show_audit else {}),
+            **({"Source Candidates (audit)": st.column_config.TextColumn(
+                "Source Candidates (audit)",
+                help="Unverified discovery candidates — NOT confirmed to match the EAN. For audit only.",
+            )} if show_audit else {}),
             "Source 1": st.column_config.LinkColumn(display_text="Link 1"),
             "Source 2": st.column_config.LinkColumn(display_text="Link 2"),
             "Source 3": st.column_config.LinkColumn(display_text="Link 3"),
