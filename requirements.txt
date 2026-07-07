@@ -5,3 +5,4 @@ aiohttp
 google-genai
 Pillow
 imagehash
+openpyxl
