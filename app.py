@@ -3109,18 +3109,31 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         # much to trust the row: H = Tier-1/EAN-confirmed, M = real source but
         # not barcode-confirmed, L = weak/single source. If a product wasn't
         # found directly in a Tier-1 source, M or L is sufficient signal.
+        # ── Reliability & status gated on VERIFIED sources ────────────────────
+        # Grading now depends on whether a Route A/B page actually verified the
+        # product — NOT on Gemini's self-assessment alone. This closes the
+        # "Success/M with only a Telekom audit link" case: an audit candidate is
+        # unverified and does not count as a source.
+        #   • No Route A/B verified source (real_sources empty) AND no registry
+        #     EAN verification → data is unsourced → Failed Validation, L.
+        #   • Route B only (name-matched, no barcode)            → M (cap).
+        #   • Route A / EAN-confirmed                            → H-eligible.
         reliability = data.get("food_info_reliability", "") or "M"
+        _has_verified_source = bool(real_sources) or ean_verified
 
-        # Guard against an over-confident H when nothing independently confirmed
-        # the barcode: cap at M so H always means genuine Tier-1/EAN confirmation.
-        if reliability == "H" and not ean_verified and not real_sources:
-            reliability = "M"
-        # Route-B-only support (name-matched links, no EAN confirmation) can
-        # never be H — a name match is weaker than a barcode match.
-        if _only_name_matched and reliability == "H":
-            reliability = "M"
-
-        final_status = "Success"
+        if not _has_verified_source:
+            # Data may have been extracted, but nothing independently verified
+            # the source. Fail it and grade L — honest "unsourced" signal.
+            final_status = "Failed Validation"
+            reliability  = "L"
+        else:
+            final_status = "Success"
+            # H requires genuine Tier-1/EAN confirmation.
+            if reliability == "H" and not ean_verified and not real_sources:
+                reliability = "M"
+            # Route-B-only support (name match, no barcode) can never be H.
+            if _only_name_matched and reliability == "H":
+                reliability = "M"
 
         row = {
             "Image 1": imgs[0],
