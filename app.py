@@ -70,19 +70,7 @@ def init_cache():
     con.close()
 
 
-def _cache_key(ean: str, ground_truth: str = "") -> str:
-    """
-    Cache key = EAN + normalized ground truth. Two different inputs for the SAME
-    barcode (e.g. "Fanta Exotic 500ml" vs "120x Fanta Exotic 500ml") must not
-    collide — the ground truth drives Route B name-matching and validation, so
-    their results genuinely differ. Normalization (lowercase, collapse spaces)
-    keeps trivial variants from fragmenting the cache.
-    """
-    gt = re.sub(r"\s+", " ", (ground_truth or "").strip().lower())
-    return f"{ean}|{gt}" if gt else ean
-
-
-def cache_get(ean: str, market: str, ground_truth: str = ""):
+def cache_get(ean: str, market: str):
     """
     Return a cached result only if it was stored under the current schema version
     AND its status was 'Success'.  Any other entry (error, failed-validation,
@@ -94,12 +82,11 @@ def cache_get(ean: str, market: str, ground_truth: str = ""):
     This is intentional — the extraction prompt and source rules have changed
     significantly, so stale entries must not be served as authoritative data.
     """
-    key = _cache_key(ean, ground_truth)
     try:
         con = sqlite3.connect(DB_PATH)
         row = con.execute(
             "SELECT result_json, status, version FROM ean_cache WHERE ean=? AND market=?",
-            (key, market)
+            (ean, market)
         ).fetchone()
         con.close()
         if not row:
@@ -115,16 +102,14 @@ def cache_get(ean: str, market: str, ground_truth: str = ""):
 
 
 def cache_set(ean: str, market: str, result_dict: dict,
-              status: str = "unknown", confidence: float = 0.0,
-              ground_truth: str = ""):
-    key = _cache_key(ean, ground_truth)
+              status: str = "unknown", confidence: float = 0.0):
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
             """INSERT OR REPLACE INTO ean_cache
                (ean, market, result_json, status, confidence, version)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (key, market, json.dumps(result_dict), status, confidence, CACHE_VERSION)
+            (ean, market, json.dumps(result_dict), status, confidence, CACHE_VERSION)
         )
         con.commit()
         con.close()
@@ -132,49 +117,17 @@ def cache_set(ean: str, market: str, result_dict: dict,
         pass
 
 
-def cache_delete(ean: str, market: str, ground_truth: str = ""):
-    key = _cache_key(ean, ground_truth)
+def cache_delete(ean: str, market: str):
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
             "DELETE FROM ean_cache WHERE ean=? AND market=?",
-            (key, market)
+            (ean, market)
         )
         con.commit()
         con.close()
     except Exception:
         pass
-
-
-def cache_count() -> int:
-    """Number of cached rows (for the sidebar control)."""
-    try:
-        con = sqlite3.connect(DB_PATH)
-        n = con.execute("SELECT COUNT(*) FROM ean_cache").fetchone()[0]
-        con.close()
-        return int(n)
-    except Exception:
-        return 0
-
-
-def cache_clear(market: str | None = None) -> int:
-    """
-    Clear cached results. If `market` is given, clears only that market;
-    otherwise clears everything. Returns the number of rows removed.
-    Used after logic/schema changes so stale entries can't be served.
-    """
-    try:
-        con = sqlite3.connect(DB_PATH)
-        if market:
-            cur = con.execute("DELETE FROM ean_cache WHERE market=?", (market,))
-        else:
-            cur = con.execute("DELETE FROM ean_cache")
-        removed = cur.rowcount
-        con.commit()
-        con.close()
-        return int(removed)
-    except Exception:
-        return 0
 
 
 # ============================================================================
@@ -1107,109 +1060,6 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
 
     diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} image(s) for Gemini extraction.")
     return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified, retailer_urls
-
-
-# ============================================================================
-# VERIFY-THEN-READ: extract food fields from the VERIFIED page's own text
-# The link and the data must agree. After a page is verified (Route A/B), we
-# fetch that page's text and extract the nutrition/food fields FROM IT, then
-# override the search-derived values so the number in the row matches the page
-# in the Source column. Fields genuinely absent from the page keep the
-# search-derived value but are FLAGGED as mixed-provenance (lean-flag).
-# ============================================================================
-
-# Row keys ↔ Gemini/page field keys for the fields that must trace to the page.
-_PAGE_READ_FIELDS = {
-    "ingredients": "Ingredients",
-    "allergens": "Allergens",
-    "may_contain": "May Contain",
-    "energy_kj": "Energy (kJ)",
-    "fat_g": "Fat (g)",
-    "saturates_g": "Of Which Saturated Fatty Acids (g)",
-    "carbohydrates_g": "Carbohydrates (g)",
-    "sugars_g": "Of Which Sugars (g)",
-    "protein_g": "Protein (g)",
-    "fiber_g": "Fiber (g)",
-    "salt_g": "Salt (g)",
-    "manufacturer_name": "Manufacturer Name",
-    "manufacturer_address": "Manufacturer Address",
-    "place_of_origin": "Place of Origin",
-}
-
-
-def _fetch_page_text_sync(url: str) -> str:
-    """Blocking fetch of a page's visible text (run via asyncio.to_thread)."""
-    import urllib.request
-    _ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-           "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": _ua})
-        with urllib.request.urlopen(req, timeout=10) as r:
-            raw = r.read(600_000)
-        html = raw.decode("utf-8", errors="ignore")
-        html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
-        html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
-        text = re.sub(r"<[^>]+>", " ", html)
-        text = re.sub(r"\s+", " ", text)
-        return text[:20000]
-    except Exception:
-        return ""
-
-
-def extract_fields_from_page(page_text: str, ean: str, product_name: str,
-                             market_code: str, gemini_key: str) -> dict | None:
-    """
-    Ask Gemini to extract the food fields ONLY from the supplied verified-page
-    text (no search). Returns {field_key: value|None}. Missing fields = None.
-    Returns None on hard failure so the caller can fall back cleanly.
-    """
-    if not page_text or len(page_text) < 200:
-        return None
-    field_lines = "\n".join(f'        "{k}": "value or null",'
-                            for k in _PAGE_READ_FIELDS)
-    prompt = f"""
-You are reading ONE verified product page. Extract the fields below ONLY from
-the PAGE TEXT provided. Do NOT use outside knowledge or search. If a field is
-not present in this text, return null for it — do not guess or infer.
-
-Return per-100g/100ml nutrition values as plain numbers. Translate text fields
-to the {market_code} market language. Product (for reference): {product_name} (EAN {ean}).
-
-Return ONLY a JSON object, no prose:
-{{
-{field_lines}
-    }}
-
-PAGE TEXT:
-\"\"\"{page_text}\"\"\"
-"""
-    try:
-        client = genai.Client(api_key=gemini_key)
-        resp = client.models.generate_content(
-            model=EXTRACTION_MODEL,
-            contents=[prompt],
-            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=2048),
-        )
-        raw = ""
-        if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
-            for part in resp.candidates[0].content.parts:
-                if getattr(part, "text", None):
-                    raw += part.text
-        raw = raw.strip().replace("```json", "").replace("```", "").strip()
-        m = re.search(r"\{.*\}", raw, re.S)
-        if not m:
-            return None
-        parsed = json.loads(m.group(0))
-        out = {}
-        for k in _PAGE_READ_FIELDS:
-            v = parsed.get(k, None)
-            if v in ("", "null", "None", None):
-                out[k] = None
-            else:
-                out[k] = v
-        return out
-    except Exception:
-        return None
 
 
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
@@ -2952,19 +2802,14 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
 
     # ── Cache check ──────────────────────────────────────────────────────────
     if not force_refresh:
-        cached = cache_get(ean, market, ground_truth)
+        cached = cache_get(ean, market)
         if cached:
-            # Always reflect the CURRENT request's input, never the input the
-            # row was first cached under — prevents a stale User Input string
-            # (e.g. an old "120x …") showing on a hit.
-            cached["Cached"]      = "✅ Cached"
-            cached["User Input"]  = ground_truth
-            cached["GTIN / EAN"]  = ean
+            cached["Cached"] = "✅ Cached"
             empty_diag = ImageDiagnostics(ean)
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
     else:
-        cache_delete(ean, market, ground_truth)
+        cache_delete(ean, market)
 
     async with sem:
         # ── Tier 1A: Go-UPC — single call, result shared by both paths ───────
@@ -3264,31 +3109,18 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         # much to trust the row: H = Tier-1/EAN-confirmed, M = real source but
         # not barcode-confirmed, L = weak/single source. If a product wasn't
         # found directly in a Tier-1 source, M or L is sufficient signal.
-        # ── Reliability & status gated on VERIFIED sources ────────────────────
-        # Grading now depends on whether a Route A/B page actually verified the
-        # product — NOT on Gemini's self-assessment alone. This closes the
-        # "Success/M with only a Telekom audit link" case: an audit candidate is
-        # unverified and does not count as a source.
-        #   • No Route A/B verified source (real_sources empty) AND no registry
-        #     EAN verification → data is unsourced → Failed Validation, L.
-        #   • Route B only (name-matched, no barcode)            → M (cap).
-        #   • Route A / EAN-confirmed                            → H-eligible.
         reliability = data.get("food_info_reliability", "") or "M"
-        _has_verified_source = bool(real_sources) or ean_verified
 
-        if not _has_verified_source:
-            # Data may have been extracted, but nothing independently verified
-            # the source. Fail it and grade L — honest "unsourced" signal.
-            final_status = "Failed Validation"
-            reliability  = "L"
-        else:
-            final_status = "Success"
-            # H requires genuine Tier-1/EAN confirmation.
-            if reliability == "H" and not ean_verified and not real_sources:
-                reliability = "M"
-            # Route-B-only support (name match, no barcode) can never be H.
-            if _only_name_matched and reliability == "H":
-                reliability = "M"
+        # Guard against an over-confident H when nothing independently confirmed
+        # the barcode: cap at M so H always means genuine Tier-1/EAN confirmation.
+        if reliability == "H" and not ean_verified and not real_sources:
+            reliability = "M"
+        # Route-B-only support (name-matched links, no EAN confirmation) can
+        # never be H — a name match is weaker than a barcode match.
+        if _only_name_matched and reliability == "H":
+            reliability = "M"
+
+        final_status = "Success"
 
         row = {
             "Image 1": imgs[0],
@@ -3347,91 +3179,9 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             "Cached": "🔄 Fresh"
         }
 
-        # ── VERIFY-THEN-READ: reconcile data with the linked page ─────────────
-        # NON-DESTRUCTIVE: a page value may only CORRECT a field — it can never
-        # blank or worsen a value the first pass already found. We only override
-        # when (a) the page text was actually readable, and (b) the page value
-        # is a genuine, non-trivial reading. Otherwise the first pass's data is
-        # kept as-is. This fixes both the Fanta mismatch (226→111 when the page
-        # clearly has 111) AND the blank-out bug (a thin/cookie-walled page must
-        # never erase good data).
-        _MIN_READABLE_PAGE = 800   # chars of extracted text to trust a re-read
-        _JUNK_VALUES = {"", "null", "none", "n/a", "na", "-", "–", "—", "tbd",
-                        "bild folgt bald", "keine angabe", "k.a."}
-
-        def _is_real_value(v) -> bool:
-            """A page value worth overriding with: not junk, not empty."""
-            if v is None:
-                return False
-            s = str(v).strip().lower()
-            if s in _JUNK_VALUES:
-                return False
-            return len(s) > 0
-
-        def _is_better_reading(page_val, existing_val) -> bool:
-            """
-            True if the page value should replace the existing one. Guards:
-            - page value must be a real reading (never overwrite with junk);
-            - for NUMERIC fields, don't replace a concrete number with a vague
-              'less than' reading (e.g. keep 0.5 rather than overwrite with
-              '<0.5'), which is a downgrade in precision.
-            """
-            if not _is_real_value(page_val):
-                return False
-            ex = str(existing_val or "").strip()
-            pv = str(page_val).strip()
-            if ex and pv == ex:
-                return False
-            # Don't downgrade a concrete number to an inequality/approximate.
-            if ex and re.fullmatch(r"[\d.,]+", ex) and re.search(r"[<>~≈]", pv):
-                return False
-            return True
-
-        data_provenance = "Search only"
-        if final_status == "Success" and _verified_srcs:
-            _vpage = _verified_srcs[0]
-            _ptext = await asyncio.to_thread(_fetch_page_text_sync, _vpage)
-            if not _ptext or len(_ptext) < _MIN_READABLE_PAGE:
-                # Page unreadable (JS/cookie wall / thin shell) → keep first-pass
-                # data untouched. NEVER let an unreadable page blank good data.
-                data_provenance = "Search (page not readable to confirm)"
-                image_diag.log("⚠️ Verify-then-read: page too thin to confirm — "
-                               "first-pass data kept unchanged.")
-            else:
-                _pfields = await asyncio.to_thread(
-                    extract_fields_from_page, _ptext, ean, name, market, gemini_key)
-                if _pfields:
-                    _corrected, _page_confirmed, _kept_from_search = [], [], []
-                    for _fkey, _rowkey in _PAGE_READ_FIELDS.items():
-                        _pval = _pfields.get(_fkey)
-                        _existing = row.get(_rowkey, "")
-                        if _is_better_reading(_pval, _existing):
-                            row[_rowkey] = _pval          # correct from page
-                            _corrected.append(_rowkey)
-                        elif _is_real_value(_pval):
-                            _page_confirmed.append(_rowkey)  # page agreed / matched
-                        elif str(_existing or "").strip():
-                            _kept_from_search.append(_rowkey)  # page silent, keep search
-                    if _corrected or _kept_from_search:
-                        data_provenance = "Mixed — some fields from search ⚠️" \
-                            if _kept_from_search else "Verified page"
-                    else:
-                        data_provenance = "Verified page"
-                    image_diag.log(
-                        f"📄 Verify-then-read: {len(_corrected)} corrected, "
-                        f"{len(_page_confirmed)} confirmed, "
-                        f"{len(_kept_from_search)} kept from search.")
-                else:
-                    # Extraction failed on a readable page → keep first-pass data.
-                    data_provenance = "Search (page read inconclusive)"
-                    image_diag.log("⚠️ Verify-then-read: extraction inconclusive — "
-                                   "first-pass data kept unchanged.")
-        row["Data Provenance"] = data_provenance
-
         # ── Cache only confirmed successes ────────────────────────────────────
         if should_cache(final_status):
-            cache_set(ean, market, row, status=final_status, confidence=1.0,
-                      ground_truth=ground_truth)
+            cache_set(ean, market, row, status=final_status, confidence=1.0)
 
         # Sanitise: replace Python None and the string "null" with ""
         # so Streamlit never renders the word "None" in any cell.
@@ -3509,20 +3259,6 @@ with st.sidebar:
     )
     market_code = market_selection.split("(")[1].replace(")", "")
 
-    # ── Cache management ──────────────────────────────────────────────────────
-    st.divider()
-    st.caption(f"🗃️ Cache: {cache_count()} stored result(s)")
-    _c1, _c2 = st.columns(2)
-    with _c1:
-        if st.button("Clear this market", help=f"Remove cached results for {market_code} only"):
-            _n = cache_clear(market_code)
-            st.success(f"Cleared {_n} entr{'y' if _n == 1 else 'ies'} for {market_code}.")
-    with _c2:
-        if st.button("Clear all", help="Remove ALL cached results (all markets)"):
-            _n = cache_clear()
-            st.success(f"Cleared {_n} cached entr{'y' if _n == 1 else 'ies'}.")
-    st.caption("Tip: prefix a line with `REFRESH ` to force-refresh a single EAN.")
-
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables.")
     if not GO_UPC_KEY:
@@ -3562,15 +3298,7 @@ with st.expander("ℹ️ How to read the results — reliability grades, status 
         "the row is capped at **M** because a name match is weaker than a barcode match. "
         "Common for brand/organic shops that don't publish EANs.\n"
         "Unverified candidates are kept in the hidden *Source Candidates (audit)* column "
-        "(toggle it on above the results table).\n\n"
-        "**Data Provenance** — where the food data was read from:\n"
-        "- **Verified page** — every field was read directly from the linked source page. "
-        "The numbers match Source 1.\n"
-        "- **Mixed — some fields from search ⚠️** — most fields come from the linked page, "
-        "but a few not present on it were filled from web search. Those specific cells "
-        "aren't backed by the link.\n"
-        "- **Search only** — no readable verified page; data came from web search and "
-        "isn't confirmed against a source (these rows also grade low)."
+        "(toggle it on above the results table)."
     )
 
 ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
@@ -3647,7 +3375,6 @@ if "results_df" in st.session_state:
         "Status",
         "Info Reliability",
         "Link Basis",
-        "Data Provenance",
         "Reliability Reasoning",
         "Chain of Thought",
         "Category L1",
