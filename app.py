@@ -1062,6 +1062,109 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
     return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified, retailer_urls
 
 
+# ============================================================================
+# VERIFY-THEN-READ: extract food fields from the VERIFIED page's own text
+# The link and the data must agree. After a page is verified (Route A/B), we
+# fetch that page's text and extract the nutrition/food fields FROM IT, then
+# override the search-derived values so the number in the row matches the page
+# in the Source column. Fields genuinely absent from the page keep the
+# search-derived value but are FLAGGED as mixed-provenance (lean-flag).
+# ============================================================================
+
+# Row keys ↔ Gemini/page field keys for the fields that must trace to the page.
+_PAGE_READ_FIELDS = {
+    "ingredients": "Ingredients",
+    "allergens": "Allergens",
+    "may_contain": "May Contain",
+    "energy_kj": "Energy (kJ)",
+    "fat_g": "Fat (g)",
+    "saturates_g": "Of Which Saturated Fatty Acids (g)",
+    "carbohydrates_g": "Carbohydrates (g)",
+    "sugars_g": "Of Which Sugars (g)",
+    "protein_g": "Protein (g)",
+    "fiber_g": "Fiber (g)",
+    "salt_g": "Salt (g)",
+    "manufacturer_name": "Manufacturer Name",
+    "manufacturer_address": "Manufacturer Address",
+    "place_of_origin": "Place of Origin",
+}
+
+
+def _fetch_page_text_sync(url: str) -> str:
+    """Blocking fetch of a page's visible text (run via asyncio.to_thread)."""
+    import urllib.request
+    _ua = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": _ua})
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read(600_000)
+        html = raw.decode("utf-8", errors="ignore")
+        html = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+        html = re.sub(r"<style.*?</style>", " ", html, flags=re.S | re.I)
+        text = re.sub(r"<[^>]+>", " ", html)
+        text = re.sub(r"\s+", " ", text)
+        return text[:20000]
+    except Exception:
+        return ""
+
+
+def extract_fields_from_page(page_text: str, ean: str, product_name: str,
+                             market_code: str, gemini_key: str) -> dict | None:
+    """
+    Ask Gemini to extract the food fields ONLY from the supplied verified-page
+    text (no search). Returns {field_key: value|None}. Missing fields = None.
+    Returns None on hard failure so the caller can fall back cleanly.
+    """
+    if not page_text or len(page_text) < 200:
+        return None
+    field_lines = "\n".join(f'        "{k}": "value or null",'
+                            for k in _PAGE_READ_FIELDS)
+    prompt = f"""
+You are reading ONE verified product page. Extract the fields below ONLY from
+the PAGE TEXT provided. Do NOT use outside knowledge or search. If a field is
+not present in this text, return null for it — do not guess or infer.
+
+Return per-100g/100ml nutrition values as plain numbers. Translate text fields
+to the {market_code} market language. Product (for reference): {product_name} (EAN {ean}).
+
+Return ONLY a JSON object, no prose:
+{{
+{field_lines}
+    }}
+
+PAGE TEXT:
+\"\"\"{page_text}\"\"\"
+"""
+    try:
+        client = genai.Client(api_key=gemini_key)
+        resp = client.models.generate_content(
+            model=EXTRACTION_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=2048),
+        )
+        raw = ""
+        if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+            for part in resp.candidates[0].content.parts:
+                if getattr(part, "text", None):
+                    raw += part.text
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return None
+        parsed = json.loads(m.group(0))
+        out = {}
+        for k in _PAGE_READ_FIELDS:
+            v = parsed.get(k, None)
+            if v in ("", "null", "None", None):
+                out[k] = None
+            else:
+                out[k] = v
+        return out
+    except Exception:
+        return None
+
+
 def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
                     image_bytes_list, user_ground_truth, go_upc_data=None,
                     verified_pages=None, candidate_pages=None, ean_verified=False):
@@ -3192,6 +3295,45 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             "Cached": "🔄 Fresh"
         }
 
+        # ── VERIFY-THEN-READ: make the data match the linked page ─────────────
+        # If we have a verified source page, read the food fields FROM that page
+        # and override the search-derived values, so the numbers in the row
+        # match the page in Source 1 (fixes: displayed 226 kJ vs page's 111 kJ).
+        # Lean-flag: fields present on the page → page value (authoritative);
+        # fields absent on the page → keep search value but FLAG the row.
+        data_provenance = "Search only"
+        if final_status == "Success" and _verified_srcs:
+            _vpage = _verified_srcs[0]
+            _ptext = await asyncio.to_thread(_fetch_page_text_sync, _vpage)
+            _pfields = await asyncio.to_thread(
+                extract_fields_from_page, _ptext, ean, name, market, gemini_key)
+            if _pfields:
+                _overridden, _kept_from_search = [], []
+                for _fkey, _rowkey in _PAGE_READ_FIELDS.items():
+                    _pval = _pfields.get(_fkey)
+                    _existing = row.get(_rowkey, "")
+                    if _pval not in (None, "", "null", "None"):
+                        # Page has this field → authoritative, override.
+                        if str(_pval) != str(_existing):
+                            _overridden.append(_rowkey)
+                        row[_rowkey] = _pval
+                    elif _existing not in (None, "", "null", "None"):
+                        # Page lacks it but search had a value → keep, but flag.
+                        _kept_from_search.append(_rowkey)
+                if _kept_from_search:
+                    data_provenance = "Mixed — some fields from search ⚠️"
+                else:
+                    data_provenance = "Verified page"
+                image_diag.log(
+                    f"📄 Verify-then-read: {len(_overridden)} field(s) set from page, "
+                    f"{len(_kept_from_search)} kept from search.")
+            else:
+                # Couldn't read the page (JS/cookie wall) → data unbacked by link.
+                data_provenance = "Search only ⚠️ (page unreadable)"
+                image_diag.log("⚠️ Verify-then-read: verified page text unreadable — "
+                               "data not confirmed against the link.")
+        row["Data Provenance"] = data_provenance
+
         # ── Cache only confirmed successes ────────────────────────────────────
         if should_cache(final_status):
             cache_set(ean, market, row, status=final_status, confidence=1.0)
@@ -3311,7 +3453,15 @@ with st.expander("ℹ️ How to read the results — reliability grades, status 
         "the row is capped at **M** because a name match is weaker than a barcode match. "
         "Common for brand/organic shops that don't publish EANs.\n"
         "Unverified candidates are kept in the hidden *Source Candidates (audit)* column "
-        "(toggle it on above the results table)."
+        "(toggle it on above the results table).\n\n"
+        "**Data Provenance** — where the food data was read from:\n"
+        "- **Verified page** — every field was read directly from the linked source page. "
+        "The numbers match Source 1.\n"
+        "- **Mixed — some fields from search ⚠️** — most fields come from the linked page, "
+        "but a few not present on it were filled from web search. Those specific cells "
+        "aren't backed by the link.\n"
+        "- **Search only** — no readable verified page; data came from web search and "
+        "isn't confirmed against a source (these rows also grade low)."
     )
 
 ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
@@ -3388,6 +3538,7 @@ if "results_df" in st.session_state:
         "Status",
         "Info Reliability",
         "Link Basis",
+        "Data Provenance",
         "Reliability Reasoning",
         "Chain of Thought",
         "Category L1",
