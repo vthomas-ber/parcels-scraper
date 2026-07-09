@@ -133,9 +133,24 @@ _GOLDMINE_DOMAINS = frozenset({
 })
 
 _EXCLUDED_DOMAIN_TOKENS = (
-    "amazon.", "ebay.", "openfoodfacts.", "aliexpress.", "alibaba.",
+    "amazon.", "ebay.", "aliexpress.", "alibaba.",
     "barcodelookup.", "go-upc.",
 )
+
+# Data aggregators carry clean, structured nutrition/ingredient tables and are
+# often the FIRST hit on a bare-EAN Google search. They are market-agnostic
+# (most cover the whole EU) and far more reliable to parse than JS-heavy retail
+# SPAs, so we search them explicitly and treat them as prime read targets.
+_DATA_AGGREGATOR_QUERY = (
+    "site:openfoodfacts.org OR site:codecheck.info OR site:das-ist-drin.de "
+    "OR site:fddb.info OR site:supermarktcheck.de OR site:digit-eyes.com "
+    "OR site:piccantino.com OR site:questionmark.com OR site:yuka.io"
+)
+_AGGREGATOR_DOMAINS = frozenset({
+    "openfoodfacts.org", "world.openfoodfacts.org", "codecheck.info",
+    "das-ist-drin.de", "fddb.info", "fddb.mobi", "supermarktcheck.de",
+    "digit-eyes.com", "piccantino.com", "questionmark.com", "yuka.io",
+})
 
 _BRAND_STOPWORDS = {
     "mandorle", "anacardi", "arachidi", "nocciole", "pistacchi", "noci",
@@ -265,6 +280,11 @@ def _is_goldmine(url: str) -> bool:
     return any(dom == g or dom.endswith("." + g) for g in _GOLDMINE_DOMAINS)
 
 
+def _is_aggregator(url: str) -> bool:
+    dom = _domain_of(url)
+    return any(dom == g or dom.endswith("." + g) for g in _AGGREGATOR_DOMAINS)
+
+
 def _result_matches_gt(res: dict, ground_truth: str) -> bool:
     if not ground_truth:
         return True
@@ -303,10 +323,12 @@ def _to_float(raw) -> float | None:
         else:
             num = num.replace(",", ".")
     elif "." in num:
-        # Dot may be an EU thousands separator ("1.980" -> 1980) rather than a
-        # decimal point. Treat as thousands ONLY when it matches the strict
-        # grouped pattern; "18.5" / "1.5" keep the dot as a decimal point.
-        if re.fullmatch(r'\d{1,3}(\.\d{3})+', num):
+        # A single dot is a DECIMAL POINT ("13.062" -> 13.062, "0.039" -> 0.039,
+        # "18.5" -> 18.5). Only MULTIPLE dot groups ("1.234.567") are an
+        # unambiguous European thousands grouping. (An earlier heuristic treated
+        # any "X.XXX" as thousands, which corrupted clean per-100g decimals such
+        # as Open Food Facts' "13.062 kJ" into "13062" and "0.039 g" into "39".)
+        if num.count(".") > 1:
             num = num.replace(".", "")
     try:
         return float(num)
@@ -319,7 +341,7 @@ def _fmt_num(v: float | None) -> str:
         return ""
     if abs(v - round(v)) < 1e-9:
         return str(int(round(v)))
-    return f"{v:.2f}".rstrip("0").rstrip(".")
+    return f"{v:.3f}".rstrip("0").rstrip(".")
 
 
 def _energy_to_kj(raw) -> str:
@@ -351,6 +373,33 @@ def _sodium_to_salt(raw) -> str:
     if "mg" in s:            # mg -> g
         val = val / 1000.0
     return _fmt_num(val * 2.5)
+
+
+# Plausible per-100g/ml ranges. Values outside these are almost always a
+# mis-parse (a price, an RDA %, a pack count) and are rejected rather than shown.
+_NUTRI_BOUNDS = {
+    "energy_kj": (10, 4000),      # water ~0, pure fat ~3700 kJ
+    "fat_g": (0, 100),
+    "saturates_g": (0, 100),
+    "carbohydrates_g": (0, 100),
+    "sugars_g": (0, 100),
+    "protein_g": (0, 100),
+    "fiber_g": (0, 100),
+    "salt_g": (0, 100),           # realistically <30, but keep a safe ceiling
+}
+
+
+def _bounded(key: str, value: str) -> str:
+    """Return value only if it falls inside the plausible per-100 range."""
+    if not value:
+        return ""
+    lo, hi = _NUTRI_BOUNDS.get(key, (None, None))
+    if lo is None:
+        return value
+    fv = _to_float(value)
+    if fv is None or fv < lo or fv > hi:
+        return ""
+    return value
 
 
 # Canonical nutrition field keys used across the module (== app.py row/data keys)
@@ -654,27 +703,33 @@ def _assign_nutri_label(label: str, value: str, out: dict) -> None:
             else:
                 fv = _to_float(value)
                 v = _fmt_num(fv) if fv is not None else ""
+            v = _bounded(key, v)
             if v:
                 out[key] = v
             return
 
 
 def _scan_inline_nutrition(text: str, out: dict) -> None:
-    """Catch 'Label 12,3 g' patterns in flat text when there was no table."""
+    """Catch 'Label 12,3 g' patterns in flat text when there was no table.
+    Requires a unit next to the number so stray figures (prices, RDA %, pack
+    counts) aren't captured, and clamps to plausible per-100 ranges."""
     low = text.lower()
     for key, variants in _NUTRI_LABELS:
         if out[key]:
             continue
+        # Energy may legitimately be unit-suffixed kj/kcal; macros must end in g.
+        unit = r'(?:kj|kcal)' if key == "energy_kj" else r'(?:g|mg)'
         for v in variants:
-            m = re.search(re.escape(v) + r'[^0-9<]{0,25}(<?\s*\d[\d.,]*\s*(?:kj|kcal|g|mg|mcg)?)',
-                          low)
+            m = re.search(re.escape(v) + r'[^0-9<]{0,25}(\d[\d.,]*)\s*' + unit, low)
             if m:
                 raw = m.group(1)
                 if key == "energy_kj":
-                    val = _energy_to_kj(raw)
+                    # re-attach the matched unit so kcal converts correctly
+                    val = _energy_to_kj(m.group(0))
                 else:
                     fv = _to_float(raw)
                     val = _fmt_num(fv) if fv is not None else ""
+                val = _bounded(key, val)
                 if val:
                     out[key] = val
                 break
@@ -812,16 +867,83 @@ async def _fetch_html(session, url: str, timeout: int = 15) -> str:
 # DETERMINISTIC EXTRACTION FOR ONE PAGE (all three parsers, one pass)
 # ============================================================================
 
+_EMBEDDED_JSON_RE = re.compile(
+    r'<script[^>]+(?:id=["\']__NEXT_DATA__["\']|type=["\']application/json["\'])'
+    r'[^>]*>(.*?)</script>', re.S | re.I)
+_STATE_JSON_RE = re.compile(
+    r'window\.__(?:NUXT|INITIAL_STATE|APOLLO_STATE|PRELOADED_STATE)__\s*=\s*'
+    r'(\{.*?\})\s*(?:;|</script>)', re.S)
+
+# nutriment-ish JSON keys -> canonical field, with a converter.
+_JSON_NUTRI_KEYS = {
+    "energy-kj_100g": ("energy_kj", lambda x: _bounded("energy_kj", _fmt_num(_to_float(x)))),
+    "energy-kj": ("energy_kj", lambda x: _bounded("energy_kj", _fmt_num(_to_float(x)))),
+    "energy-kcal_100g": ("energy_kj", lambda x: _bounded("energy_kj", _energy_to_kj(str(x) + " kcal"))),
+    "fat_100g": ("fat_g", lambda x: _bounded("fat_g", _fmt_num(_to_float(x)))),
+    "saturated-fat_100g": ("saturates_g", lambda x: _bounded("saturates_g", _fmt_num(_to_float(x)))),
+    "carbohydrates_100g": ("carbohydrates_g", lambda x: _bounded("carbohydrates_g", _fmt_num(_to_float(x)))),
+    "sugars_100g": ("sugars_g", lambda x: _bounded("sugars_g", _fmt_num(_to_float(x)))),
+    "proteins_100g": ("protein_g", lambda x: _bounded("protein_g", _fmt_num(_to_float(x)))),
+    "fiber_100g": ("fiber_g", lambda x: _bounded("fiber_g", _fmt_num(_to_float(x)))),
+    "salt_100g": ("salt_g", lambda x: _bounded("salt_g", _fmt_num(_to_float(x)))),
+    "sodium_100g": ("salt_g", lambda x: _bounded("salt_g", _sodium_to_salt(str(x)))),
+}
+
+
+def _walk_json_for_nutrition(node, out: dict, gtins: set) -> None:
+    """Depth-first walk of an arbitrary JSON tree pulling nutriment-style keys.
+    Handles the state blobs that JS retail SPAs ship in the initial HTML."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            kl = str(k).lower()
+            if kl in _JSON_NUTRI_KEYS and isinstance(v, (str, int, float)):
+                key, conv = _JSON_NUTRI_KEYS[kl]
+                if not out.get(key):
+                    val = conv(v)
+                    if val:
+                        out[key] = val
+            elif kl in ("gtin", "gtin13", "gtin12", "gtin8", "ean", "barcode") and v:
+                gtins.add(re.sub(r"\D", "", str(v)))
+            elif kl in ("ingredients_text", "ingredientstext", "ingredients") and \
+                    isinstance(v, str) and len(v) > 8 and not out.get("ingredients"):
+                out["ingredients"] = v.strip()[:500]
+            else:
+                _walk_json_for_nutrition(v, out, gtins)
+    elif isinstance(node, list):
+        for item in node:
+            _walk_json_for_nutrition(item, out, gtins)
+
+
+def parse_embedded_json(html: str) -> dict:
+    """Extract nutrition/ingredients from __NEXT_DATA__ / state JSON blobs that
+    JS-rendered retail pages embed in their initial HTML (site-agnostic)."""
+    out = _blank_fields()
+    gtins: set = set()
+    blobs = _EMBEDDED_JSON_RE.findall(html) + _STATE_JSON_RE.findall(html)
+    for blob in blobs[:6]:                       # cap work
+        blob = blob.strip()
+        if not blob.startswith(("{", "[")):
+            continue
+        try:
+            data = json.loads(blob)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        _walk_json_for_nutrition(data, out, gtins)
+    out["_gtins"] = gtins
+    return out
+
+
 def extract_page_fields(html: str, ean: str) -> dict:
-    """Run JSON-LD -> microdata/OG -> HTML-table parsers and merge (earlier
-    parser wins per field). Returns canonical field dict (+ _gtins/_og_*)."""
+    """Run JSON-LD -> microdata/OG -> embedded-JSON -> HTML-table parsers and
+    merge (earlier parser wins per field). Returns canonical field dict."""
     jsonld = parse_jsonld(html, ean)
     micro = parse_microdata_og(html)
+    embedded = parse_embedded_json(html)
     table = parse_html_nutrition(html)
 
     merged = _blank_fields()
     gtins = set()
-    for src in (jsonld, micro, table):           # priority order
+    for src in (jsonld, micro, embedded, table):     # priority order
         gtins |= src.get("_gtins", set())
         for k in ALL_FIELD_KEYS:
             if not merged[k] and src.get(k):
@@ -962,6 +1084,110 @@ async def fetch_go_upc(session, ean: str, go_upc_key: str) -> dict | None:
             return None
 
 
+# Identify ourselves per OFF policy (they ask every client to send a UA).
+_OFF_UA = "TGTG-FoodDataResearcher/1.0 (parcels data ops; contact via TGTG)"
+# OFF country subdomain per market -> localised product names/ingredients.
+_OFF_CC = {"UK": "uk", "DE": "de", "FR": "fr", "NL": "nl", "BE": "be",
+           "AT": "at", "DK": "dk", "IT": "it", "ES": "es", "PL": "pl"}
+_OFF_FIELDS = ("product_name,brands,quantity,nutriments,ingredients_text,"
+               "ingredients_text_de,ingredients_text_en,ingredients_text_fr,"
+               "allergens,traces,labels_tags,origins,countries_tags,url")
+# OFF nutriment key -> (canonical, converter)
+_OFF_NUTRI = {
+    "energy-kj_100g": ("energy_kj", lambda x: _bounded("energy_kj", _fmt_num(_to_float(x)))),
+    "fat_100g": ("fat_g", lambda x: _bounded("fat_g", _fmt_num(_to_float(x)))),
+    "saturated-fat_100g": ("saturates_g", lambda x: _bounded("saturates_g", _fmt_num(_to_float(x)))),
+    "carbohydrates_100g": ("carbohydrates_g", lambda x: _bounded("carbohydrates_g", _fmt_num(_to_float(x)))),
+    "sugars_100g": ("sugars_g", lambda x: _bounded("sugars_g", _fmt_num(_to_float(x)))),
+    "proteins_100g": ("protein_g", lambda x: _bounded("protein_g", _fmt_num(_to_float(x)))),
+    "fiber_100g": ("fiber_g", lambda x: _bounded("fiber_g", _fmt_num(_to_float(x)))),
+    "salt_100g": ("salt_g", lambda x: _bounded("salt_g", _fmt_num(_to_float(x)))),
+}
+
+
+async def fetch_openfoodfacts(session, ean: str, market: str) -> dict | None:
+    """
+    Structured product data straight from the Open Food Facts API — EAN-keyed,
+    multilingual, and covering every market we operate in. This is the most
+    reliable single source because it returns clean per-100g nutriments and a
+    parsed ingredients/allergens list with NO scraping or HTML parsing.
+
+    Returns {"fields": {...}, "url": <off product url>, "name": str} or None.
+
+    NOTE (scale): OFF asks that the live API be used at roughly 1 call per real
+    lookup (our per-EAN cache already ensures this). For very large bulk runs,
+    the right pattern is their nightly data dump (Parquet/CSV) loaded locally —
+    see the module docstring — rather than hammering this endpoint.
+    """
+    if not ean:
+        return None
+    cc = _OFF_CC.get((market or "").upper(), "world")
+    for host in (f"https://{cc}.openfoodfacts.org", "https://world.openfoodfacts.org"):
+        url = f"{host}/api/v2/product/{ean}.json?fields={_OFF_FIELDS}"
+        try:
+            async with session.get(url, headers={"User-Agent": _OFF_UA},
+                                   timeout=12) as r:
+                if r.status != 200:
+                    continue
+                data = await r.json(content_type=None)
+        except Exception:
+            continue
+        if not data or data.get("status") != 1:
+            # status 0 = product not found on this instance; try world once.
+            if host.endswith("world.openfoodfacts.org"):
+                return None
+            continue
+
+        p = data.get("product") or {}
+        fields = _blank_fields()
+        nutr = p.get("nutriments") or {}
+        for k, (canon, conv) in _OFF_NUTRI.items():
+            if not fields[canon] and k in nutr and nutr[k] not in (None, ""):
+                v = conv(nutr[k])
+                if v:
+                    fields[canon] = v
+        # energy fallback: OFF's energy_100g is always in kJ; else derive from kcal
+        if not fields["energy_kj"] and nutr.get("energy_100g") not in (None, ""):
+            fields["energy_kj"] = _bounded("energy_kj", _fmt_num(_to_float(nutr["energy_100g"])))
+        if not fields["energy_kj"] and nutr.get("energy-kcal_100g") not in (None, ""):
+            fields["energy_kj"] = _bounded(
+                "energy_kj", _energy_to_kj(f"{nutr['energy-kcal_100g']} kcal"))
+
+        brands = p.get("brands", "")
+        if brands and not is_garbage_name(brands):
+            fields["brand"] = brands.split(",")[0].strip()
+        if p.get("quantity"):
+            fields["net_weight"] = str(p["quantity"]).strip()[:60]
+        # ingredients: prefer the market language, then generic, then EN.
+        for ik in (f"ingredients_text_{cc}", "ingredients_text",
+                   "ingredients_text_de", "ingredients_text_en",
+                   "ingredients_text_fr"):
+            iv = p.get(ik)
+            if iv and len(iv.strip()) > 8:
+                fields["ingredients"] = iv.strip()[:500]
+                break
+        if p.get("allergens"):
+            fields["allergens"] = re.sub(r"\ben:", "", p["allergens"]).replace(
+                "-", " ").replace(",", ", ").strip()[:400]
+        if p.get("traces"):
+            fields["may_contain"] = re.sub(r"\ben:", "", p["traces"]).replace(
+                "-", " ").replace(",", ", ").strip()[:400]
+        if p.get("origins"):
+            fields["place_of_origin"] = str(p["origins"]).strip()[:200]
+        labels = " ".join(p.get("labels_tags", []) or [])
+        if "organic" in labels or "bio" in labels or "eu-organic" in labels:
+            fields["organic_certification_id"] = "EU Organic (per Open Food Facts)"
+
+        # Only treat OFF as a real hit if it yielded something substantive.
+        has_data = any(fields.get(k) for k in _NUTRI_KEYS) or fields.get("ingredients")
+        if not has_data:
+            return None
+        off_url = p.get("url") or f"{host}/product/{ean}"
+        return {"fields": fields, "url": off_url,
+                "name": p.get("product_name", "") or ""}
+    return None
+
+
 async def _serp_get(session, params: dict, timeout: int = 15) -> dict | None:
     global _SERP_SEM, _SERP_LOOP
     loop = asyncio.get_running_loop()
@@ -1068,6 +1294,13 @@ async def discover_candidate_pages(session, ean, ground_truth, market,
                         name = t
                 ean_verified = True
 
+    # Attempt 2.6: data aggregators (openfoodfacts/codecheck/das-ist-drin/...)
+    # These carry clean structured tables and are the usual bare-EAN top hits.
+    data = await _serp_get(session, {"q": f"{_DATA_AGGREGATOR_QUERY} {ean}",
+                                     "gl": gl, "api_key": serp_key})
+    for res in (data or {}).get("organic_results", [])[:5]:
+        _add(res.get("link", ""))
+
     # Attempt 3: goldmine
     goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
     data = await _serp_get(session, {"q": f"{goldmine} {ean}", "gl": gl,
@@ -1138,6 +1371,21 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         go_upc_data = await fetch_go_upc(session, ean, keys["go_upc"])
     reg_name = registry_name or (go_upc_data or {}).get("name", "") or ""
     ean_verified = bool(ean_verified_hint or go_upc_data)
+    market_upper = (market or "").upper()
+
+    # ---- Open Food Facts: structured, EAN-keyed source (covers all markets) --
+    # Tried for EVERY EAN regardless of what pages app.py passed, so discovery
+    # is never starved. It's a free API returning clean per-100g nutriments and
+    # a parsed ingredient/allergen list — the single most reliable source.
+    off = await fetch_openfoodfacts(session, ean, market)
+    if off:
+        resolved_off_name = off.get("name") or ""
+        ean_verified = True
+        diag.append(f"OpenFoodFacts hit ({sum(1 for k in _NUTRI_KEYS if off['fields'].get(k))}"
+                    f"/8 nutriments).")
+    else:
+        resolved_off_name = ""
+        diag.append("OpenFoodFacts: no product.")
 
     # ---- Candidate discovery -------------------------------------------------
     resolved_name = reg_name
@@ -1197,10 +1445,73 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         diag.append(f"verified Route {route} ({'read' if nonempty else 'thin'}): "
                     f"{_domain_of(url)}")
 
-    # ---- Rank pages: Route A before B; goldmine before other; then order ----
+    # ---- Rescue pass: if the provided pages gave thin nutrition, run ONE ----
+    # aggregator-targeted bare-EAN search and read those clean-data pages too.
+    # Cheap sources (OFF) are tried first; this costs a SERP call only when the
+    # common path failed, so bulk cost stays low.
+    def _nutri_hits(pages):
+        got = set()
+        for p in pages:
+            for k in _NUTRI_KEYS:
+                if p["fields"].get(k):
+                    got.add(k)
+        return len(got)
+
+    off_hits = sum(1 for k in _NUTRI_KEYS if off and off["fields"].get(k))
+    if keys.get("serp") and (_nutri_hits(read_pages) + off_hits) < 4:
+        diag.append("thin data -> aggregator rescue search")
+        try:
+            rescue = await _serp_get(session, {
+                "q": f"{_DATA_AGGREGATOR_QUERY} {ean}",
+                "gl": (market or "us").lower(), "api_key": keys["serp"]})
+            rescue_urls = [r.get("link", "") for r in
+                           (rescue or {}).get("organic_results", [])[:6]]
+            for url in rescue_urls:
+                if len([p for p in read_pages if p["fields_nonempty"]]) >= MAX_READ_PAGES:
+                    break
+                dom = _domain_of(url)
+                if not url or _is_excluded_domain(url) or dom in seen_dom:
+                    continue
+                seen_dom.add(dom)
+                html = await _fetch_html(session, url)
+                if not html:
+                    continue
+                pf = extract_page_fields(html, ean)
+                route = verify_route(html, ean, anchors, pf.get("_gtins"))
+                if route is None:
+                    continue
+                verified_any = True
+                source_routes[url] = route
+                ne = any(pf.get(k) for k in ALL_FIELD_KEYS)
+                if ne:
+                    readable_any = True
+                read_pages.append({"url": url, "route": route, "fields": pf,
+                                   "text": page_visible_text(html),
+                                   "readable": ne, "fields_nonempty": ne})
+                diag.append(f"rescue Route {route} ({'read' if ne else 'thin'}): {dom}")
+        except Exception:
+            pass
+
+    # ---- Inject Open Food Facts as a verified, EAN-keyed source -------------
+    # OFF is matched on the exact barcode (so it's EAN-verified, not a name
+    # guess) but it is community-maintained, so it gets its own "OFF" tier: it
+    # grades M on its own, and a real retailer page (Route A) still outranks it
+    # for both field priority and the H grade.
+    if off:
+        off_fields = dict(off["fields"])
+        off_fields["_gtins"] = {re.sub(r"\D", "", ean)}
+        read_pages.append({
+            "url": off["url"], "route": "OFF", "fields": off_fields,
+            "text": "", "readable": True, "fields_nonempty": True,
+        })
+        source_routes[off["url"]] = "OFF"
+        verified_any = True
+        readable_any = True
+
+    # ---- Rank pages: retailer-A before OFF before B; then trusted-data first -
     def _rank(p):
-        return (0 if p["route"] == "A" else 1,
-                0 if _is_goldmine(p["url"]) else 1)
+        tier = {"A": 0, "OFF": 1, "B": 2}.get(p["route"], 3)
+        return (tier, 0 if (_is_goldmine(p["url"]) or _is_aggregator(p["url"])) else 1)
     read_pages.sort(key=_rank)
 
     # ---- Fill fields ACROSS verified pages (highest-trust wins per field) ----
@@ -1243,13 +1554,22 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                         gemini_used = True
 
     # ---- Grade + provenance --------------------------------------------------
-    has_route_a = any(p["route"] == "A" for p in read_pages if p["fields_nonempty"])
-    has_route_b = any(p["route"] == "B" for p in read_pages if p["fields_nonempty"])
+    live = [p for p in read_pages if p["fields_nonempty"]]
+    has_retailer_a = any(p["route"] == "A" for p in live)
+    has_off        = any(p["route"] == "OFF" for p in live)
+    has_route_b    = any(p["route"] == "B" for p in live)
 
     if readable_any:
         status = "success"
-        reliability = "H" if has_route_a else "M"
-        if registry_used or gemini_used:
+        # H only when a real retailer page carried the EAN. OFF (community DB,
+        # EAN-keyed) and name-only retailer matches cap at M.
+        reliability = "H" if has_retailer_a else "M"
+        off_only = has_off and not has_retailer_a and not has_route_b
+        if off_only:
+            provenance = "Open Food Facts (community DB) ⚠️"
+        elif has_off:
+            provenance = "Verified page + Open Food Facts"
+        elif registry_used or gemini_used:
             provenance = "Verified page + fallback ⚠️"
         else:
             provenance = "Verified page"
@@ -1265,8 +1585,8 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         provenance = ("Registry only — no verified page ⚠️" if registry_used
                       else "No verified source")
 
-    # A name-only (Route-B) match can never be H even if flagged as such above.
-    if reliability == "H" and not has_route_a:
+    # A name-only (Route-B) or OFF-only match can never be H.
+    if reliability == "H" and not has_retailer_a:
         reliability = "M"
 
     diag.append(f"status={status} reliability={reliability} "
