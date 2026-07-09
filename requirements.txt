@@ -6,3 +6,4 @@ google-genai
 Pillow
 imagehash
 openpyxl
+beautifulsoup4
