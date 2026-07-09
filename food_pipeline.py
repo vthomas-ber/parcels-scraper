@@ -682,12 +682,21 @@ def _scan_inline_nutrition(text: str, out: dict) -> None:
 
 def _extract_labelled_paragraph(soup, text_blob: str, out: dict) -> None:
     low = text_blob.lower()
+    # Generic stops: a new section heading ends the current paragraph.
+    common_stops = (r'Nutrition|N\u00e4hrwert|Valeurs nutrit|Valori nutriz|'
+                    r'Voedingswaarde|Informaci\u00f3n nutricional|Angaben pro|'
+                    r'Durchschnittliche|Nettof\u00fcllmenge|Netto|Aufbewahrung|'
+                    r'Verwendung|Hersteller|Kontakt zum|Alle Preise|Preise und|'
+                    r'Produkthinweise|Brennwert|Kalorien|Energie|Energy|'
+                    r'Valore energetico')
     # ingredients need a real list; allergen / may-contain segments can be as
-    # short as a single word ("nuts"), so they get a lower length floor.
-    for key, labels, min_len in (
-            ("ingredients", _INGREDIENT_LABELS, 8),
-            ("may_contain", _MAYCONTAIN_LABELS, 3),
-            ("allergens", _ALLERGEN_LABELS, 3)):
+    # short as a single word ("nuts"), so they get a lower length floor. Each
+    # field also stops when the NEXT field's label begins, so an allergen line
+    # doesn't swallow the ingredients list that follows it (and vice versa).
+    for key, labels, min_len, extra_stop in (
+            ("ingredients", _INGREDIENT_LABELS, 8, r'Allerg'),
+            ("may_contain", _MAYCONTAIN_LABELS, 3, r'Zutaten|Ingredient|Allerg'),
+            ("allergens", _ALLERGEN_LABELS, 3, r'Zutaten|Ingredient|Ingr\u00e9dient|Ingredienti')):
         if out[key]:
             continue
         for lab in labels:
@@ -697,9 +706,13 @@ def _extract_labelled_paragraph(soup, text_blob: str, out: dict) -> None:
             # Grab the sentence/segment after the label up to a sensible stop.
             after = text_blob[idx + len(lab): idx + len(lab) + 600]
             after = re.sub(r'^[\s:：\-–—.]+', '', after)
-            seg = re.split(r'(?:\.\s|\n|Nutrition|Nährwerte|Valeurs|Valori|'
-                           r'Voedingswaarde|Información nutricional)', after, 1)[0]
+            stop = common_stops + "|" + extra_stop
+            seg = re.split(r'(?:\.\s|\n|' + stop + r')', after, 1)[0]
             seg = _clean_text(seg)
+            # Strip a repeated inline label prefix ("Zutaten: ...", "Ingredients: ...").
+            seg = re.sub(r'^(?:zutaten|ingredients?|ingr\u00e9dients?|ingredienti|'
+                         r'ingredi\u00ebnten|ingredienten|ingredientes|enthaltene\s+allergene|'
+                         r'allergene?|allergens?)\s*[:：]?\s*', '', seg, flags=re.I)
             if len(seg) >= min_len:
                 out[key] = seg[:500]
                 break
@@ -757,14 +770,39 @@ def verify_route(html: str, ean: str, anchors: list, gtins: set | None = None) -
     return None
 
 
-async def _fetch_html(session, url: str, timeout: int = 10) -> str:
+_FETCH_HEADERS = {
+    "User-Agent": _UA,
+    "Accept": ("text/html,application/xhtml+xml,application/xml;q=0.9,"
+               "image/avif,image/webp,*/*;q=0.8"),
+    # Cover every market we operate in so retailers serve the localised page.
+    "Accept-Language": "de,en-US;q=0.9,en;q=0.8,fr;q=0.7,it;q=0.6,es;q=0.5,nl;q=0.4",
+    "Accept-Encoding": "gzip, deflate",
+}
+
+# Retail product pages (globus, rewe, etc.) inline the ENTIRE site navigation
+# mega-menu before the product content, so the nutrition table lives near the
+# very end of the HTML. A small read cap silently truncates it away — read
+# generously (up to ~4 MB) so the product block always survives.
+_MAX_HTML_BYTES = 4_000_000
+
+
+async def _fetch_html(session, url: str, timeout: int = 15) -> str:
     if not url or not url.startswith("http") or _is_excluded_domain(url):
         return ""
     try:
-        async with session.get(url, headers={"User-Agent": _UA}, timeout=timeout) as r:
+        async with session.get(url, headers=_FETCH_HEADERS, timeout=timeout,
+                               allow_redirects=True) as r:
             if r.status != 200:
                 return ""
-            raw = await r.content.read(700_000)
+            raw = await r.content.read(_MAX_HTML_BYTES)
+            # Honour the declared charset when it isn't UTF-8 (e.g. digit-eyes
+            # and other legacy pages use latin-1), else fall back to utf-8.
+            charset = (r.charset or "").lower()
+            if charset and charset not in ("utf-8", "utf8"):
+                try:
+                    return raw.decode(charset, errors="ignore")
+                except (LookupError, TypeError):
+                    pass
             return raw.decode("utf-8", errors="ignore")
     except Exception:
         return ""
