@@ -9,6 +9,7 @@ import time
 from io import BytesIO
 from google import genai
 from google.genai import types
+from food_pipeline import extract_food_data
 
 # Image processing libraries (for display pipeline only - food extraction never touches these)
 try:
@@ -70,23 +71,36 @@ def init_cache():
     con.close()
 
 
-def cache_get(ean: str, market: str):
+def _cache_key(ean: str, ground_truth: str = "") -> str:
+    """
+    Cache key = EAN + normalized ground truth. Two different inputs for the SAME
+    barcode (e.g. "Fanta Exotic 500ml" vs "120x Fanta Exotic 500ml") must not
+    collide — the ground truth drives Route B name-matching and validation, so
+    their results genuinely differ. Normalization (lowercase, collapse spaces)
+    keeps trivial variants from fragmenting the cache.
+    """
+    gt = re.sub(r"\s+", " ", (ground_truth or "").strip().lower())
+    return f"{ean}|{gt}" if gt else ean
+
+
+def cache_get(ean: str, market: str, ground_truth: str = ""):
     """
     Return a cached result only if it was stored under the current schema version
     AND its status was 'Success'.  Any other entry (error, failed-validation,
     needs-review, wrong schema version) is treated as a miss so the EAN is
     re-queried fresh.
 
-    NOTE: On first deployment after upgrading to CACHE_VERSION 2, ALL existing
+    NOTE: On first deployment after upgrading to CACHE_VERSION 3, ALL existing
     entries will be invalidated because their version column is NULL / 1.
     This is intentional — the extraction prompt and source rules have changed
     significantly, so stale entries must not be served as authoritative data.
     """
+    key = _cache_key(ean, ground_truth)
     try:
         con = sqlite3.connect(DB_PATH)
         row = con.execute(
             "SELECT result_json, status, version FROM ean_cache WHERE ean=? AND market=?",
-            (ean, market)
+            (key, market)
         ).fetchone()
         con.close()
         if not row:
@@ -102,14 +116,16 @@ def cache_get(ean: str, market: str):
 
 
 def cache_set(ean: str, market: str, result_dict: dict,
-              status: str = "unknown", confidence: float = 0.0):
+              status: str = "unknown", confidence: float = 0.0,
+              ground_truth: str = ""):
+    key = _cache_key(ean, ground_truth)
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
             """INSERT OR REPLACE INTO ean_cache
                (ean, market, result_json, status, confidence, version)
                VALUES (?, ?, ?, ?, ?, ?)""",
-            (ean, market, json.dumps(result_dict), status, confidence, CACHE_VERSION)
+            (key, market, json.dumps(result_dict), status, confidence, CACHE_VERSION)
         )
         con.commit()
         con.close()
@@ -117,17 +133,49 @@ def cache_set(ean: str, market: str, result_dict: dict,
         pass
 
 
-def cache_delete(ean: str, market: str):
+def cache_delete(ean: str, market: str, ground_truth: str = ""):
+    key = _cache_key(ean, ground_truth)
     try:
         con = sqlite3.connect(DB_PATH)
         con.execute(
             "DELETE FROM ean_cache WHERE ean=? AND market=?",
-            (ean, market)
+            (key, market)
         )
         con.commit()
         con.close()
     except Exception:
         pass
+
+
+def cache_count() -> int:
+    """Number of cached rows (for the sidebar control)."""
+    try:
+        con = sqlite3.connect(DB_PATH)
+        n = con.execute("SELECT COUNT(*) FROM ean_cache").fetchone()[0]
+        con.close()
+        return int(n)
+    except Exception:
+        return 0
+
+
+def cache_clear(market: str | None = None) -> int:
+    """
+    Clear cached results. If `market` is given, clears only that market;
+    otherwise clears everything. Returns the number of rows removed.
+    Used after logic/schema changes so stale entries can't be served.
+    """
+    try:
+        con = sqlite3.connect(DB_PATH)
+        if market:
+            cur = con.execute("DELETE FROM ean_cache WHERE market=?", (market,))
+        else:
+            cur = con.execute("DELETE FROM ean_cache")
+        removed = cur.rowcount
+        con.commit()
+        con.close()
+        return int(removed)
+    except Exception:
+        return 0
 
 
 # ============================================================================
@@ -135,7 +183,7 @@ def cache_delete(ean: str, market: str):
 # Update model strings here when migrating — never scatter them across the file.
 # ============================================================================
 
-# Food data extraction: uses Google Search grounding + full JSON output
+# Food data categorization/tagging model; food extraction itself is deterministic in food_pipeline.py
 EXTRACTION_MODEL = "gemini-2.5-flash"
 
 # Image identity verification: vision-only, no grounding needed, must be cheap & fast
@@ -146,7 +194,7 @@ VISION_MODEL = "gemini-2.5-flash-lite"
 
 # Bump this whenever the extraction prompt or cache schema changes significantly.
 # All rows stored under a lower version are treated as cache misses on first load.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 # Minimum vision confidence score (0.0–1.0) required to display an image.
 # Candidates below this threshold are rejected; their URL is preserved in
@@ -709,7 +757,7 @@ async def _serp_get(session, url: str, params: dict, timeout: int = 15,
 async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                           user_ground_truth="", go_upc_data=None):
     """
-    Path A: Resolves the product name and gathers images for Gemini extraction.
+    Legacy helper: resolves the product name and gathers images. The active food-data path is food_pipeline.extract_food_data.
 
     go_upc_data: pre-fetched Go-UPC result (from process_ean) or None.
     Waterfall: Go-UPC (Tier 1A) → EAN-Search (Tier 1B, only if Go-UPC empty)
@@ -959,7 +1007,7 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         diagnostic_log.append("SERP_FAILED_FLAG")   # machine-readable marker for process_ean
 
     if not product_name:
-        diagnostic_log.append("⚠️ Name not found via any source — Gemini will attempt EAN-grounded search.")
+        diagnostic_log.append("⚠️ Name not found via any source — deterministic food pipeline will validate discovered pages.")
         product_name = f"Product with EAN {ean}"
     elif not product_name.startswith("Product with EAN"):
         # Change 5: guard resolved name against obviously non-food titles
@@ -1058,256 +1106,115 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         seen_b64_prefixes.append(prefix)
         final_downloaded_images.append(img_payload)
 
-    diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} image(s) for Gemini extraction.")
+    diagnostic_log.append(f"✅ Secured {len(final_downloaded_images)} image(s) for legacy image context.")
     return product_name, final_downloaded_images, "\n".join(diagnostic_log), ean_verified, retailer_urls
 
 
-def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
-                    image_bytes_list, user_ground_truth, go_upc_data=None,
-                    verified_pages=None, candidate_pages=None, ean_verified=False):
+def _extract_json_object(raw_text: str) -> dict:
+    """Parse the first JSON object from a Gemini response."""
+    if not raw_text:
+        return {}
+    clean = raw_text.strip().replace("```json", "").replace("```", "").strip()
+    start_idx = clean.find("{")
+    end_idx = clean.rfind("}")
+    if start_idx == -1 or end_idx == -1 or end_idx <= start_idx:
+        return {}
+    try:
+        return json.loads(clean[start_idx:end_idx + 1], strict=False)
+    except Exception:
+        return {}
+
+
+def run_categorization_sync(ean, product_name, market_code, gemini_key,
+                            taxonomy_text, extracted_fields,
+                            user_ground_truth=""):
     """
-    Path A: Sends the resolved product name + images to Gemini for structured
-    food data extraction.  Uses Google Search grounding so Gemini can reach
-    tier-1 retailer and brand pages directly.
+    Gemini is now used only for category assignment and tag selection.
 
-    go_upc_data: optional dict from fetch_go_upc — used as search-anchoring
-    context only. Never cited as an output source.
-
-    Source exclusion rules are enforced both in this prompt and in the
-    Python-side domain blocklist (_is_excluded_domain).
+    It receives the deterministic, verified-page food data as context. It does
+    not receive tools and cannot run Google Search. Food fields/nutrition/source
+    links are not generated here.
     """
-    market_upper   = market_code.upper()
-    goldmine_sites = GOLDMINE.get(market_upper, "Major Tier-1 Supermarkets")
+    if not gemini_key:
+        return {"error": "GEMINI_API_KEY missing for categorization"}
 
-    # Build barcode-database context string for search anchoring (never output source)
-    _go_upc_ctx = ""
-    if go_upc_data:
-        _parts = []
-        if go_upc_data.get("brand"):
-            _parts.append(f"Brand: {go_upc_data['brand']}")
-        if go_upc_data.get("category"):
-            _parts.append(f"Category: {go_upc_data['category']}")
-        if go_upc_data.get("ingredients"):
-            _parts.append(f"Ingredients reference: {go_upc_data['ingredients'][:400]}")
-        _go_upc_ctx = "\n".join(_parts)
-
-    # Build pipeline-verification evidence block. This is the bridge between
-    # Python-side verification and Gemini: pages listed here were FETCHED and
-    # the EAN was found in their HTML/structured data. Gemini must treat this
-    # as established fact, not re-litigate it with its own (weaker) search.
-    _verified_pages  = [u for u in (verified_pages or []) if u][:4]
-    _candidate_pages = [u for u in (candidate_pages or []) if u
-                        and u not in _verified_pages][:4]
-    if _verified_pages:
-        _evidence_ctx = (
-            "TIER A IS ALREADY SATISFIED — PRE-VERIFIED BY THE PIPELINE.\n"
-            f"    The following pages were fetched and CONFIRMED to contain EAN {ean} "
-            "in their HTML or structured data:\n    "
-            + "\n    ".join(f"- {u}" for u in _verified_pages)
-            + "\n    Treat these as your PRIMARY sources: browse them and extract the product data. "
-            "Do NOT set 'is_exact_match' to false because your own search cannot re-find the EAN — "
-            "the on-page confirmation above supersedes your search results."
-        )
-    elif ean_verified:
-        _evidence_ctx = (
-            f"IDENTITY PRE-VERIFIED: the EAN {ean} was matched to the product name "
-            f"'{product_name}' via a barcode registry or an EAN-confirmed page. "
-            "Treat the product identity as established; focus your search on finding "
-            "the richest data for this product rather than re-proving the EAN link."
-        )
-    else:
-        _evidence_ctx = "No pipeline-side EAN verification available — apply the full validation gate below."
-    if _candidate_pages:
-        _evidence_ctx += (
-            "\n    Additional candidate pages found by the pipeline (unverified, may help):\n    "
-            + "\n    ".join(f"- {u}" for u in _candidate_pages))
-
+    safe_context = json.dumps(extracted_fields or {}, ensure_ascii=False, indent=2)[:14000]
     prompt = f"""
-    You are the Lead Food Product Researcher.
-    TARGET EAN: {ean}
-    ONLINE PRODUCT NAME FOUND: {product_name}
-    USER INPUT (GROUND TRUTH): {user_ground_truth if user_ground_truth else "None provided (Proceed normally)"}
-    MARKET: {market_code}
-    PIPELINE VERIFICATION STATUS:
-    {_evidence_ctx}
-    BARCODE DATABASE CONTEXT (search anchoring only — do NOT cite as output source):
-    {_go_upc_ctx if _go_upc_ctx else "No additional context available."}
+You are the product taxonomy and tagging classifier for a food-product DMF upload.
+Do NOT browse, search, or use outside knowledge. Use ONLY the deterministic product data below.
+Do NOT extract ingredients, nutrition, GTIN, weight, manufacturer data, or source URLs. Those fields have already been extracted from verified pages and must not be changed.
 
-    CORE DIRECTIVES:
-    0. VALIDATION GATE — TIERED CONFIRMATION:
+TARGET EAN: {ean}
+PRODUCT NAME: {product_name}
+USER INPUT: {user_ground_truth if user_ground_truth else "None"}
+MARKET: {market_code}
 
-       FOOD CHECK (mandatory first step): This tool covers food, drink, and pet food products. If the product you find VIA TEXT SEARCH is clearly NOT in any of these categories — for example household cleaning products, air fresheners, plug-in refills, cling wrap, aluminium foil, baking paper, personal care, cosmetics, electronics, furniture, tools, clothing, or stationery — set "is_exact_match" to false immediately and do not extract any data. This check applies to the product identified through web search of text sources, NEVER to attached images (see directive 6 — attached images can be scrape noise). NOTE: tinned fish, seafood, and all animal products for human consumption ARE food. Pet food, animal feed, and treats sold for pets are also acceptable — do not reject them.
+DETERMINISTIC VERIFIED-PAGE DATA:
+{safe_context}
 
-       SEARCH STRATEGY: If USER INPUT (GROUND TRUTH) is provided, your FIRST search query MUST be the combined form: "{user_ground_truth} {ean}". This surfaces niche retailers and GTIN databases that a bare-barcode search misses. Only if that yields nothing, fall back to searching the EAN alone and the product name alone.
+TASKS:
+1. Classify the product into the provided 6-level taxonomy. Use exact category names from the taxonomy. If Level 6 is not applicable, return "None".
+2. Assign dietary, occasion, and seasonal tags from the exact lists below only.
+3. For dietary tags, use the provided ingredients, allergen, organic-certification, and nutrition values only. Return empty strings when evidence is absent.
+4. Be conservative: missing evidence means no tag.
 
-       TIER A — Highest confidence: The exact EAN/barcode {ean} appears explicitly in the page text, URL, GTIN field, or structured data of a food product page — OR the PIPELINE VERIFICATION STATUS above states Tier A is already satisfied (pre-verified pages count as full Tier A evidence even if your own search cannot re-confirm them). Set food_info_reliability to "H" if Tier A is confirmed and sources are tier-1.
+TAXONOMY FIRST-PRINCIPLES:
+- Liquid, syrup, concentrate, mixer, shake, or drink powder primarily consumed as a beverage -> Drinks.
+- Cooking ingredients, flour, cocoa powder, baking ingredients -> Food / Pantry where available.
+- Protein supplements / health supplements -> Food / Health where available.
+- Solid food, snacks, meals -> Food.
+- Pet food and animal treats are acceptable food products; map them to the closest taxonomy path if present.
 
-       TIER B — Good confidence (only when USER INPUT ground truth is non-empty): The EAN {ean} does NOT appear in page text, BUT the product you found matches every field THAT IS PRESENT in the USER INPUT (GROUND TRUTH):
-         - Brand name matches, IF the USER INPUT contains a brand (minor spelling differences allowed)
-         - Product name matches closely (key words present, language differences allowed)
-         - Unit weight or volume matches within 15%, IF the USER INPUT contains a weight/volume
-       Fields ABSENT from the USER INPUT are WAIVED — a missing weight in USER INPUT is not a mismatch and must NOT block Tier B. If only a product name was provided, a close name match alone satisfies Tier B. Note in chain_of_thought which fields were compared and which were waived. Set food_info_reliability to "M" at most for Tier B confirmations. If USER INPUT (GROUND TRUTH) is empty, Tier B is NOT available — only Tier A is accepted.
+DIETARY TAGS:
+- "Vegetarian": no meat, fish, or seafood ingredients; dairy/eggs permitted.
+- "Vegan": no animal-derived ingredients and no animal cross-contamination advisory, or certified vegan.
+- "Organic": explicit organic certification/logo/code only.
+- "Halal": recognised Halal certification only.
+- "Kosher": recognised Kosher certification only.
+- "Dairy Free": no milk-derived ingredients and no contains-milk allergen declaration.
+- "Nut Free": no tree nuts/peanuts and no contains-nuts/peanuts declaration.
+- "Low Sugar": <=5g sugars/100g solids or <=2.5g sugars/100ml liquids.
+- "High protein": only when protein contributes >20% of total energy; if energy/protein evidence is insufficient, do not apply.
+- "Gluten-free": explicit gluten-free label or clear evidence.
+- "Low Fat": <=3g fat/100g solids or <=1.5g fat/100ml liquids.
 
-       TIER C — Reject immediately (set is_exact_match to false):
-         - Product is clearly not food, drink, or pet food (see FOOD CHECK above)
-         - Brand OR product name clearly do not match USER INPUT (for a clear, meaningful mismatch — not cosmetic differences)
-         - EAN found on page but belongs to a different product
-         - No food/pet-food product can be found for EAN {ean} on any approved source
+OCCASION TAGS:
+- "Breakfast", "Lunchbox", "BBQ", "Party", "Christmas", "Ramadan", "Meal prep", "Quick dinner", "Kids snack".
 
-       COSMETIC DIFFERENCES: Do NOT fail for minor formatting differences (e.g. 'da 100 gr.' vs '100g', abbreviations, capitalisation, language translation). Only reject for clear, meaningful mismatches. A null result is always better than wrong data.
+SEASONAL TAGS:
+- "Christmas", "Easter", "Back to School", "Valentines Day", "Mothers Day", "Halloween", "Other".
+- Return "" for seasonal_tags if no explicit seasonal marketing/packaging is present.
 
-       PACK SIZE LENIENCY (important): If USER INPUT states a multi-pack format like '4x200ml', '6x330ml', or '(4 Pack) 80g', compare only the UNIT size against what you find online. A product listed as '200ml' MATCHES a USER INPUT of '4x200ml'. A product listed as '80g' MATCHES '(4 Pack) 80g'. Do NOT fail validation because the online listing shows the individual unit while the USER INPUT describes the pack. The barcode on the pack is the same as the barcode on the unit in most retailer systems.
-    1. ACCURACY: You have access to Google Search. PREFER official brand websites, tier-1 retailers ({goldmine_sites}), and structured GTIN databases — but you MAY use ANY real product page (regional retailers, organic/specialty shops, niche food directories) to find and confirm the product. Source quality determines the RELIABILITY grade, not whether the product can be found at all. Only the sources in rule 2 are forbidden.
-    2. SOURCE EXCLUSION (HARD CONSTRAINT): The following sources are STRICTLY FORBIDDEN — do NOT use them under any circumstances, even as a last resort:
-       - Amazon (any amazon.* domain or subdomain including amazon.com, amazon.co.uk, amazon.de, etc.)
-       - eBay (any ebay.* domain or subdomain including ebay.com, ebay.co.uk, ebay.de, etc.)
-       - openfoodfacts.org or any Open Food Facts mirror or API
-       - barcodelookup.com, go-upc.com, or similar barcode aggregator sites
-       - Any wiki (including Wikipedia), forum, Reddit, social media, or user-generated database
-       - Any marketplace, reseller, third-party seller, or affiliate page
-       ONLY approved sources: official brand website and the Tier-1 retailers listed below.
-    3. TARGET MARKET LANGUAGE: You MUST translate and output ALL product text (Ingredients, Allergens, May Contain, Dietary Info, Nutritional Context) into the native language of the TARGET MARKET ({market_code}). Write it verbatim. EXCEPTION: The 6 taxonomy categories AND the Tags (Dietary, Occasion, Seasonal) MUST remain exactly as they appear in the English lists below.
-    4. MISSING DATA & SOURCE CASCADE: You MUST try to fill every field. Follow this cascade:
-        STEP 1 — Official brand website (highest priority). Extract everything available.
-        STEP 2 — If ANY field is still null after Step 1, search the Tier-1 retailers for {market_code}: {goldmine_sites}. Cross-reference and fill any remaining nulls.
-        STEP 3 — If a field is STILL null after Steps 1 and 2, return "null" for that field. Do NOT fall back to forbidden sources (Amazon, eBay, Open Food Facts, barcodelookup, go-upc, wikis, forums, or any marketplace). Returning "null" is always better than data from a forbidden or unverified source.
-        STEP 4 — Do NOT guess nutritional values. Do NOT invent ingredients. Do NOT copy from similar products.
-        IMPORTANT: A brand page that has ingredients but no nutrition table is NOT a complete source. Continue to Step 2 for the missing fields.
-        Do NOT attempt to deduce "May Contain" warnings from the ingredient list; only populate "May Contain" if you find an explicit warning on the source website or packaging.
-    5. TAXONOMY MAPPING: Classify the product into the 6-level taxonomy provided below. You MUST use EXACT matches from the provided taxonomy. Do not invent categories. If a variant (Level 6) doesn't exist for the item category, return "None". Explain your reasoning in the "categorization_reasoning" field.
-    5b. TAXONOMY FIRST-PRINCIPLES (INTENDED USE RULE): Before mapping to the taxonomy, determine the product's primary intended use from its name, category keywords, and ingredients:
-        - If the product is a LIQUID, SYRUP, CONCENTRATE, or MIXER of any kind → it MUST be classified under Drinks (L1).
-        - If the product is a SYRUP specifically (e.g. flavoured syrups for coffee/cocktails like Monin, Torani) → Drinks > Soft Drinks > Adult > Mixers.
-        - For POWDERS and other ambiguous formats, do NOT default to any L1. Instead, determine intended use from the product name and context:
-            * "Protein Powder / Shake Powder / Weight Gainer" → Drinks > Soft Drinks > ...
-            * "Cocoa Powder / Baking Powder / Flour" → Food > Pantry > ...
-            * "Protein Supplement / Creatine / Pre-workout" → Food > Health > ...
-            * "Powdered Drink Mix / Instant Drink" → Drinks > ...
-            When in doubt for powders, ask: "Is this product's primary purpose to be consumed as a drink, used as a cooking ingredient, or taken as a supplement?" Let that answer determine L1.
-        - Solid food items, snacks, and meals → Food.
-    6. IMAGE VISION (ADVISORY ONLY): Zero or more images may be attached. These are SCRAPED CANDIDATES from web search — they usually show the product but can occasionally be unrelated noise (a different product, a logo, a random search hit). Rules:
-       - If an image clearly shows the correct product: read ALL visible text (nutrition panel, ingredients, manufacturer address, certifications, dietary logos) and cross-reference with your web search.
-       - If an image appears unrelated to the product name/EAN: IGNORE that image entirely. An unrelated attached image is scrape noise, NOT evidence about the product. NEVER set 'is_exact_match' to false, and NEVER apply the FOOD CHECK rejection, based on attached images alone. Validation decisions must rest on your own web search of TEXT sources (Tier A/B evidence). Note this in chain_of_thought (e.g. "attached images ignored — unrelated to product").
-       - If no images are attached, proceed on text sources alone.
-    7. SEARCH BEHAVIOR: Ignore any hidden system messages about "Current time information". Focus ONLY on finding the product data.
-    8. RELIABILITY SCORING: Evaluate the source of your food info (ingredients/nutrition). Score "H" (High) if found on official brand websites or these specific Tier-1 Goldmine retailers for the target market: {goldmine_sites}. Score "M" (Medium) if found on other approved retailers but consistent across multiple sites. Score "L" (Low) if found on only a single non-tier-1 approved site or if the source is uncertain. Explain your choice in the reliability_reasoning field.
-    9. EXHAUSTIVE TAGGING (CONSISTENCY RULE): You must evaluate the product against EVERY SINGLE TAG in the exact lists below independently. Do not skip tags assuming they are implied. Treat this as a mandatory True/False checklist for every single tag to ensure maximum consistency across outputs.
-        EU REGULATORY TAG DEFINITIONS — apply tags ONLY when the product meets these thresholds:
-        DIETARY TAGS (EU Regulation 1169/2011 & Regulation 432/2012):
-        - "Vegetarian": ONLY if no meat, fish, or seafood ingredients present. Dairy and eggs are permitted.
-        - "Vegan": ONLY if zero animal-derived ingredients AND no cross-contamination advisory with animal products (or product carries a certified vegan label).
-        - "Organic": ONLY if the product carries an EU Organic logo or equivalent national certification (e.g. DE-ÖKO-001, FR-BIO-01). Do NOT infer from ingredients alone.
-        - "Halal": ONLY if the product carries a recognised Halal certification mark on pack.
-        - "Kosher": ONLY if the product carries a recognised Kosher certification mark on pack.
-        - "Dairy Free": ONLY if no milk or milk-derived ingredients listed AND no "contains milk" allergen declaration.
-        - "Nut Free": ONLY if no tree nuts or peanuts in ingredients AND no "contains nuts/peanuts" allergen declaration.
-        - "Low Sugar": ONLY if ≤5g sugars per 100g (solid) or ≤2.5g sugars per 100ml (liquid) — EU Regulation 1924/2006.
-        - "High protein": ONLY if protein contributes >20% of the product's total energy value — EU Regulation 1924/2006.
-        - "Gluten-free": ONLY if labelled gluten-free on pack OR all ingredients are gluten-free AND gluten content is <20 mg/kg — EU Regulation 828/2014.
-        - "Low Fat": ONLY if ≤3g fat per 100g (solid) or ≤1.5g fat per 100ml (liquid) — EU Regulation 1924/2006.
-    
-        OCCASION TAGS — apply based on product type and primary usage context. Do NOT over-assign:
-        - "Breakfast": Cereals, porridge, breakfast biscuits, morning drinks, pastries.
-        - "Lunchbox": Individually portioned snacks, sandwich accompaniments, small-format items.
-        - "BBQ": Condiments, marinades, grillable meats, charcoal, disposable BBQ accessories.
-        - "Party": Multi-serve sharing formats, party snack packs, celebration cakes, mixers/soft drinks in large format.
-        - "Christmas": Only if the product is explicitly Christmas-themed or a recognised Christmas food/drink tradition (e.g. mince pies, mulled wine spice).
-        - "Ramadan": Only if product is specifically marketed for Ramadan or is a traditional Ramadan food (e.g. dates, harira).
-        - "Meal prep": Bulk staples, dry goods in large quantities, ingredient-focused products.
-        - "Quick dinner": Ready meals, instant noodles, stir-in sauces, products with <15 min prep.
-        - "Kids snack": Products explicitly marketed at children OR inherently child-targeted by format/size/packaging.
-    
-        SEASONAL TAGS — apply ONLY if the SKU is specifically marketed or packaged for that season. Default is empty:
-        - "Christmas": Limited-edition Christmas packaging or an explicitly seasonal SKU.
-        - "Easter": Limited-edition Easter packaging.
-        - "Back to School": Explicitly back-to-school themed products.
-        - "Valentines Day": Explicitly Valentine's Day themed.
-        - "Mothers Day": Explicitly Mother's Day themed.
-        - "Halloween": Limited-edition Halloween packaging.
-        - "Other": A seasonal angle exists but fits none of the above.
-        - If NONE of the above apply, return "" (empty string) for seasonal_tags. Do NOT default to "Other".
-        
-    --- START TAXONOMY REFERENCE (CSV FORMAT) ---
-    {taxonomy_text}
-    --- END TAXONOMY REFERENCE ---
+--- START TAXONOMY REFERENCE (CSV FORMAT) ---
+{taxonomy_text}
+--- END TAXONOMY REFERENCE ---
 
-    CRITICAL JSON RULES:
-    - YOUR ENTIRE RESPONSE MUST BE A SINGLE VALID JSON OBJECT. NO EXCEPTIONS.
-    - NEVER write conversational text outside the JSON object. All thoughts, summaries, and reasoning MUST go inside the "chain_of_thought" field.
-    - EVEN IF YOU FIND ABSOLUTELY NO DATA, YOU MUST RETURN THE JSON WITH ALL FIELDS SET TO "null". NEVER ABORT OR SKIP THE JSON.
-    - To avoid RECITATION errors (copyright filters), do NOT copy-paste long paragraphs of text verbatim. You MUST paraphrase and summarize descriptions in your own words.
-    - JSON REQUIRES double quotes (") for keys and string values. You MUST use double quotes for the JSON structure.
-    - If you need to use quotes INSIDE a string value, use single quotes ('). NEVER use unescaped double quotes inside a value.
-    - Do not use literal newlines/tabs inside strings.
-
-    SCHEMA:
-    {{
-        "is_exact_match": true or false,
-        "rejection_reason": "If is_exact_match is false, one of: 'non_food' (product is not food/drink/pet food per FOOD CHECK), 'mismatch' (a different product than the EAN/input), or 'unconfirmed' (could not confirm). Empty string if is_exact_match is true.",
-        "chain_of_thought": "Step-by-step reasoning. If validation failed, explain why. If passed, briefly explain how you found the data, translated it, and read the images. Include which sources you used and confirm EAN match.",
-        "food_info_reliability": "H, M, or L",
-        "reliability_reasoning": "Explain why H, M, or L was assigned based on the specific URLs/sources used",
-        "category_1": "Level 1 Category (English)",
-        "category_2": "Level 2 Category (English)",
-        "category_3": "Level 3 Category (English)",
-        "category_4": "Level 4 Category (English)",
-        "category_5": "Level 5 Category (English)",
-        "category_6": "Level 6 Variant or None (English)",
-        "categorization_reasoning": "Brief explanation of why these categories were chosen",
-        "dietary_tags": "Comma-separated tags from the exact Dietary list (English)",
-        "occasion_tags": "Comma-separated tags from the exact Occasion list (English)",
-        "seasonal_tags": "Comma-separated tags from the exact Seasonal list (English)",
-        "tagging_reasoning": "Brief explanation for the chosen tags. Be concise. Only explain assigned tags, do not explain rejected ones.",
-        "brand": "Brand Name",
-        "uom": "Strictly write 'g' (or 'ml' for liquids). Do not write 'gram', 'grams', 'gr'.",
-        "packaging": "Packaging type (e.g., Box, Bottle, Wrapper)",
-        "fragile_item": "Yes or No",
-        "net_weight": "Weight/Volume number only",
-        "gross_weight": "Gross weight if found, else null",
-        "organic_product": "Yes or No",
-        "net_weight_customer_facing": "How weight is displayed on pack",
-        "ingredients": "Full list as a single string (Translated to {market_code} language)",
-        "allergens": "List as a single string (Translated to {market_code} language)",
-        "may_contain": "List as a single string (Translated to {market_code} language)",
-        "nutritional_info": "Context (e.g., per 100g or per serving) (Translated to {market_code} language)",
-        "manufacturer_name": "Legal name of the manufacturer company",
-        "manufacturer_address": "Full address",
-        "place_of_origin": "Country/Region of origin",
-        "organic_certification_id": "e.g., DE-ÖKO-001 or null",
-        "energy_kj": "Value in kJ",
-        "fat_g": "Value",
-        "saturates_g": "Value",
-        "carbohydrates_g": "Value",
-        "sugars_g": "Value",
-        "protein_g": "Value",
-        "fiber_g": "Value",
-        "salt_g": "Value",
-        "sources": ["Array of full URLs (starting with https://) from approved sources only — NO Amazon, eBay, OpenFoodFacts, or any forbidden domain"]
-    }}
-    """
+Return ONLY a single valid JSON object with this schema. No prose outside JSON:
+{{
+  "category_1": "Level 1 Category or empty string",
+  "category_2": "Level 2 Category or empty string",
+  "category_3": "Level 3 Category or empty string",
+  "category_4": "Level 4 Category or empty string",
+  "category_5": "Level 5 Category or empty string",
+  "category_6": "Level 6 Variant or None",
+  "categorization_reasoning": "Brief evidence-based reason for the category path",
+  "dietary_tags": "Comma-separated tags from the Dietary list, or empty string",
+  "occasion_tags": "Comma-separated tags from the Occasion list, or empty string",
+  "seasonal_tags": "Comma-separated tags from the Seasonal list, or empty string",
+  "tagging_reasoning": "Brief reason for assigned tags only"
+}}
+"""
 
     client = genai.Client(api_key=gemini_key)
-
-    contents_payload = [prompt]
-    for img in image_bytes_list:
-        contents_payload.append(
-            types.Part.from_bytes(data=img["data"], mime_type=img["mime"])
-        )
-
     last_error = "Unknown error"
-
     for attempt in range(3):
         try:
             response = client.models.generate_content(
                 model=EXTRACTION_MODEL,
-                contents=contents_payload,
+                contents=[prompt],
                 config=types.GenerateContentConfig(
-                    temperature=0.25,
-                    tools=[{"google_search": {}}],
-                    max_output_tokens=8192,
-                    # NOTE: To disable thinking tokens on gemini-2.5-flash and control costs,
-                    # uncomment the line below (requires google-genai >= 0.8.0):
-                    # thinking_config=types.ThinkingConfig(thinking_budget=0),
+                    temperature=0.0,
+                    max_output_tokens=4096,
                     safety_settings=[
                         types.SafetySetting(
                             category=types.HarmCategory.HARM_CATEGORY_HATE_SPEECH,
@@ -1324,82 +1231,38 @@ def run_gemini_sync(ean, product_name, market_code, gemini_key, taxonomy_text,
                         types.SafetySetting(
                             category=types.HarmCategory.HARM_CATEGORY_HARASSMENT,
                             threshold=types.HarmBlockThreshold.BLOCK_NONE,
-                        )
-                    ]
-                )
+                        ),
+                    ],
+                ),
             )
-
-            if not response.candidates:
-                raw_resp_str = str(response)[:500].replace('\n', ' ')
-                raise Exception(f"Request blocked entirely. Raw response: {raw_resp_str}")
-
-            raw_text = ""
-            if response.candidates[0].content and response.candidates[0].content.parts:
-                for part in response.candidates[0].content.parts:
-                    if getattr(part, 'text', None):
-                        raw_text += part.text + "\n"
-
-            if not raw_text.strip() and getattr(response, 'text', None):
-                raw_text = response.text
-
-            raw_text = raw_text.strip() if raw_text else ""
-
-            if not raw_text:
-                candidate    = response.candidates[0]
-                finish_reason = candidate.finish_reason
-                raise Exception(f"Empty text extracted. Reason: {finish_reason}")
-
-            # ── Collect grounding redirect URLs as supplementary source references ──
-            grounding_urls = []
-            try:
-                if response.candidates and response.candidates[0].grounding_metadata:
-                    metadata = response.candidates[0].grounding_metadata
-                    if metadata.grounding_chunks:
-                        for chunk in metadata.grounding_chunks:
-                            if chunk.web and chunk.web.uri:
-                                grounding_urls.append(chunk.web.uri)
-            except Exception:
-                pass
-
-            start_idx = raw_text.find('{')
-            end_idx   = raw_text.rfind('}')
-
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                clean_json = raw_text[start_idx:end_idx+1]
-            else:
-                rogue_preview = raw_text[:200].replace('\n', ' ')
-                raise Exception(f"Could not find JSON object. AI wrote: {rogue_preview}...")
-
-            data = json.loads(clean_json, strict=False)
-
-            # ── Merge sources: model-claimed URLs first, grounding redirects appended ──
-            # Model sources are the real claimed domains; grounding redirects are
-            # supplementary references (Vertex redirect URLs, not real domains).
-            # Filter out any forbidden domains from model-claimed sources.
-            model_sources = data.get("sources", [])
-            if isinstance(model_sources, str):
-                model_sources = [s.strip() for s in model_sources.split(",") if s.strip()]
-            elif not isinstance(model_sources, list):
-                model_sources = []
-
-            # Hard filter: remove any forbidden domains that Gemini may have included
-            model_sources = [s for s in model_sources if not _is_excluded_domain(s)]
-
-            # Merge: model sources take priority; grounding redirects appended as refs
-            all_sources = list(dict.fromkeys([*model_sources, *grounding_urls]))
-            data["sources"] = all_sources
-
-            return data
-
-        except json.JSONDecodeError as e:
-            last_error = f"JSON Error: {str(e)}"
+            raw_text = getattr(response, "text", "") or ""
+            if not raw_text and getattr(response, "candidates", None):
+                cand = response.candidates[0]
+                if cand.content and cand.content.parts:
+                    for part in cand.content.parts:
+                        if getattr(part, "text", None):
+                            raw_text += part.text + "\n"
+            data = _extract_json_object(raw_text)
+            if not data:
+                raise Exception("Could not parse categorization JSON")
+            defaults = {
+                "category_1": "", "category_2": "", "category_3": "",
+                "category_4": "", "category_5": "", "category_6": "None",
+                "categorization_reasoning": "", "dietary_tags": "",
+                "occasion_tags": "", "seasonal_tags": "", "tagging_reasoning": "",
+            }
+            defaults.update({k: ("" if v in (None, "null", "None") else v)
+                             for k, v in data.items()})
+            defaults["chain_of_thought"] = (
+                "Food fields were extracted deterministically from verified pages; "
+                "Gemini was used only for taxonomy/category and tag assignment."
+            )
+            return defaults
         except Exception as e:
             last_error = str(e)
-
-        if attempt < 2:
-            time.sleep(3)
-
-    return {"error": f"API Error (Failed after 3 attempts). Last error: {last_error}"}
+            if attempt < 2:
+                time.sleep(2)
+    return {"error": f"Categorization Error: {last_error}"}
 
 
 # ============================================================================
@@ -2235,7 +2098,7 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                                 ground_truth="", gemini_key="", go_upc_data=None):
     """
     Path B: Find and verify the 2 images shown in the results table.
-    Completely separate from food extraction; runs in parallel with Path A.
+    Completely separate from deterministic food extraction; runs in parallel with food_pipeline.
 
     Hard constraints enforced here:
     - Amazon and eBay domains are skipped at every stage.
@@ -2802,391 +2665,265 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
 
     # ── Cache check ──────────────────────────────────────────────────────────
     if not force_refresh:
-        cached = cache_get(ean, market)
+        cached = cache_get(ean, market, ground_truth)
         if cached:
-            cached["Cached"] = "✅ Cached"
+            cached["Cached"]      = "✅ Cached"
+            cached["User Input"]  = ground_truth
+            cached["GTIN / EAN"]  = ean
             empty_diag = ImageDiagnostics(ean)
             empty_diag.log("✅ Loaded from cache.")
             return {"row": cached, "image_diag": empty_diag, "food_diag": None}
     else:
-        cache_delete(ean, market)
+        cache_delete(ean, market, ground_truth)
+
+    def _clean_cell(v):
+        return "" if (v is None or v == "null" or v == "None") else v
+
+    def _source_slots(links):
+        return (list(links or []) + ["", "", "", "", ""])[:5]
+
+    def _link_basis(routes, links, registry_ean_verified=False):
+        shown_routes = [routes.get(u) for u in links if u in routes]
+        has_a = "A" in shown_routes or registry_ean_verified
+        has_b = "B" in shown_routes
+        if has_a and has_b:
+            return "EAN + Name ⚠️"
+        if has_a:
+            return "EAN-verified"
+        if has_b:
+            return "Name-matched ⚠️"
+        return ""
+
+    def _reliability_reasoning(reliability, routes, links, provenance, rejection_reason=""):
+        shown_routes = [routes.get(u) for u in links if u in routes]
+        if rejection_reason == "page_not_readable" or provenance == "page not readable":
+            return "Low confidence: no readable verified product page was available; page not readable."
+        if reliability == "H":
+            return "High confidence: Route A verified the EAN on the fetched product page; food fields were read from verified pages only."
+        if reliability == "M":
+            return "Medium confidence: Route B verified the product by ≥80% name match with no clear weight conflict, but no on-page barcode was found; confidence is capped at M."
+        if links:
+            return "Low confidence: verified source support was weak or incomplete; spot-check before upload."
+        return "Low confidence: no verified source page contributed readable food data."
 
     async with sem:
-        # ── Tier 1A: Go-UPC — single call, result shared by both paths ───────
+        # ── Tier 1A: Go-UPC — still shared with image sourcing, but not used as a
+        # source link for food data. The deterministic module reuses it only as
+        # registry identity/context and reads food fields from verified pages.
         go_upc_data = await fetch_go_upc(session, ean, go_upc_key)
         if go_upc_data:
             print(f"[Go-UPC] {ean}: {go_upc_data.get('name','')} "
                   f"| food={go_upc_data.get('is_food')} "
                   f"| img={'yes' if go_upc_data.get('image_url') else 'no'}")
 
-        # Go-UPC non-food early exit is intentionally disabled.
-        # Go-UPC's category taxonomy is unreliable (e.g. tinned salmon can be
-        # tagged as "Fish Food" for aquariums). The user also sells pet food
-        # which would be incorrectly rejected by a category-based gate.
-        # Gemini's tiered validation gate handles food classification with
-        # much better context and accuracy.
-
-        # ── Run both pipelines concurrently ──────────────────────────────────
-        food_task  = fetch_basic_info(session, ean, serp_key, ean_token, market,
-                                      user_ground_truth=ground_truth,
-                                      go_upc_data=go_upc_data)
-        image_task = fetch_display_images(session, ean, serp_key, ean_token, market,
-                                           ground_truth=ground_truth, gemini_key=gemini_key,
-                                           go_upc_data=go_upc_data)
-
-        (name, gemini_images, food_diag, ean_verified, food_retailer_urls),         (display_images, image_diag, source_links, pipeline_urls, source_routes) = await asyncio.gather(food_task, image_task)
-
-        # Path A discovered and verified its own retailer pages (e.g. the Byodo
-        # oil on bioaufvorrat.de, or the Ökostern Nudeln on eekenhof-shop found
-        # by NAME) that Path B's separate search may never have seen. Share and
-        # classify them with the SAME Route A/B logic so a page found by name
-        # (Route B) still supplies its link and image — flagged, capping M.
-        for _u in (food_retailer_urls or []):
-            if _u and _u not in (pipeline_urls or []):
-                pipeline_urls.append(_u)
-
-        _registry_name_pa = ""
+        registry_name = ""
         if go_upc_data and go_upc_data.get("name") and not is_garbage_name(go_upc_data["name"]):
-            _registry_name_pa = go_upc_data["name"]
-        _clean_gt_pa = _strip_pack_notation(ground_truth) if ground_truth else ground_truth
-        _anchors_pa = [a for a in (_clean_gt_pa, _registry_name_pa) if a]
+            registry_name = go_upc_data["name"]
 
-        _existing_src_domains = {s.split("/")[2] for s in source_links if s.startswith("http")}
-        for _u in (food_retailer_urls or []):
-            if len(source_links) >= 2:
-                break
-            if not _u or not _u.startswith("http") or _is_excluded_domain(_u):
-                continue
-            _dom = _u.split("/")[2]
-            if _dom in _existing_src_domains:
-                continue
-            _route_pa, _page_imgs_pa = await classify_page(session, _u, ean, _anchors_pa)
-            if _route_pa is None:
-                continue
-            source_links.append(_u)
-            source_routes[_u] = _route_pa
-            _existing_src_domains.add(_dom)
-            image_diag.log(f"✅ Promoted Path-A page ({'EAN' if _route_pa=='A' else 'name'}-matched): {_dom}")
-            # If we still have no image, mine this verified page for one.
-            if not display_images and _page_imgs_pa:
-                for _tag, _img in _page_imgs_pa:
-                    if not _is_valid_image_url(_img) or _is_excluded_domain(_img):
+        food_task = extract_food_data(
+            session=session,
+            ean=ean,
+            ground_truth=ground_truth,
+            market=market,
+            registry_name=registry_name,
+            keys={
+                "serp_key": serp_key,
+                "ean_token": ean_token,
+                "go_upc_key": go_upc_key,
+                "gemini_key": gemini_key,
+                "gemini_model": EXTRACTION_MODEL,
+                "go_upc_data": go_upc_data,
+            },
+        )
+        image_task = fetch_display_images(session, ean, serp_key, ean_token, market,
+                                          ground_truth=ground_truth, gemini_key=gemini_key,
+                                          go_upc_data=go_upc_data)
+
+        food_result, (display_images, image_diag, image_source_links, image_pipeline_urls, image_source_routes) = await asyncio.gather(food_task, image_task)
+
+        food_diag = food_result.get("diagnostic_log", "")
+        if food_diag:
+            image_diag.log("── Food data pipeline ──")
+            for _line in str(food_diag).splitlines():
+                image_diag.log(_line)
+
+        fields = dict(food_result.get("fields") or {})
+        name = fields.get("product_name") or registry_name or ground_truth or f"Product with EAN {ean}"
+        fields["product_name"] = name
+
+        source_links = [u for u in (food_result.get("source_links") or []) if u and _is_displayable_url(u)]
+        source_routes = dict(food_result.get("source_routes") or {})
+        candidate_pages = list(food_result.get("candidate_pages") or [])
+        reliability = food_result.get("reliability") or "L"
+        final_status = food_result.get("status") or "Failed Validation"
+        data_provenance = food_result.get("provenance") or "Verified page"
+        rejection_reason = food_result.get("rejection_reason") or ""
+
+        # If the image pipeline found images but the food pipeline produced different
+        # verified source pages, mine those food pages for display images as a safe
+        # supplement. Route-B page images are still vision-checked.
+        if source_links and len(display_images) < MAX_DISPLAY_IMAGES:
+            brand_for_verify = fields.get("brand", "")
+            weight_for_verify = fields.get("net_weight_customer_facing", "") or _extract_weight_hint(ground_truth)
+            for page_url in source_links:
+                if len(display_images) >= MAX_DISPLAY_IMAGES:
+                    break
+                try:
+                    page_imgs = await display_extract_from_page(session, page_url)
+                except Exception:
+                    page_imgs = []
+                route = source_routes.get(page_url, "")
+                for src_tag, img_url in page_imgs:
+                    if len(display_images) >= MAX_DISPLAY_IMAGES:
+                        break
+                    if not _is_valid_image_url(img_url) or _is_excluded_domain(img_url):
                         continue
-                    _pl = await display_fetch_image_bytes(session, _img)
-                    if not _pl or "error" in _pl:
+                    if any(x.get("url") == img_url for x in display_images):
                         continue
-                    _insp = display_inspect_image(_pl["data"])
-                    if not _insp["ok"]:
+                    payload = await display_fetch_image_bytes(session, img_url)
+                    if not payload or "error" in payload:
                         continue
-                    _smime = _safe_mime(_pl["mime"], _pl["data"]) or "image/jpeg"
-                    # Route B image → vision-verify (name match is weaker).
-                    if _route_pa == "B" and gemini_key and name and \
-                            not str(name).startswith("Product with EAN"):
-                        _vs = await asyncio.to_thread(
-                            verify_image_with_gemini, _pl["data"], _smime,
-                            name, "", gemini_key, "")
-                        if _vs is not None and 0 <= _vs < IMAGE_MATCH_THRESHOLD_TRUSTED:
-                            image_diag.log(f"   ⚠️ Route-B Path-A image rejected by vision: {_dom}")
+                    inspection = display_inspect_image(payload["data"])
+                    if not inspection["ok"]:
+                        continue
+                    safe_mime = _safe_mime(payload["mime"], payload["data"]) or "image/jpeg"
+                    if route == "B" and gemini_key and name and not str(name).startswith("Product with EAN"):
+                        vscore = await asyncio.to_thread(
+                            verify_image_with_gemini, payload["data"], safe_mime,
+                            name, brand_for_verify, gemini_key, weight_for_verify)
+                        if vscore is not None and 0 <= vscore < IMAGE_MATCH_THRESHOLD_TRUSTED:
+                            image_diag.log(f"   ⚠️ Route-B food-page image rejected by vision ({vscore:.2f}): {page_url}")
                             continue
                     display_images.append({
-                        "url": _img, "mime": _smime, "data": _pl["data"],
-                        "source": f"pathA_route{_route_pa}_{_tag}", "inspection": _insp,
-                        "phash": display_compute_phash(_pl["data"]),
+                        "url": img_url, "mime": safe_mime, "data": payload["data"],
+                        "source": f"food_route{route}_{src_tag}", "inspection": inspection,
+                        "phash": display_compute_phash(payload["data"]),
                         "display": True, "match": 0.5,
                     })
-                    image_diag.log(f"   ✅ Image from Path-A {'EAN' if _route_pa=='A' else 'name'}-matched page: {_dom}")
-                    break
-
-        # ── Change 1: Early exit when no approved source found anything ───────
-        no_sources = (
-            name.startswith("Product with EAN") and
-            not ean_verified and
-            len(gemini_images) == 0 and
-            go_upc_data is None
-        )
-        if no_sources:
-            # If any SerpAPI call hard-failed (429/5xx after retries), this row
-            # is INCONCLUSIVE, not "Not Found" — surface that so users re-run
-            # instead of trusting a quota failure as a genuine miss.
-            if "SERP_FAILED_FLAG" in (food_diag or ""):
-                nf_status = "⚠️ Search Failed — quota/rate-limit hit, please re-run"
-            else:
-                nf_status = "⚠️ Not Found — no approved source indexed this EAN"
-                if not ground_truth:
-                    nf_status += " (tip: add the product name to the input line to enable name-based fallback)"
-            row = {
-                "Image 1": "", "Image 2": "", "Image Source Link": "",
-                "GTIN / EAN": ean, "User Input": ground_truth,
-                "Status": nf_status,
-                "Cached": "🔄 Fresh",
-            }
-            return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
-
-        # ── Path A: Gemini food extraction ───────────────────────────────────
-        # Pass pipeline verification through: source_links are pages FETCHED
-        # and confirmed to contain the EAN; pipeline_urls are real SERP hits.
-        data = await asyncio.to_thread(
-            run_gemini_sync, ean, name, market, gemini_key,
-            taxonomy_text, gemini_images, ground_truth, go_upc_data,
-            source_links, pipeline_urls, ean_verified
-        )
+                    image_diag.log(f"   ✅ Image sourced from food-data verified page: {page_url}")
 
         # ── Path B output ─────────────────────────────────────────────────────
-        # Durable-URL gate: ephemeral CDN thumbnails (encrypted-tbn*.gstatic.com
-        # etc.) render fine NOW but expire within hours/days — they are the main
-        # cause of "broken image links" in shared exports. Blank them here; the
-        # EAN-confirmed Image Source Link still gives users a working page.
         display_urls = []
         for img in display_images:
-            u = img["url"]
+            u = img.get("url", "")
             if _is_durable_url(u):
                 display_urls.append(u)
             else:
                 image_diag.log(f"⚠️ Image URL dropped from output (ephemeral CDN): {u[:80]}")
-        imgs          = (display_urls + ["", ""])[:2]
-        img_src_links = (source_links + ["", ""])[:2]
+        imgs = (display_urls + ["", ""])[:2]
+        img_src_basis = source_links or [u for u in (image_source_links or []) if u and _is_displayable_url(u)]
+        img_src_links = (img_src_basis + ["", ""])[:2]
 
-        # ── Error branch — do NOT cache ───────────────────────────────────────
-        if "error" in data:
-            row = {
-                "Image 1": imgs[0],
-                "Image 2": imgs[1],
-                "Image Source Link": img_src_links[0],
-                "GTIN / EAN": ean,
-                "User Input": ground_truth,
-                "Status": f"{data['error']}",
-                "Cached": "🔄 Fresh"
-            }
-            # Errors are never cached — they will be retried on next lookup
-            row = {k: ("" if (v is None or v == "null" or v == "None") else v)
-                   for k, v in row.items()}
-            return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
-
-        # ── Build Source 1-5 — VERIFIED-ONLY ─────────────────────────────────
-        # A link reaches the Source columns ONLY if the pipeline fetched it this
-        # run and confirmed the product's EAN on the page (source_links are
-        # exactly those pages). This is the fix for wrong/broken source links:
-        #   • Gemini-returned URLs (hallucinated / stale)      → never in output
-        #   • Unverified SerpAPI hits (right digits, wrong item, e.g. a
-        #     MediaMarkt plug or a tyre listing matching an article number)
-        #                                                      → never in output
-        # Users see FEWER links, but every shown link is live AND correct.
-        _gemini_sources = data.get("sources", [])
-        if isinstance(_gemini_sources, str):
-            _gemini_sources = [s.strip() for s in _gemini_sources.split(",") if s.strip()]
-        elif not isinstance(_gemini_sources, list):
-            _gemini_sources = []
-        _gemini_sources = [s for s in _gemini_sources if s and _is_displayable_url(s)]
+        # Source columns = contributing verified food pages only.
+        _verified_srcs = list(dict.fromkeys(source_links))[:5]
+        srcs = _source_slots(_verified_srcs)
+        link_basis = _link_basis(source_routes, _verified_srcs)
 
         _search_patterns = ("/search?", "?q=", "?query=", "?search=",
-                             "?entry=", "?searchTerm=", "?terme=")
-        _pipe_filtered = [
-            u for u in (pipeline_urls or [])
-            if u and _is_displayable_url(u)
-            and not any(p in u.lower() for p in _search_patterns)
-        ]
-
-        # Output = verified pages only (Route A EAN-confirmed OR Route B name-matched).
-        _verified_srcs = list(dict.fromkeys(
-            [u for u in source_links if u and _is_displayable_url(u)]
-        ))
-        srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
-
-        # ── Link Basis flag (feedback: flag name-matched links) ──────────────
-        # Summarise how the shown links were verified so reviewers see at a
-        # glance whether a link is barcode-confirmed or only name-matched.
-        _routes_shown = [source_routes.get(u) for u in _verified_srcs]
-        _has_A = "A" in _routes_shown
-        _has_B = "B" in _routes_shown
-        if _has_A and _has_B:
-            link_basis = "EAN + Name ⚠️"
-        elif _has_A:
-            link_basis = "EAN-verified"
-        elif _has_B:
-            link_basis = "Name-matched ⚠️"
-        else:
-            link_basis = ""
-        # Route-B-only support means no barcode confirmation → cap confidence.
-        _only_name_matched = _has_B and not _has_A and not ean_verified
-
-        # Unverified candidates are retained for AUDIT ONLY (hidden column),
-        # so the discovery trail is preserved but never shown as a real source.
+                            "?entry=", "?searchTerm=", "?terme=")
         _audit_candidates = list(dict.fromkeys(
-            [u for u in _pipe_filtered if u not in _verified_srcs] +
-            [u for u in _gemini_sources if u not in _verified_srcs]
-        ))[:8]
+            [u for u in candidate_pages if u and _is_displayable_url(u) and u not in _verified_srcs] +
+            [u for u in (image_pipeline_urls or []) if u and _is_displayable_url(u) and u not in _verified_srcs]
+        ))
+        _audit_candidates = [u for u in _audit_candidates if not any(p in u.lower() for p in _search_patterns)][:8]
         audit_sources = " | ".join(_audit_candidates)
 
-        real_sources = list(_verified_srcs)
+        # Preserve the old search-failure distinction when SerpAPI itself failed.
+        if final_status != "Success" and "SERP_FAILED" in str(food_diag):
+            final_status = "⚠️ Search Failed — quota/rate-limit hit, please re-run"
+            reliability = "L"
+            data_provenance = "Search failed"
 
-        # ── Validation gate — is_exact_match=False means wrong product ────────
-        if data.get("is_exact_match") is False:
-            _reject = str(data.get("rejection_reason", "")).strip().lower()
-            # The conflict path (trust the pipeline, show the verified link)
-            # applies ONLY when Gemini merely couldn't CONFIRM the product.
-            # A 'non_food' or 'mismatch' rejection means the product is wrong —
-            # showing its link (e.g. the WETEC screwdriver for a food EAN) is a
-            # bug. Those always hard-fail with ZERO links and ZERO images.
-            _conflict_eligible = _reject in ("", "unconfirmed")
-            _pipeline_verified = _conflict_eligible and (bool(_verified_srcs) or ean_verified)
-            if _pipeline_verified:
-                row = {
-                    "Image 1": imgs[0],
-                    "Image 2": imgs[1],
-                    "Image Source Link": img_src_links[0],
-                    "Status": "Success",
-                    "GTIN / EAN": ean,
-                    "User Input": ground_truth,
-                    "Product Name": name,
-                    "Info Reliability": "L",
-                    "Link Basis": link_basis,
-                    "Reliability Reasoning": (
-                        f"Low confidence: pipeline confirmed EAN {ean} "
-                        f"{'on-page at ' + ', '.join(_verified_srcs[:2]) if _verified_srcs else 'via barcode registry'}, "
-                        f"but automated extraction could not fully confirm the match. "
-                        f"Verify against the source link before upload."),
-                    "Chain of Thought": data.get("chain_of_thought", ""),
-                    "Source 1": srcs[0], "Source 2": srcs[1], "Source 3": srcs[2],
-                    "Source 4": srcs[3], "Source 5": srcs[4],
-                    "Source Candidates (audit)": audit_sources,
-                    "Cached": "🔄 Fresh",
+        # Categorization/tagging remains Gemini, but only after deterministic extraction
+        # and only when the food-data validation succeeded.
+        cat_data = {}
+        if final_status == "Success":
+            cat_data = await asyncio.to_thread(
+                run_categorization_sync, ean, name, market, gemini_key,
+                taxonomy_text, fields, ground_truth,
+            )
+            if "error" in cat_data:
+                image_diag.log(f"⚠️ Categorization step failed: {cat_data['error']}")
+                cat_data = {
+                    "categorization_reasoning": cat_data["error"],
+                    "tagging_reasoning": "Categorization/tagging unavailable; food fields were still extracted deterministically.",
                 }
-                row = {k: ("" if (v is None or v == "null" or v == "None") else v)
-                       for k, v in row.items()}
-                return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
-            # Images are suppressed: Path B searched under the wrong product
-            # name, so any images found belong to the wrong product.
-            # Failed validation → the product is wrong. Show ZERO source links
-            # and ZERO images: an EAN-confirmed or name-matched page for the
-            # WRONG product (e.g. a screwdriver returned for a food EAN) must
-            # never be offered as a source.
-            _fv_srcs = ["", "", "", "", ""]
-            row = {
-                "Image 1": "",
-                "Image 2": "",
-                "Image Source Link": "",
-                "Image 2 Failure Reason": "Images suppressed — EAN validation failed",
-                "Status": "Failed Validation",
-                "GTIN / EAN": ean,
-                "User Input": ground_truth,
-                "Product Name": name,
-                "Categorization Diagnosis": "Error: EAN does not correspond to the product found.",
-                "Info Reliability": "",
-                "Reliability Reasoning": data.get("chain_of_thought", ""),
-                "Chain of Thought": data.get("chain_of_thought", ""),
-                "Category L1": "", "Category L2": "", "Category L3": "",
-                "Category L4": "", "Category L5": "", "Category L6": "",
-                "Dietary Tags": "", "Occasion Tags": "", "Seasonal Tags": "",
-                "Tagging Reasoning": "",
-                "Brand": "", "UoM": "", "Packaging": "", "Fragile Item": "",
-                "Net Weight (g) / Volume": "", "Gross Weight (g)": "",
-                "Organic Product": "", "Net Weight/ Volume (Customer Facing)": "",
-                "Ingredients": "", "Allergens": "", "May Contain": "",
-                "Nutritional Info": "", "Manufacturer Name": "",
-                "Manufacturer Address": "", "Place of Origin": "",
-                "Organic Certification ID": "",
-                "Energy (kJ)": "", "Fat (g)": "",
-                "Of Which Saturated Fatty Acids (g)": "", "Carbohydrates (g)": "",
-                "Of Which Sugars (g)": "", "Protein (g)": "",
-                "Fiber (g)": "", "Salt (g)": "",
-                "Source 1": _fv_srcs[0], "Source 2": _fv_srcs[1], "Source 3": _fv_srcs[2],
-                "Source 4": _fv_srcs[3], "Source 5": _fv_srcs[4],
-                "Source Candidates (audit)": audit_sources,
-                "Cached": "🔄 Fresh"
-            }
-            # Failed validation is never cached — the product may be retried with
-            # corrected ground truth
-            row = {k: ("" if (v is None or v == "null" or v == "None") else v)
-                   for k, v in row.items()}
-            return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
-        # ── Determine final status ────────────────────────────────────────────
-        # "Needs Review" removed per feedback — it was confusing about what
-        # action to take. Status is now binary:
-        #   Failed Validation  → wrong product (handled above)
-        #   Success            → data extracted; confidence conveyed by H/M/L
-        # Reliability grading (unchanged from Gemini) tells the reviewer how
-        # much to trust the row: H = Tier-1/EAN-confirmed, M = real source but
-        # not barcode-confirmed, L = weak/single source. If a product wasn't
-        # found directly in a Tier-1 source, M or L is sufficient signal.
-        reliability = data.get("food_info_reliability", "") or "M"
+        reliability_reasoning = _reliability_reasoning(
+            reliability, source_routes, _verified_srcs, data_provenance, rejection_reason)
+        chain_summary = (
+            "Food data was extracted from fetched Route A/B verified pages only; "
+            "Gemini search/grounding was not used for food data. "
+            "Gemini was used only for category/tag assignment."
+        ) if final_status == "Success" else (
+            f"Food-data validation failed: {data_provenance or rejection_reason or 'unconfirmed'}."
+        )
 
-        # Guard against an over-confident H when nothing independently confirmed
-        # the barcode: cap at M so H always means genuine Tier-1/EAN confirmation.
-        if reliability == "H" and not ean_verified and not real_sources:
-            reliability = "M"
-        # Route-B-only support (name-matched links, no EAN confirmation) can
-        # never be H — a name match is weaker than a barcode match.
-        if _only_name_matched and reliability == "H":
-            reliability = "M"
-
-        final_status = "Success"
-
+        # Failed page-readable rows keep any first-pass deterministic/registry data,
+        # but are clearly blocked from upload by Failed Validation/L.
         row = {
-            "Image 1": imgs[0],
-            "Image 2": imgs[1],
-            "Image Source Link": img_src_links[0],
-            "Image 2 Failure Reason": image_diag.image_2_failure,
+            "Image 1": imgs[0] if final_status == "Success" else "",
+            "Image 2": imgs[1] if final_status == "Success" else "",
+            "Image Source Link": img_src_links[0] if final_status == "Success" else "",
+            "Image 2 Failure Reason": image_diag.image_2_failure if final_status == "Success" else "Images suppressed — food-data validation failed",
             "Status": final_status,
             "GTIN / EAN": ean,
             "User Input": ground_truth,
             "Product Name": name,
             "Info Reliability": reliability,
             "Link Basis": link_basis,
-            "Reliability Reasoning": data.get("reliability_reasoning", ""),
-            "Chain of Thought": data.get("chain_of_thought", ""),
-            "Category L1": data.get("category_1", ""),
-            "Category L2": data.get("category_2", ""),
-            "Category L3": data.get("category_3", ""),
-            "Category L4": data.get("category_4", ""),
-            "Category L5": data.get("category_5", ""),
-            "Category L6": data.get("category_6", ""),
-            "Categorization Diagnosis": data.get("categorization_reasoning", ""),
-            "Dietary Tags": data.get("dietary_tags", ""),
-            "Occasion Tags": data.get("occasion_tags", ""),
-            "Seasonal Tags": data.get("seasonal_tags", ""),
-            "Tagging Reasoning": data.get("tagging_reasoning", ""),
-            "Brand": data.get("brand", ""),
-            "UoM": data.get("uom", ""),
-            "Packaging": data.get("packaging", ""),
-            "Fragile Item": data.get("fragile_item", ""),
-            "Net Weight (g) / Volume": data.get("net_weight", ""),
-            "Gross Weight (g)": data.get("gross_weight", ""),
-            "Organic Product": data.get("organic_product", ""),
-            "Net Weight/ Volume (Customer Facing)": data.get("net_weight_customer_facing", ""),
-            "Ingredients": data.get("ingredients", ""),
-            "Allergens": data.get("allergens", ""),
-            "May Contain": data.get("may_contain", ""),
-            "Nutritional Info": data.get("nutritional_info", ""),
-            "Manufacturer Address": data.get("manufacturer_address", ""),
-            "Manufacturer Name": data.get("manufacturer_name", ""),
-            "Place of Origin": data.get("place_of_origin", ""),
-            "Organic Certification ID": data.get("organic_certification_id", ""),
-            "Energy (kJ)": data.get("energy_kj", ""),
-            "Fat (g)": data.get("fat_g", ""),
-            "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
-            "Carbohydrates (g)": data.get("carbohydrates_g", ""),
-            "Of Which Sugars (g)": data.get("sugars_g", ""),
-            "Protein (g)": data.get("protein_g", ""),
-            "Fiber (g)": data.get("fiber_g", ""),
-            "Salt (g)": data.get("salt_g", ""),
+            "Data Provenance": data_provenance,
+            "Reliability Reasoning": reliability_reasoning,
+            "Chain of Thought": cat_data.get("chain_of_thought", chain_summary),
+            "Category L1": cat_data.get("category_1", ""),
+            "Category L2": cat_data.get("category_2", ""),
+            "Category L3": cat_data.get("category_3", ""),
+            "Category L4": cat_data.get("category_4", ""),
+            "Category L5": cat_data.get("category_5", ""),
+            "Category L6": cat_data.get("category_6", ""),
+            "Categorization Diagnosis": cat_data.get("categorization_reasoning", ""),
+            "Dietary Tags": cat_data.get("dietary_tags", ""),
+            "Occasion Tags": cat_data.get("occasion_tags", ""),
+            "Seasonal Tags": cat_data.get("seasonal_tags", ""),
+            "Tagging Reasoning": cat_data.get("tagging_reasoning", ""),
+            "Brand": fields.get("brand", ""),
+            "UoM": fields.get("uom", ""),
+            "Packaging": fields.get("packaging", ""),
+            "Fragile Item": fields.get("fragile_item", ""),
+            "Net Weight (g) / Volume": fields.get("net_weight", ""),
+            "Gross Weight (g)": fields.get("gross_weight", ""),
+            "Organic Product": fields.get("organic_product", ""),
+            "Net Weight/ Volume (Customer Facing)": fields.get("net_weight_customer_facing", ""),
+            "Ingredients": fields.get("ingredients", ""),
+            "Allergens": fields.get("allergens", ""),
+            "May Contain": fields.get("may_contain", ""),
+            "Nutritional Info": fields.get("nutritional_info", ""),
+            "Manufacturer Address": fields.get("manufacturer_address", ""),
+            "Manufacturer Name": fields.get("manufacturer_name", ""),
+            "Place of Origin": fields.get("place_of_origin", ""),
+            "Organic Certification ID": fields.get("organic_certification_id", ""),
+            "Energy (kJ)": fields.get("energy_kj", ""),
+            "Fat (g)": fields.get("fat_g", ""),
+            "Of Which Saturated Fatty Acids (g)": fields.get("saturates_g", ""),
+            "Carbohydrates (g)": fields.get("carbohydrates_g", ""),
+            "Of Which Sugars (g)": fields.get("sugars_g", ""),
+            "Protein (g)": fields.get("protein_g", ""),
+            "Fiber (g)": fields.get("fiber_g", ""),
+            "Salt (g)": fields.get("salt_g", ""),
             "Source 1": srcs[0],
             "Source 2": srcs[1],
             "Source 3": srcs[2],
             "Source 4": srcs[3],
             "Source 5": srcs[4],
             "Source Candidates (audit)": audit_sources,
-            "Cached": "🔄 Fresh"
+            "Cached": "🔄 Fresh",
         }
 
-        # ── Cache only confirmed successes ────────────────────────────────────
         if should_cache(final_status):
-            cache_set(ean, market, row, status=final_status, confidence=1.0)
+            cache_set(ean, market, row, status=final_status, confidence=1.0,
+                      ground_truth=ground_truth)
 
-        # Sanitise: replace Python None and the string "null" with ""
-        # so Streamlit never renders the word "None" in any cell.
-        row = {k: ("" if (v is None or v == "null" or v == "None") else v)
-               for k, v in row.items()}
+        row = {k: _clean_cell(v) for k, v in row.items()}
         return {"row": row, "image_diag": image_diag, "food_diag": food_diag}
 
 
@@ -3259,6 +2996,20 @@ with st.sidebar:
     )
     market_code = market_selection.split("(")[1].replace(")", "")
 
+    # ── Cache management ──────────────────────────────────────────────────────
+    st.divider()
+    st.caption(f"🗃️ Cache: {cache_count()} stored result(s)")
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        if st.button("Clear this market", help=f"Remove cached results for {market_code} only"):
+            _n = cache_clear(market_code)
+            st.success(f"Cleared {_n} entr{'y' if _n == 1 else 'ies'} for {market_code}.")
+    with _c2:
+        if st.button("Clear all", help="Remove ALL cached results (all markets)"):
+            _n = cache_clear()
+            st.success(f"Cleared {_n} cached entr{'y' if _n == 1 else 'ies'}.")
+    st.caption("Tip: prefix a line with `REFRESH ` to force-refresh a single EAN.")
+
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables.")
     if not GO_UPC_KEY:
@@ -3298,7 +3049,15 @@ with st.expander("ℹ️ How to read the results — reliability grades, status 
         "the row is capped at **M** because a name match is weaker than a barcode match. "
         "Common for brand/organic shops that don't publish EANs.\n"
         "Unverified candidates are kept in the hidden *Source Candidates (audit)* column "
-        "(toggle it on above the results table)."
+        "(toggle it on above the results table).\n\n"
+        "**Data Provenance** — where the food data was read from:\n"
+        "- **Verified page / Verified pages** — food fields were read directly from "
+        "the linked Route A/B verified source page(s). Nutrition numbers come only "
+        "from deterministic parsing of those pages.\n"
+        "- **page not readable** — a candidate existed but the plain HTTP fetch could "
+        "not read a usable product page (JS/cookie wall/thin shell). The row is "
+        "blocked as Failed Validation / L.\n"
+        "- **Search failed** — SerpAPI was rate-limited or failed; re-run the row."
     )
 
 ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
@@ -3375,6 +3134,7 @@ if "results_df" in st.session_state:
         "Status",
         "Info Reliability",
         "Link Basis",
+        "Data Provenance",
         "Reliability Reasoning",
         "Chain of Thought",
         "Category L1",
