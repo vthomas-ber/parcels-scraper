@@ -2930,18 +2930,19 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             [u for u in food_srcs if u and _is_displayable_url(u)]))
         srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
 
-        # ── Link Basis — how each shown link was verified (A=EAN, B=name) ────
+        # ── Link Basis — how each shown link was verified (A=EAN, B=name, OFF) ─
         _routes_shown = [food_routes.get(u) for u in _verified_srcs]
         _has_A = "A" in _routes_shown
         _has_B = "B" in _routes_shown
-        if _has_A and _has_B:
-            link_basis = "EAN + Name ⚠️"
-        elif _has_A:
-            link_basis = "EAN-verified"
-        elif _has_B:
-            link_basis = "Name-matched ⚠️"
-        else:
-            link_basis = ""
+        _has_OFF = "OFF" in _routes_shown
+        _lb_parts = []
+        if _has_A:
+            _lb_parts.append("EAN-verified")
+        if _has_OFF:
+            _lb_parts.append("Open Food Facts")
+        if _has_B:
+            _lb_parts.append("Name-matched ⚠️")
+        link_basis = " + ".join(_lb_parts)
 
         # ── Audit candidates: discovered pages that did NOT become sources ───
         _audit_candidates = list(dict.fromkeys(
@@ -2961,15 +2962,23 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             reliability  = food_reliab
             if link_basis == "EAN-verified":
                 reliability_reasoning = (
-                    f"EAN {ean} confirmed on the verified source page(s); food "
+                    f"EAN {ean} confirmed on the verified retailer page(s); food "
                     f"data read directly from {', '.join(_verified_srcs[:2])}.")
+            elif _has_A and _has_OFF:
+                reliability_reasoning = (
+                    f"EAN {ean} confirmed on a retailer page and cross-checked "
+                    f"against Open Food Facts.")
+            elif _has_OFF and not _has_B:
+                reliability_reasoning = (
+                    f"Matched by exact barcode in Open Food Facts (community "
+                    f"database); capped at M — spot-check before upload.")
             elif link_basis.startswith("Name-matched"):
                 reliability_reasoning = (
                     f"Product confirmed by name match (>=80%) on "
                     f"{', '.join(_verified_srcs[:2])}; barcode not on page, so "
                     f"capped at M. Data read from that page.")
             else:
-                reliability_reasoning = "Data read from verified source page(s)."
+                reliability_reasoning = "Data read from verified source(s)."
         else:
             final_status = "Failed Validation"
             reliability  = "L"
@@ -3173,6 +3182,9 @@ with st.expander("ℹ️ How to read the results — reliability grades, status 
         "The food data in the row is read from those same verified pages. "
         "The **Link Basis** column tells you how it was confirmed:\n"
         "- **EAN-verified** — the barcode was found on the page (strongest).\n"
+        "- **Open Food Facts** — matched by exact barcode in the Open Food Facts "
+        "community database (structured data, no scraping). Reliable but community-"
+        "maintained, so it caps the row at **M** — spot-check before upload.\n"
         "- **Name-matched ⚠️** — the page matched the product name (≥80%) but carried no barcode; "
         "the row is capped at **M** because a name match is weaker than a barcode match. "
         "Common for brand/organic shops that don't publish EANs.\n"
@@ -3181,6 +3193,10 @@ with st.expander("ℹ️ How to read the results — reliability grades, status 
         "**Data Provenance** — where the food data was read from:\n"
         "- **Verified page** — every field was read directly from the linked source page(s). "
         "The numbers match the Source columns.\n"
+        "- **Verified page + Open Food Facts** — a retailer page was read and gaps were filled "
+        "from the Open Food Facts database.\n"
+        "- **Open Food Facts (community DB) ⚠️** — data came from Open Food Facts only "
+        "(no readable retailer page). EAN-exact but community-sourced; grades **M**.\n"
         "- **Verified page + fallback ⚠️** — most fields were read from the linked page; a few absent "
         "ones were filled from the barcode registry or a text-only extraction. Those cells are weaker.\n"
         "- **Registry only — page not readable ⚠️** / **Page not readable** — a page was verified as the "
