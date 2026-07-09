@@ -1,66 +1,98 @@
-"""Deterministic verified-page food-data pipeline.
+"""
+food_pipeline.py — deterministic-first food-data extraction (verify-then-read).
 
-This module deliberately does not import Streamlit and does not use Gemini / Google
-Search grounding for food-data discovery. The workflow is:
+This module is INTENTIONALLY SELF-CONTAINED. It does not import from app.py so
+it can be unit-tested in isolation (feed it a session + an EAN and it returns
+structured food data). A handful of small pure helpers and the GOLDMINE /
+exclusion constants are duplicated from app.py on purpose — that duplication is
+the price of isolation. If you change the goldmine list or exclusion tokens in
+app.py, mirror the change here.
 
-1. Resolve registry identity from Go-UPC, then EAN-Search only if Go-UPC is empty.
-2. Discover candidate product pages with SerpAPI using the existing ladder.
-3. Verify pages by Route A (EAN on page) or Route B (>=80% product-name token match
-   against user input / registry name, with no clear weight mismatch).
-4. Read food fields from the verified page HTML only, deterministic first:
-   JSON-LD -> microdata/OpenGraph -> labelled HTML nutrition/attribute tables.
-5. Use Gemini only as an optional no-search fallback for messy free-text fields,
-   fed only the fetched page text.
+Public entry point
+------------------
+    await extract_food_data(session, ean, ground_truth, market,
+                            registry_name, keys,
+                            go_upc_data=None, candidate_pages=None,
+                            ean_verified_hint=False)
+      -> {
+           "fields":        {gemini-style field keys -> value|""},
+           "source_links":  [urls actually read, trust-ordered],
+           "source_routes": {url: "A"|"B"},
+           "provenance":    str,     # for the "Data Provenance" column
+           "reliability":   "H"|"M"|"L",
+           "status":        "success"|"page_not_readable"|"no_source",
+           "name":          str,
+           "ean_verified":  bool,
+           "retailer_urls": [all candidate urls seen],
+           "diagnostics":   [log lines],
+         }
+
+Design rules (per the rebuild brief)
+------------------------------------
+* Verify-then-read is the PRIMARY path. Candidate pages come from the discovery
+  ladder (Tier 1A Go-UPC -> 1B EAN-Search -> Attempt 2 brand -> 2.5 name+EAN ->
+  3 goldmine -> 4 bare-GTIN -> 5 name fallback). In production app.py passes the
+  already-discovered pages via `candidate_pages`; standalone/testing lets the
+  module run the ladder itself.
+* Each candidate is VERIFIED: Route A (EAN in a labelled GTIN context on the
+  page) or Route B (product name >=80% token overlap vs user input OR the
+  registry name, with no conflicting weight). Only verified pages are read.
+* Extraction is DETERMINISTIC-FIRST, in this fallback order:
+      JSON-LD (application/ld+json Product / NutritionInformation / gtin)
+        -> microdata / OpenGraph
+        -> labelled HTML nutrition table.
+  Numbers (nutrition, GTIN, weight) ONLY ever come from the deterministic
+  parser — never from an LLM.
+* Gemini is a LAST-RESORT fallback for messy free-text fields only
+  (ingredients / allergens / may-contain / manufacturer / origin), fed ONLY the
+  fetched page text, temperature 0, "extract only what's present, return null
+  otherwise, do not search."
+* Fields are filled ACROSS the top verified pages: richest / highest-trust
+  source wins per field; genuinely absent fields stay blank.
+* Grading: any readable Route-A page -> H; only Route-B -> M; no readable
+  verified page -> page_not_readable / L (first-pass registry data is kept, not
+  blanked).
 """
 
 from __future__ import annotations
 
 import asyncio
-import html as html_lib
 import json
-import math
 import re
-import time
-from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
-from urllib.parse import urlparse
+from html import unescape
 
 try:
     from bs4 import BeautifulSoup
-    BS4_OK = True
-except Exception:  # pragma: no cover - production dependency guard
-    BeautifulSoup = None  # type: ignore
-    BS4_OK = False
+    _BS4_OK = True
+except ImportError:  # pragma: no cover - defensive; requirements pins bs4
+    _BS4_OK = False
 
+# google-genai is only needed for the free-text fallback. Import lazily so the
+# deterministic parsers (and their tests) work without the SDK present.
 try:
     from google import genai
     from google.genai import types
-    GENAI_OK = True
-except Exception:  # pragma: no cover - optional fallback only
-    genai = None  # type: ignore
-    types = None  # type: ignore
-    GENAI_OK = False
+    _GENAI_OK = True
+except ImportError:  # pragma: no cover
+    _GENAI_OK = False
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/122.0.0.0 Safari/537.36"
-)
 
-MAX_FETCH_BYTES = 900_000
-MAX_CANDIDATES = 18
-MAX_VERIFIED_READS = 6
-NAME_MATCH_THRESHOLD = 0.80
+# ============================================================================
+# CONFIG (kept in sync with app.py — see module docstring)
+# ============================================================================
 
-EXCLUDED_DOMAIN_TOKENS: Tuple[str, ...] = (
-    "amazon.",
-    "ebay.",
-    "openfoodfacts.",
-    "aliexpress.",
-    "alibaba.",
-)
+EXTRACTION_MODEL = "gemini-2.5-flash"
 
-GOLDMINE: Dict[str, str] = {
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+
+# Max verified pages to read and fill across (richest/highest-trust wins).
+MAX_READ_PAGES = 4
+# Max candidate pages to fetch+verify before giving up (keeps HTTP bounded).
+MAX_CANDIDATES = 8
+_NAME_MATCH_THRESHOLD = 0.80
+
+GOLDMINE = {
     "FR": ("site:carrefour.fr OR site:auchan.fr OR site:coursesu.com "
            "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr"),
     "UK": ("site:ocado.com OR site:waitrose.com OR site:asda.com "
@@ -74,7 +106,7 @@ GOLDMINE: Dict[str, str] = {
     "AT": ("site:billa.at OR site:spar.at OR site:gurkerl.at "
            "OR site:hofer.at OR site:mpreis.at"),
     "DK": ("site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk "
-           "OR site:rema1000.dk OR site:coop.dk OR site:salling.dk"),
+           "OR site:coop.dk OR site:salling.dk"),
     "IT": ("site:carrefour.it OR site:conad.it OR site:coop.it "
            "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it"),
     "ES": ("site:carrefour.es OR site:mercadona.es OR site:dia.es "
@@ -84,1234 +116,1136 @@ GOLDMINE: Dict[str, str] = {
 }
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
-GOLDMINE_DOMAINS: Dict[str, Tuple[str, ...]] = {
-    "UK": ("ocado.com", "waitrose.com", "asda.com", "tesco.com", "sainsburys.co.uk", "morrisons.com"),
-    "FR": ("carrefour.fr", "auchan.fr", "coursesu.com", "leclerc.fr", "intermarche.fr", "monoprix.fr"),
-    "IT": ("carrefour.it", "conad.it", "coop.it", "esselunga.it", "eurospin.it", "lidl.it"),
-    "DE": ("rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de", "budni.de", "ecoinform.de"),
-    "NL": ("ah.nl", "jumbo.com", "plus.nl", "dirk.nl"),
-    "BE": ("delhaize.be", "colruyt.be", "carrefour.be", "spar.be", "lidl.be"),
-    "AT": ("billa.at", "spar.at", "gurkerl.at", "hofer.at", "mpreis.at"),
-    "DK": ("nemlig.com", "matsmart.dk", "rema1000.dk", "coop.dk", "salling.dk"),
-    "ES": ("carrefour.es", "mercadona.es", "dia.es", "alcampo.es", "eroski.es", "lidl.es"),
-    "PL": ("carrefour.pl", "auchan.pl", "frisco.pl", "lidl.pl", "kaufland.pl"),
-}
+# Approved / goldmine domains are the "prime read targets" — pages on these
+# rank higher when filling fields across multiple verified pages.
+_GOLDMINE_DOMAINS = frozenset({
+    "ocado.com", "waitrose.com", "asda.com", "tesco.com", "sainsburys.co.uk",
+    "morrisons.com", "carrefour.fr", "auchan.fr", "coursesu.com", "leclerc.fr",
+    "intermarche.fr", "monoprix.fr", "carrefour.it", "conad.it", "coop.it",
+    "esselunga.it", "eurospin.it", "lidl.it", "rewe.de", "edeka.de",
+    "kaufland.de", "dm.de", "rossmann.de", "metro.de", "budni.de",
+    "ecoinform.de", "ah.nl", "jumbo.com", "plus.nl", "dirk.nl", "delhaize.be",
+    "colruyt.be", "carrefour.be", "spar.be", "lidl.be", "billa.at", "spar.at",
+    "gurkerl.at", "hofer.at", "mpreis.at", "nemlig.com", "rema1000.dk",
+    "coop.dk", "salling.dk", "carrefour.es", "mercadona.es", "dia.es",
+    "alcampo.es", "eroski.es", "lidl.es", "carrefour.pl", "auchan.pl",
+    "frisco.pl", "lidl.pl", "kaufland.pl",
+})
 
-# Output field names mirror the previous app.py food schema to keep wiring stable.
-FOOD_FIELDS: Tuple[str, ...] = (
-    "product_name", "brand", "uom", "packaging", "fragile_item",
-    "net_weight", "gross_weight", "organic_product", "net_weight_customer_facing",
-    "ingredients", "allergens", "may_contain", "nutritional_info",
-    "manufacturer_name", "manufacturer_address", "place_of_origin",
-    "organic_certification_id", "energy_kj", "fat_g", "saturates_g",
-    "carbohydrates_g", "sugars_g", "protein_g", "fiber_g", "salt_g",
+_EXCLUDED_DOMAIN_TOKENS = (
+    "amazon.", "ebay.", "openfoodfacts.", "aliexpress.", "alibaba.",
+    "barcodelookup.", "go-upc.",
 )
 
-NUMERIC_FIELDS = {
-    "energy_kj", "fat_g", "saturates_g", "carbohydrates_g", "sugars_g",
-    "protein_g", "fiber_g", "salt_g", "net_weight", "gross_weight",
+_BRAND_STOPWORDS = {
+    "mandorle", "anacardi", "arachidi", "nocciole", "pistacchi", "noci",
+    "mix", "assortiti", "ricoperte", "tostate", "salate", "bio", "organic",
+    "cioccolato", "fondente", "bianco", "latte", "cocco", "yogurt", "limone",
+    "arancia", "fragola", "lampone", "vaniglia", "caramello", "miele",
+    "preparazione", "confezione", "formato", "gusto", "sapore",
+    "preparation", "aromatisation", "saveur", "pour", "avec",
+    "product", "item", "food", "snack", "pack", "bag", "box",
+    "gr", "kg", "ml", "cl", "da", "al", "di", "con", "per",
 }
 
-LLM_FALLBACK_FIELDS: Tuple[str, ...] = (
-    "ingredients", "allergens", "may_contain", "manufacturer_name",
-    "manufacturer_address", "place_of_origin", "organic_certification_id",
-)
-
-NULLISH = {"", "null", "none", "n/a", "na", "-", "–", "—", "tbd", "k.a.", "keine angabe"}
-
-NUTRIENT_LABELS = {
-    "energy_kj": (
-        "energy", "energie", "énergie", "energia", "energía", "energi", "wartość energetyczna",
-    ),
-    "fat_g": (
-        "fat", "fett", "matières grasses", "materias grasas", "grasas", "grassi", "vet", "fedt", "tłuszcz",
-    ),
-    "saturates_g": (
-        "saturates", "saturated fat", "of which saturates", "davon gesättigte", "gesättigte fettsäuren",
-        "dont acides gras saturés", "ácidos grasos saturados", "grassi saturi", "verzadigde vetzuren",
-        "heraf mættede", "kwasy tłuszczowe nasycone",
-    ),
-    "carbohydrates_g": (
-        "carbohydrate", "carbohydrates", "kohlenhydrate", "glucides", "hidratos de carbono", "carboidrati",
-        "koolhydraten", "kulhydrat", "węglowodany",
-    ),
-    "sugars_g": (
-        "sugars", "sugar", "davon zucker", "zucker", "dont sucres", "azúcares", "zuccheri",
-        "suikers", "sukkerarter", "cukry",
-    ),
-    "protein_g": (
-        "protein", "proteins", "eiweiß", "eiweiss", "protéines", "proteínas", "proteine", "eiwitten",
-        "protein", "białko",
-    ),
-    "fiber_g": (
-        "fibre", "fiber", "ballaststoffe", "fibres", "fibra", "vezels", "kostfibre", "błonnik",
-    ),
-    "salt_g": (
-        "salt", "salz", "sel", "sale", "sal", "zout", "sól",
-    ),
-}
-
-LABEL_ALIASES = {
-    "ingredients": (
-        "ingredients", "ingredient", "zutaten", "ingrédients", "ingredientes", "ingredienti", "ingrediënten",
-        "składniki", "ingredienser", "sammansättning",
-    ),
-    "allergens": (
-        "allergens", "allergen", "allergene", "allergènes", "allergeni", "alérgenos", "allergenen",
-        "contains", "enthält", "contient", "contiene", "zawiera",
-    ),
-    "may_contain": (
-        "may contain", "may also contain", "kann enthalten", "kann spuren", "spuren von",
-        "peut contenir", "puede contener", "può contenere", "kan sporen bevatten", "może zawierać",
-    ),
-    "manufacturer_name": (
-        "manufacturer", "producer", "hersteller", "hergestellt von", "fabriquant", "fabricant",
-        "producteur", "produttore", "fabricante", "producent",
-    ),
-    "manufacturer_address": (
-        "manufacturer address", "address", "adresse", "anschrift", "kontakt", "contact", "indirizzo", "dirección", "adres",
-    ),
-    "place_of_origin": (
-        "origin", "country of origin", "place of origin", "herkunft", "ursprung", "origine", "origen", "provenienza", "pochodzenie",
-    ),
-    "net_weight_customer_facing": (
-        "net weight", "net content", "net quantity", "nettofüllmenge", "füllmenge", "inhalt", "poids net",
-        "contenu net", "peso neto", "peso netto", "netto inhoud", "nettogewicht", "massa netto",
-    ),
-    "organic_certification_id": (
-        "organic certification", "bio", "öko", "oekologisch", "eko", "organic", "certification",
-    ),
-}
-
-PACKAGING_PATTERNS = [
-    ("Glass jar", r"\b(glass jar|jar|glas|glasflasche|weckglas)\b"),
-    ("Bottle", r"\b(bottle|flasche|bouteille|botella|bottiglia|fles)\b"),
-    ("Can", r"\b(can|tin|dose|boîte|lata|lattina|blik)\b"),
-    ("Box", r"\b(box|carton|karton|boîte|scatola|doos)\b"),
-    ("Bag", r"\b(bag|pouch|beutel|sachet|sac|bolsa|busta|zak)\b"),
-    ("Wrapper", r"\b(wrapper|wrap|flowpack|barquette|verpackung)\b"),
-    ("Tub", r"\b(tub|cup|becher|pot|vasetto)\b"),
+_GARBAGE_NAME_PATTERNS = [
+    r"upc lookup", r"ninguno", r"^lookup ", r"barcode\s+\d",
+    r"unknown product", r"^no\s+(name|product)", r"^[\d\s#]+$", r"#####",
 ]
 
-ORG_CERT_RE = re.compile(r"\b(?:[A-Z]{2}-)?(?:BIO|ÖKO|OKO|EKO|ECO|ORG)-\d{2,4}\b", re.I)
 
-
-@dataclass
-class CandidatePage:
-    url: str
-    title: str = ""
-    snippet: str = ""
-    attempt: str = ""
-    rank: int = 0
-
-
-@dataclass
-class VerifiedPage:
-    url: str
-    final_url: str
-    route: str  # A or B
-    html: str
-    text: str
-    title: str
-    attempt: str
-    domain: str
-    fields: Dict[str, Any] = field(default_factory=dict)
-    score: int = 0
-    readable: bool = False
-    reason: str = ""
-
+# ============================================================================
+# PURE HELPERS (self-contained copies of app.py utilities)
+# ============================================================================
 
 def _is_excluded_domain(url: str) -> bool:
     if not url:
         return False
     u = url.lower()
-    return any(tok in u for tok in EXCLUDED_DOMAIN_TOKENS)
+    return any(tok in u for tok in _EXCLUDED_DOMAIN_TOKENS)
 
 
-def _domain(url: str) -> str:
-    try:
-        return urlparse(url).netloc.lower().removeprefix("www.")
-    except Exception:
-        return ""
-
-
-def _is_goldmine_domain(url: str, market: str) -> bool:
-    dom = _domain(url)
-    if not dom:
+def barcode_matches(returned: str, queried: str) -> bool:
+    if not returned:
         return False
-    return any(dom == d or dom.endswith("." + d) for d in GOLDMINE_DOMAINS.get(market.upper(), ()))
+    return str(returned).strip().lstrip("0") == str(queried).strip().lstrip("0")
 
 
-def _dedupe_append(candidates: List[CandidatePage], url: str, title: str = "", snippet: str = "", attempt: str = "") -> None:
-    if not url or not url.startswith("http") or _is_excluded_domain(url):
-        return
-    if any(c.url == url for c in candidates):
-        return
-    candidates.append(CandidatePage(url=url, title=title or "", snippet=snippet or "", attempt=attempt, rank=len(candidates)))
+def is_garbage_name(name: str) -> bool:
+    if not name or len(name.strip()) < 3:
+        return True
+    low = name.lower().strip()
+    if low.startswith("http") or "://" in low or "www." in low:
+        return True
+    return any(re.search(p, low) for p in _GARBAGE_NAME_PATTERNS)
 
 
-def _clean_text(text: str) -> str:
+def strip_pack_notation(text: str) -> str:
     if not text:
-        return ""
-    text = html_lib.unescape(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
+        return text
+    text = re.sub(r'\(\s*\d+\s*[Pp]ack[^)]*\)', '', text)
+    text = re.sub(r'\(\s*[Pp]ack\s+of\s+\d+[^)]*\)', '', text)
+    text = re.sub(
+        r'\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?\s*(?:g|gr|kg|ml|cl|l|oz|lb))\b',
+        r'\1', text, flags=re.IGNORECASE)
+    text = re.sub(r',\s*,', ',', text)
+    text = re.sub(r'\s{2,}', ' ', text).strip().strip(',').strip()
+    return text
 
 
-def _soup_text(soup) -> str:
-    for tag in soup(["script", "style", "noscript", "svg"]):
-        tag.decompose()
-    return _clean_text(soup.get_text(" "))
-
-
-def _sig_tokens(s: str) -> set[str]:
-    cleaned = re.sub(r"[^\w\s]", " ", (s or "").lower())
-    return {t for t in cleaned.split() if len(t) > 3 and not t.isdigit()}
-
-
-def _name_match_ratio(anchor: str, text: str) -> float:
-    tokens = _sig_tokens(anchor)
-    if not tokens:
-        return 0.0
-    hay = (text or "").lower()
-    return sum(1 for t in tokens if t in hay) / len(tokens)
-
-
-def _best_name_ratio(anchors: Sequence[str], text: str) -> float:
-    return max((_name_match_ratio(a, text) for a in anchors if a), default=0.0)
-
-
-def _strip_pack_notation(text: str) -> str:
-    if not text:
-        return ""
-    # 4x200ml -> keep 200ml, remove pack count noise.
-    text = re.sub(r"\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?\s*(?:g|gr|kg|ml|cl|l|oz|lb))\b", r"\1", text)
-    text = re.sub(r"\((?:\d+\s*)?(?:pack|pcs?|pieces|st(?:ück)?|x)\)", " ", text, flags=re.I)
-    return _clean_text(text)
-
-
-def _extract_brand(ground_truth: str) -> str:
+def extract_brand(ground_truth: str) -> str:
     if not ground_truth:
         return ""
-    cleaned = _strip_pack_notation(ground_truth)
-    tokens = cleaned.split()
-    stop = {"the", "and", "with", "for", "bio", "organic", "vegan", "gluten", "free"}
-    usable = []
-    for t in tokens[:3]:
-        bare = re.sub(r"[^A-Za-zÀ-ž0-9&'-]", "", t)
-        if len(bare) < 2 or bare.lower() in stop or re.search(r"\d", bare):
+    for token in ground_truth.split():
+        clean = token.strip(".,;:()-/")
+        if len(clean) < 3 or not clean[0].isupper():
             continue
-        usable.append(bare)
-    return usable[0] if usable else ""
+        if clean.lower() in _BRAND_STOPWORDS or clean.replace(".", "").isdigit():
+            continue
+        return clean
+    return ""
 
 
-def _brand_matches_domain(brand: str, domain: str) -> bool:
+def brand_matches_domain(brand: str, domain: str) -> bool:
     if not brand or not domain:
         return False
     b = re.sub(r"[^a-z0-9]", "", brand.lower())
-    d = re.sub(r"[^a-z0-9]", "", domain.lower())
-    return len(b) >= 3 and b in d
+    d = re.sub(r"[^a-z0-9.]", "", domain.lower())
+    return len(b) >= 4 and b in d
 
 
-def _ean_variants(ean: str) -> set[str]:
-    e = str(ean or "").strip()
-    stripped = e.lstrip("0") or e
-    return {v for v in {e, stripped, e.zfill(12), e.zfill(13), e.zfill(14)} if v}
+def _sig_tokens(s: str) -> set:
+    if not s:
+        return set()
+    return {t for t in re.sub(r"[^\w\s]", " ", s.lower()).split() if len(t) > 3}
 
 
-def barcode_matches(returned_barcode: str, queried_ean: str) -> bool:
-    if not returned_barcode or not queried_ean:
-        return False
-    return str(returned_barcode).strip().lstrip("0") == str(queried_ean).strip().lstrip("0")
+def _name_match_ratio(anchor: str, text: str) -> float:
+    a = _sig_tokens(anchor)
+    if not a:
+        return 0.0
+    hay = text.lower()
+    return sum(1 for t in a if t in hay) / len(a)
 
 
-def _extract_weight_hint(text: str) -> Optional[Tuple[float, str, str]]:
-    """Return normalized (amount, unit, display) where unit is g or ml."""
+def _best_name_ratio(anchors: list, text: str) -> float:
+    return max((_name_match_ratio(a, text) for a in anchors if a), default=0.0)
+
+
+def extract_weight_hint(text: str) -> str:
     if not text:
-        return None
-    m = re.search(r"\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?)\s*(kg|g|gr|ml|cl|l|oz|lb)\b", text, re.I)
-    if not m:
-        m = re.search(r"\b(\d+(?:[.,]\d+)?)\s*(kg|g|gr|ml|cl|l|oz|lb)\b", text, re.I)
-    if not m:
-        return None
-    amount = float(m.group(1).replace(",", "."))
-    unit_raw = m.group(2).lower()
-    unit = "g"
-    if unit_raw == "kg":
-        amount *= 1000
-        unit = "g"
-    elif unit_raw in ("g", "gr"):
-        unit = "g"
-    elif unit_raw == "l":
-        amount *= 1000
-        unit = "ml"
-    elif unit_raw == "cl":
-        amount *= 10
-        unit = "ml"
-    elif unit_raw == "ml":
-        unit = "ml"
-    elif unit_raw == "oz":
-        amount *= 28.3495
-        unit = "g"
-    elif unit_raw == "lb":
-        amount *= 453.592
-        unit = "g"
-    amount = round(amount, 2)
-    display = f"{int(amount) if amount.is_integer() else amount:g}{unit}"
-    return amount, unit, display
+        return ""
+    m = re.search(r'\b\d+\s*[xX×]\s*(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|cl|l|oz|lb)\b',
+                  text, re.IGNORECASE)
+    if m:
+        return f"{m.group(1)}{m.group(2).lower()}"
+    m = re.search(r'\b(\d+(?:[.,]\d+)?)\s*(g|gr|kg|ml|cl|l|oz|lb)\b',
+                  text, re.IGNORECASE)
+    return f"{m.group(1)}{m.group(2).lower()}" if m else ""
 
 
-def _weights_conflict(anchors: Sequence[str], identity_text: str, body_text: str = "") -> bool:
-    page_w = _extract_weight_hint(identity_text) or _extract_weight_hint(body_text[:3000])
-    if not page_w:
+def _weights_conflict(anchors: list, text: str) -> bool:
+    tw = extract_weight_hint(text)
+    if not tw:
         return False
-    for anchor in anchors:
-        aw = _extract_weight_hint(anchor)
-        if not aw:
-            continue
-        if aw[1] != page_w[1]:
-            return True
-        # Allow 15% tolerance for rounding / customer-facing formatting.
-        base = max(abs(aw[0]), 1.0)
-        if abs(aw[0] - page_w[0]) / base > 0.15:
+    for a in anchors:
+        aw = extract_weight_hint(a)
+        if aw and aw != tw:
             return True
     return False
 
 
-def _real_value(v: Any) -> bool:
-    if v is None:
-        return False
-    if isinstance(v, (int, float)):
-        return not (isinstance(v, float) and math.isnan(v))
-    s = str(v).strip()
-    return bool(s) and s.lower() not in NULLISH
+def _domain_of(url: str) -> str:
+    return url.split("/")[2] if url.startswith("http") and "/" in url[8:] else \
+        (url.split("/")[2] if url.startswith("http") else "")
 
 
-def _to_str(v: Any) -> str:
-    if isinstance(v, list):
-        return ", ".join(_to_str(x) for x in v if _real_value(x))
-    if isinstance(v, dict):
-        if _real_value(v.get("name")):
-            return _to_str(v.get("name"))
-        return _clean_text(" ".join(f"{k}: {_to_str(val)}" for k, val in v.items() if _real_value(val)))
-    return _clean_text(str(v)) if _real_value(v) else ""
+def _is_goldmine(url: str) -> bool:
+    dom = _domain_of(url)
+    return any(dom == g or dom.endswith("." + g) for g in _GOLDMINE_DOMAINS)
 
 
-def _parse_number(value: Any, prefer_kj: bool = False) -> str:
-    if value is None:
-        return ""
-    s = _to_str(value)
+def _result_matches_gt(res: dict, ground_truth: str) -> bool:
+    if not ground_truth:
+        return True
+    gt = _sig_tokens(ground_truth)
+    if not gt:
+        return True
+    hay = (res.get("title", "") + " " + res.get("snippet", "")).lower()
+    return sum(1 for t in gt if t in hay) / len(gt) >= 0.3
+
+
+# ============================================================================
+# NUMBER / UNIT PARSING
+# ============================================================================
+
+def _to_float(raw) -> float | None:
+    """Parse a European or English decimal number out of a messy string."""
+    if raw is None:
+        return None
+    s = str(raw).strip()
     if not s:
+        return None
+    m = re.search(r'(\d[\d.\s]*[.,]?\d*)', s.replace("\xa0", " "))
+    if not m:
+        return None
+    num = m.group(1).replace(" ", "")
+    # If both separators present, the last one is the decimal separator.
+    if "," in num and "." in num:
+        if num.rfind(",") > num.rfind("."):
+            num = num.replace(".", "").replace(",", ".")
+        else:
+            num = num.replace(",", "")
+    elif "," in num:
+        # Comma as decimal separator (EU) unless it's clearly a thousands group.
+        if re.fullmatch(r'\d{1,3}(,\d{3})+', num):
+            num = num.replace(",", "")
+        else:
+            num = num.replace(",", ".")
+    elif "." in num:
+        # Dot may be an EU thousands separator ("1.980" -> 1980) rather than a
+        # decimal point. Treat as thousands ONLY when it matches the strict
+        # grouped pattern; "18.5" / "1.5" keep the dot as a decimal point.
+        if re.fullmatch(r'\d{1,3}(\.\d{3})+', num):
+            num = num.replace(".", "")
+    try:
+        return float(num)
+    except ValueError:
+        return None
+
+
+def _fmt_num(v: float | None) -> str:
+    if v is None:
         return ""
-    if prefer_kj:
-        m_kj = re.search(r"([<>~≈]?\s*\d+(?:[.,]\d+)?)\s*k\s*j\b", s, re.I)
-        if m_kj:
-            return m_kj.group(1).replace(" ", "").replace(",", ".")
-        # Deliberately do not convert kcal to kJ; the requested field is kJ and
-        # food numbers should come from the source, not an inferred conversion.
+    if abs(v - round(v)) < 1e-9:
+        return str(int(round(v)))
+    return f"{v:.2f}".rstrip("0").rstrip(".")
+
+
+def _energy_to_kj(raw) -> str:
+    """Return energy as kJ. Accepts kJ directly, or kcal (converts *4.184)."""
+    if raw is None:
         return ""
-    m = re.search(r"([<>~≈]?\s*\d+(?:[.,]\d+)?)", s)
-    return m.group(1).replace(" ", "").replace(",", ".") if m else ""
+    s = str(raw).lower()
+    val = _to_float(s)
+    if val is None:
+        return ""
+    if "kj" in s:
+        return _fmt_num(val)
+    if "kcal" in s or "cal" in s:
+        return _fmt_num(val * 4.184)
+    # Ambiguous bare number: a value >400 is almost certainly already kJ for a
+    # per-100 basis; smaller values are likely kcal. This only fires when the
+    # source gave no unit at all.
+    return _fmt_num(val if val > 400 else val * 4.184)
 
 
-def _parse_weight_to_fields(text: str) -> Dict[str, str]:
-    out: Dict[str, str] = {}
-    w = _extract_weight_hint(text)
-    if w:
-        out["net_weight"] = f"{int(w[0]) if float(w[0]).is_integer() else w[0]:g}"
-        out["uom"] = w[1]
-        out["net_weight_customer_facing"] = w[2]
-    return out
+def _sodium_to_salt(raw) -> str:
+    """schema.org sodiumContent -> salt (g). salt = sodium * 2.5."""
+    if raw is None:
+        return ""
+    s = str(raw).lower()
+    val = _to_float(s)
+    if val is None:
+        return ""
+    if "mg" in s:            # mg -> g
+        val = val / 1000.0
+    return _fmt_num(val * 2.5)
 
 
-async def _serp_get(session, serp_key: str, query: str, market: str, timeout: int = 15) -> Dict[str, Any]:
-    if not serp_key or not query:
-        return {}
-    try:
-        async with session.get(
-            "https://serpapi.com/search",
-            params={"q": query, "gl": market.lower(), "api_key": serp_key},
-            timeout=timeout,
-            headers={"User-Agent": USER_AGENT},
-        ) as resp:
-            if resp.status == 200:
-                return await resp.json()
-            return {"_error": resp.status}
-    except Exception as exc:
-        return {"_error": str(exc)}
+# Canonical nutrition field keys used across the module (== app.py row/data keys)
+_NUTRI_KEYS = ("energy_kj", "fat_g", "saturates_g", "carbohydrates_g",
+               "sugars_g", "protein_g", "fiber_g", "salt_g")
+_TEXT_KEYS = ("ingredients", "allergens", "may_contain",
+              "manufacturer_name", "manufacturer_address", "place_of_origin")
+_OTHER_KEYS = ("brand", "net_weight", "gross_weight", "nutritional_info",
+               "organic_certification_id")
+ALL_FIELD_KEYS = _NUTRI_KEYS + _TEXT_KEYS + _OTHER_KEYS
 
 
-async def _fetch_go_upc(session, ean: str, go_upc_key: str) -> Optional[Dict[str, Any]]:
-    if not go_upc_key:
-        return None
-    try:
-        async with session.get(
-            f"https://go-upc.com/api/v1/code/{ean}",
-            headers={"Authorization": f"Bearer {go_upc_key}", "User-Agent": USER_AGENT},
-            timeout=10,
-        ) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            if not barcode_matches(str(data.get("code", "")), ean):
-                return None
-            product = data.get("product") or {}
-            if not product:
-                return None
-            return {
-                "name": product.get("name") or "",
-                "brand": product.get("brand") or "",
-                "description": product.get("description") or "",
-                "ingredients": ((product.get("ingredients") or {}).get("text", "")
-                                if isinstance(product.get("ingredients"), dict) else ""),
-                "category": product.get("category") or "",
-                "category_path": product.get("categoryPath") or [],
-                "specs": dict(product.get("specs") or []),
-            }
-    except Exception:
-        return None
+def _blank_fields() -> dict:
+    return {k: "" for k in ALL_FIELD_KEYS}
 
 
-async def _fetch_ean_search(session, ean: str, token: str) -> Optional[Dict[str, Any]]:
-    if not token:
-        return None
-    try:
-        url = f"https://api.ean-search.org/api?token={token}&op=barcode-lookup&ean={ean}&format=json"
-        async with session.get(url, timeout=7, headers={"User-Agent": USER_AGENT}) as resp:
-            if resp.status != 200:
-                return None
-            data = await resp.json()
-            if not data or not isinstance(data, list) or "error" in data[0]:
-                return None
-            item = data[0]
-            returned = str(item.get("barcode", item.get("ean", "")))
-            if not barcode_matches(returned, ean):
-                return None
-            return {"name": item.get("name", ""), "brand": item.get("categoryName", ""), "image": item.get("image", "")}
-    except Exception:
-        return None
+# ============================================================================
+# DETERMINISTIC PARSER 1 — JSON-LD  (application/ld+json)
+# ============================================================================
 
-
-def _organic_results(data: Dict[str, Any]) -> List[Dict[str, Any]]:
-    if not data or not isinstance(data, dict):
-        return []
-    return [r for r in data.get("organic_results", []) if isinstance(r, dict)]
-
-
-async def _discover_candidates(
-    session,
-    ean: str,
-    ground_truth: str,
-    market: str,
-    registry_name: str,
-    serp_key: str,
-    diag: List[str],
-) -> List[CandidatePage]:
-    candidates: List[CandidatePage] = []
-    clean_gt = _strip_pack_notation(ground_truth) if ground_truth else ""
-    anchor_name = registry_name or clean_gt
-    brand = _extract_brand(clean_gt or registry_name)
-
-    # Attempt 2: brand-site lookup.
-    if serp_key and brand:
-        diag.append(f"🔍 Attempt 2 brand-site query: {brand} + EAN")
-        data = await _serp_get(session, serp_key, f"{brand} {ean}", market)
-        if data.get("_error"):
-            diag.append(f"❌ SERP_FAILED Attempt 2: {data.get('_error')}")
-        for i, res in enumerate(_organic_results(data)[:6]):
-            link = res.get("link", "")
-            if _brand_matches_domain(brand, _domain(link)):
-                _dedupe_append(candidates, link, res.get("title", ""), res.get("snippet", ""), "Attempt 2 brand-site")
-        # Keep non-marketplace top brand query results as candidates too; some brand domains
-        # do not contain the exact brand token in the host (e.g. parent-company sites).
-        for i, res in enumerate(_organic_results(data)[:4]):
-            _dedupe_append(candidates, res.get("link", ""), res.get("title", ""), res.get("snippet", ""), "Attempt 2 brand-site")
-
-    # Attempt 2.5: combined name + EAN query.
-    if serp_key and (clean_gt or registry_name):
-        q_name = clean_gt or registry_name
-        diag.append("🔍 Attempt 2.5 combined name + EAN query")
-        data = await _serp_get(session, serp_key, f"{q_name} {ean}", market)
-        if data.get("_error"):
-            diag.append(f"❌ SERP_FAILED Attempt 2.5: {data.get('_error')}")
-        for res in _organic_results(data)[:8]:
-            _dedupe_append(candidates, res.get("link", ""), res.get("title", ""), res.get("snippet", ""), "Attempt 2.5 name+EAN")
-
-    # Attempt 3: goldmine tier-1 retailers, prioritized as read targets.
-    if serp_key:
-        goldmine = f"{GOLDMINE.get(market.upper(), '')} OR {GLOBAL_SITES}".strip(" OR")
-        if goldmine:
-            diag.append("🔍 Attempt 3 goldmine/tier-1 retailers")
-            data = await _serp_get(session, serp_key, f"{goldmine} {ean}", market)
-            if data.get("_error"):
-                diag.append(f"❌ SERP_FAILED Attempt 3: {data.get('_error')}")
-            for res in _organic_results(data)[:10]:
-                _dedupe_append(candidates, res.get("link", ""), res.get("title", ""), res.get("snippet", ""), "Attempt 3 goldmine")
-
-    # Attempt 4: bare GTIN.
-    if serp_key:
-        diag.append("🔍 Attempt 4 bare-GTIN fallback")
-        data = await _serp_get(session, serp_key, str(ean), market)
-        if data.get("_error"):
-            diag.append(f"❌ SERP_FAILED Attempt 4: {data.get('_error')}")
-        for res in _organic_results(data)[:8]:
-            # Keep relevance guard when user supplied a name; verification still happens on page.
-            hay = f"{res.get('title', '')} {res.get('snippet', '')}"
-            if clean_gt and _best_name_ratio([clean_gt], hay) < 0.30 and str(ean) not in hay:
-                continue
-            _dedupe_append(candidates, res.get("link", ""), res.get("title", ""), res.get("snippet", ""), "Attempt 4 bare-GTIN")
-
-    # Attempt 5: name-based fallback.
-    if serp_key and (clean_gt or registry_name):
-        q_name = clean_gt or registry_name
-        diag.append("🔍 Attempt 5 name-based fallback")
-        queries = []
-        goldmine = GOLDMINE.get(market.upper(), "").strip()
-        if goldmine:
-            queries.append(f'{goldmine} "{q_name}"')
-        queries.append(f'"{q_name}"')
-        for q in queries:
-            data = await _serp_get(session, serp_key, q, market)
-            if data.get("_error"):
-                diag.append(f"❌ SERP_FAILED Attempt 5: {data.get('_error')}")
-            for res in _organic_results(data)[:8]:
-                _dedupe_append(candidates, res.get("link", ""), res.get("title", ""), res.get("snippet", ""), "Attempt 5 name fallback")
-            if len(candidates) >= MAX_CANDIDATES:
-                break
-
-    # Prime goldmine read targets inside the same discovery order by sorting only within
-    # comparable rank bands: market tier-1 pages beat generic pages from the same ladder depth.
-    candidates.sort(key=lambda c: (c.rank // 10, 0 if _is_goldmine_domain(c.url, market) else 1, c.rank))
-    return candidates[:MAX_CANDIDATES]
-
-
-async def _fetch_html(session, url: str) -> Tuple[str, str]:
-    try:
-        async with session.get(
-            url,
-            headers={"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"},
-            timeout=12,
-            allow_redirects=True,
-        ) as resp:
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if resp.status >= 400:
-                return "", str(resp.url)
-            raw = await resp.content.read(MAX_FETCH_BYTES)
-            if raw and ("text" in ctype or "html" in ctype or not ctype):
-                return raw.decode("utf-8", errors="ignore"), str(resp.url)
-            return raw.decode("utf-8", errors="ignore"), str(resp.url)
-    except Exception:
-        return "", url
-
-
-def _iter_jsonld_objects(obj: Any) -> Iterable[Dict[str, Any]]:
-    if isinstance(obj, dict):
-        if "@graph" in obj:
-            yield from _iter_jsonld_objects(obj.get("@graph"))
-        yield obj
-        for v in obj.values():
-            if isinstance(v, (dict, list)):
-                yield from _iter_jsonld_objects(v)
-    elif isinstance(obj, list):
-        for item in obj:
-            yield from _iter_jsonld_objects(item)
-
-
-def _jsonld_blocks(soup) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    for script in soup.find_all("script", attrs={"type": re.compile(r"ld\+json", re.I)}):
-        raw = script.string or script.get_text(" ")
-        raw = (raw or "").strip()
-        if not raw:
+def _iter_jsonld_objects(html: str):
+    """Yield every dict found in <script type=application/ld+json> blocks,
+    flattening @graph and lists."""
+    for m in re.finditer(
+        r'<script[^>]*type=[\'"]application/ld\+json[\'"][^>]*>(.*?)</script>',
+        html, re.S | re.I
+    ):
+        block = m.group(1).strip()
+        if not block:
             continue
         try:
-            parsed = json.loads(raw)
+            data = json.loads(block)
         except Exception:
-            # Some sites stuff multiple JSON objects or HTML entities into scripts.
-            cleaned = html_lib.unescape(raw)
+            # Some sites emit multiple JSON objects concatenated or with stray
+            # trailing commas; try a lenient salvage of the first {...}.
             try:
-                parsed = json.loads(cleaned)
+                data = json.loads(re.search(r"\{.*\}", block, re.S).group(0))
             except Exception:
                 continue
-        out.extend([o for o in _iter_jsonld_objects(parsed) if isinstance(o, dict)])
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            item = stack.pop()
+            if isinstance(item, list):
+                stack.extend(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            if "@graph" in item and isinstance(item["@graph"], list):
+                stack.extend(item["@graph"])
+            yield item
+
+
+def _type_matches(item: dict, wanted: str) -> bool:
+    t = item.get("@type", "")
+    if isinstance(t, list):
+        return any(wanted.lower() == str(x).lower() for x in t)
+    return str(t).lower() == wanted.lower()
+
+
+def parse_jsonld(html: str, ean: str = "") -> dict:
+    """Extract product/nutrition fields from JSON-LD. Numbers only from here."""
+    out = _blank_fields()
+    gtins = set()
+    nutrition_obj = None
+    product = None
+
+    for item in _iter_jsonld_objects(html):
+        # Collect GTINs from any object.
+        for gk in ("gtin", "gtin8", "gtin12", "gtin13", "gtin14", "sku", "mpn"):
+            if item.get(gk):
+                gtins.add(re.sub(r"\D", "", str(item[gk])))
+        if _type_matches(item, "Product") and product is None:
+            product = item
+        if _type_matches(item, "NutritionInformation"):
+            nutrition_obj = item
+
+    if product is not None:
+        # brand
+        b = product.get("brand")
+        if isinstance(b, dict):
+            b = b.get("name", "")
+        if b and not is_garbage_name(str(b)):
+            out["brand"] = str(b).strip()
+        # weight / size
+        for wk in ("weight", "size"):
+            wv = product.get(wk)
+            if isinstance(wv, dict):
+                wv = wv.get("value") or wv.get("name")
+            if wv:
+                nw = _to_float(wv)
+                if nw is not None:
+                    out["net_weight"] = _fmt_num(nw)
+                    break
+        # country of origin
+        origin = product.get("countryOfOrigin")
+        if isinstance(origin, dict):
+            origin = origin.get("name", "")
+        if origin:
+            out["place_of_origin"] = str(origin).strip()
+        # manufacturer
+        man = product.get("manufacturer")
+        if isinstance(man, dict):
+            if man.get("name"):
+                out["manufacturer_name"] = str(man["name"]).strip()
+            addr = man.get("address")
+            if isinstance(addr, dict):
+                parts = [addr.get(k, "") for k in
+                         ("streetAddress", "postalCode", "addressLocality",
+                          "addressCountry")]
+                addr = ", ".join(p for p in parts if p)
+            if addr:
+                out["manufacturer_address"] = str(addr).strip()
+        elif isinstance(man, str) and man:
+            out["manufacturer_name"] = man.strip()
+        # ingredients may live under a few nonstandard keys
+        for ik in ("ingredients", "recipeIngredient"):
+            iv = product.get(ik)
+            if isinstance(iv, list):
+                iv = ", ".join(str(x) for x in iv)
+            if iv and len(str(iv)) > 5:
+                out["ingredients"] = _clean_text(str(iv))
+                break
+        # nutrition attached to the product
+        if nutrition_obj is None and isinstance(product.get("nutrition"), dict):
+            nutrition_obj = product["nutrition"]
+
+    if isinstance(nutrition_obj, dict):
+        _apply_schema_nutrition(nutrition_obj, out)
+
+    if gtins:
+        out["_gtins"] = gtins  # internal; used for Route-A confirmation
     return out
 
 
-def _object_type(obj: Dict[str, Any]) -> str:
-    t = obj.get("@type", "")
-    if isinstance(t, list):
-        return " ".join(str(x) for x in t).lower()
-    return str(t).lower()
-
-
-def _extract_identity_text(soup, jsonld: List[Dict[str, Any]], fallback_title: str = "") -> str:
-    bits: List[str] = []
-    for obj in jsonld:
-        if "product" in _object_type(obj):
-            bits.extend([_to_str(obj.get("name")), _to_str(obj.get("brand")), _to_str(obj.get("description"))[:200]])
-    for sel in [
-        ("meta", {"property": "og:title"}),
-        ("meta", {"name": "twitter:title"}),
-        ("meta", {"property": "og:description"}),
-    ]:
-        tag = soup.find(sel[0], attrs=sel[1])
-        if tag and tag.get("content"):
-            bits.append(tag.get("content"))
-    if soup.title and soup.title.string:
-        bits.append(soup.title.string)
-    h1 = soup.find("h1")
-    if h1:
-        bits.append(h1.get_text(" "))
-    if fallback_title:
-        bits.append(fallback_title)
-    return _clean_text(" ".join(x for x in bits if x))
-
-
-def _html_contains_ean(html: str, jsonld: List[Dict[str, Any]], ean: str) -> bool:
-    variants = _ean_variants(ean)
-    # Structured GTIN keys.
-    for obj in jsonld:
-        for key, val in obj.items():
-            if str(key).lower().startswith("gtin") or str(key).lower() in {"barcode", "ean", "upc", "sku"}:
-                if any(barcode_matches(_to_str(val), v) or v in _to_str(val) for v in variants):
-                    return True
-    # Labeled or bare occurrence in fetched page. Route A is defined as EAN present on page.
-    for v in variants:
-        if not v:
-            continue
-        if re.search(rf"(ean|gtin|barcode|strichcode|streepjescode|upc|codice\s*a\s*barre|c[oó]digo\s*de\s*barras)[^0-9]{{0,50}}0*{re.escape(v.lstrip('0'))}", html, re.I):
-            return True
-        if v in html:
-            return True
-    return False
-
-
-def _page_title(soup, fallback: str = "") -> str:
-    for attrs in ({"property": "og:title"}, {"name": "twitter:title"}):
-        tag = soup.find("meta", attrs=attrs)
-        if tag and tag.get("content"):
-            return _clean_text(tag.get("content"))
-    if soup.title and soup.title.string:
-        return _clean_text(soup.title.string)
-    h1 = soup.find("h1")
-    if h1:
-        return _clean_text(h1.get_text(" "))
-    return fallback or ""
-
-
-async def _verify_candidate(session, cand: CandidatePage, ean: str, anchors: Sequence[str]) -> Optional[VerifiedPage]:
-    if not BS4_OK:
-        return None
-    html, final_url = await _fetch_html(session, cand.url)
-    if not html or len(html) < 200:
-        return None
-    soup = BeautifulSoup(html, "html.parser")
-    jsonld = _jsonld_blocks(soup)
-    title = _page_title(soup, cand.title)
-    identity = _extract_identity_text(soup, jsonld, cand.title)
-    text = _soup_text(BeautifulSoup(html, "html.parser"))
-
-    route = None
-    reason = ""
-    if _html_contains_ean(html, jsonld, ean):
-        route = "A"
-        reason = "EAN present on page"
-    else:
-        ratio = _best_name_ratio(anchors, identity)
-        if ratio >= NAME_MATCH_THRESHOLD and not _weights_conflict(anchors, identity, text):
-            route = "B"
-            reason = f"name token match {ratio:.0%}, no weight conflict"
-
-    if not route:
-        return None
-    readable = len(text) >= 500 or bool(jsonld)
-    return VerifiedPage(
-        url=cand.url,
-        final_url=final_url,
-        route=route,
-        html=html,
-        text=text[:50000],
-        title=title,
-        attempt=cand.attempt,
-        domain=_domain(final_url or cand.url),
-        readable=readable,
-        reason=reason,
-    )
-
-
-def _set_field(fields: Dict[str, Any], key: str, value: Any) -> None:
-    if key not in FOOD_FIELDS:
-        return
-    if not _real_value(value):
-        return
-    if key in NUMERIC_FIELDS:
-        val = _parse_number(value, prefer_kj=(key == "energy_kj")) if key != "net_weight" and key != "gross_weight" else _parse_number(value)
-        if not val:
-            return
-        fields[key] = val
-    else:
-        fields[key] = _to_str(value)
-
-
-def _extract_from_jsonld(soup, html: str) -> Dict[str, Any]:
-    jsonld = _jsonld_blocks(soup)
-    fields: Dict[str, Any] = {}
-    for obj in jsonld:
-        typ = _object_type(obj)
-        if "product" not in typ and "nutrition" not in typ:
-            continue
-        if "product" in typ:
-            _set_field(fields, "product_name", obj.get("name"))
-            _set_field(fields, "brand", obj.get("brand"))
-            _set_field(fields, "ingredients", obj.get("ingredients") or obj.get("ingredient"))
-            _set_field(fields, "manufacturer_name", obj.get("manufacturer"))
-            _set_field(fields, "place_of_origin", obj.get("countryOfOrigin") or obj.get("areaServed"))
-            weight_candidate = obj.get("weight") or obj.get("size") or obj.get("netWeight")
-            if _real_value(weight_candidate):
-                fields.update(_parse_weight_to_fields(_to_str(weight_candidate)))
-            for prop in obj.get("additionalProperty", []) if isinstance(obj.get("additionalProperty"), list) else []:
-                pname = _to_str(prop.get("name") if isinstance(prop, dict) else "").lower()
-                pval = prop.get("value") if isinstance(prop, dict) else None
-                if any(x in pname for x in ("ingredient", "zutaten", "ingrédients")):
-                    _set_field(fields, "ingredients", pval)
-                elif any(x in pname for x in ("allergen", "contains", "enthält")):
-                    _set_field(fields, "allergens", pval)
-                elif any(x in pname for x in ("net", "weight", "inhalt", "füllmenge", "content")):
-                    fields.update(_parse_weight_to_fields(_to_str(pval)))
-                elif "origin" in pname or "herkunft" in pname or "origine" in pname:
-                    _set_field(fields, "place_of_origin", pval)
-            nutrition = obj.get("nutrition")
-            if isinstance(nutrition, dict):
-                _extract_nutrition_object(nutrition, fields)
-        if "nutrition" in typ:
-            _extract_nutrition_object(obj, fields)
-    return fields
-
-
-def _extract_nutrition_object(n: Dict[str, Any], fields: Dict[str, Any]) -> None:
+def _apply_schema_nutrition(n: dict, out: dict) -> None:
+    """Map schema.org NutritionInformation onto canonical nutrition keys."""
+    energy = n.get("calories") or n.get("energy")
+    if energy:
+        out["energy_kj"] = _energy_to_kj(energy)
     mapping = {
-        "energy_kj": ("energyContent", "calories"),
-        "fat_g": ("fatContent",),
-        "saturates_g": ("saturatedFatContent",),
-        "carbohydrates_g": ("carbohydrateContent",),
-        "sugars_g": ("sugarContent",),
-        "protein_g": ("proteinContent",),
-        "fiber_g": ("fiberContent",),
-        "salt_g": ("saltContent",),
-    }
-    for out_key, keys in mapping.items():
-        for k in keys:
-            if k in n:
-                _set_field(fields, out_key, n.get(k))
-                break
-    serving = n.get("servingSize") or n.get("servingSizeDescription")
-    if _real_value(serving):
-        _set_field(fields, "nutritional_info", f"per {serving}")
-
-
-def _extract_microdata_opengraph(soup) -> Dict[str, Any]:
-    fields: Dict[str, Any] = {}
-    # OpenGraph / Twitter / product metas.
-    meta_map = {
-        "og:title": "product_name",
-        "twitter:title": "product_name",
-        "product:brand": "brand",
-        "og:description": "ingredients",  # only accepted later if label parser cannot do better; weak but deterministic text.
-    }
-    for prop, key in meta_map.items():
-        tag = soup.find("meta", attrs={"property": prop}) or soup.find("meta", attrs={"name": prop})
-        if tag and tag.get("content"):
-            val = tag.get("content")
-            if key == "ingredients" and not re.search(r"ingredients|zutaten|ingrédients|ingredientes|ingredienti", val, re.I):
-                continue
-            _set_field(fields, key, val)
-
-    itemprop_map = {
-        "name": "product_name",
-        "brand": "brand",
-        "manufacturer": "manufacturer_name",
-        "ingredients": "ingredients",
-        "ingredient": "ingredients",
-        "weight": "net_weight_customer_facing",
-        "netWeight": "net_weight_customer_facing",
         "fatContent": "fat_g",
         "saturatedFatContent": "saturates_g",
         "carbohydrateContent": "carbohydrates_g",
         "sugarContent": "sugars_g",
         "proteinContent": "protein_g",
         "fiberContent": "fiber_g",
-        "saltContent": "salt_g",
-        "energyContent": "energy_kj",
-        "calories": "energy_kj",
+        "fibreContent": "fiber_g",
     }
-    for tag in soup.find_all(attrs={"itemprop": True}):
-        prop = tag.get("itemprop")
-        key = itemprop_map.get(prop)
-        if not key:
+    for sk, ck in mapping.items():
+        if n.get(sk) not in (None, ""):
+            val = _to_float(n[sk])
+            if val is not None:
+                out[ck] = _fmt_num(val)
+    # salt: prefer an explicit salt field, else derive from sodium.
+    if n.get("saltContent") not in (None, ""):
+        v = _to_float(n["saltContent"])
+        if v is not None:
+            out["salt_g"] = _fmt_num(v)
+    elif n.get("sodiumContent") not in (None, ""):
+        out["salt_g"] = _sodium_to_salt(n["sodiumContent"])
+    serving = n.get("servingSize")
+    if serving:
+        out["nutritional_info"] = f"per {str(serving).strip()}"
+
+
+# ============================================================================
+# DETERMINISTIC PARSER 2 — microdata / OpenGraph
+# ============================================================================
+
+def parse_microdata_og(html: str) -> dict:
+    """Cheap identity/brand/GTIN signals from itemprop + OpenGraph meta tags."""
+    out = _blank_fields()
+    gtins = set()
+
+    for m in re.finditer(
+        r'itemprop=[\'"](gtin\d*|sku|mpn)[\'"][^>]*content=[\'"]([^\'"]+)',
+        html, re.I):
+        gtins.add(re.sub(r"\D", "", m.group(2)))
+    # itemprop on visible elements (value in text is harder; grab content attr)
+    m = re.search(r'itemprop=[\'"]brand[\'"][^>]*content=[\'"]([^\'"]+)', html, re.I)
+    if m and not is_garbage_name(m.group(1)):
+        out["brand"] = m.group(1).strip()
+
+    og_title = _meta(html, "og:title")
+    og_desc = _meta(html, "og:description")
+    if og_desc and len(og_desc) > 20:
+        out["nutritional_info"] = out["nutritional_info"] or ""
+    # OpenGraph rarely carries nutrition; it mostly helps Route-B name matching.
+    if gtins:
+        out["_gtins"] = gtins
+    out["_og_title"] = og_title or ""
+    out["_og_desc"] = og_desc or ""
+    return out
+
+
+def _meta(html: str, prop: str) -> str:
+    m = re.search(
+        rf'<meta[^>]+(?:property|name)=[\'"]{re.escape(prop)}[\'"][^>]+content=[\'"]([^\'"]+)',
+        html, re.I)
+    if not m:
+        m = re.search(
+            rf'<meta[^>]+content=[\'"]([^\'"]+)[\'"][^>]+(?:property|name)=[\'"]{re.escape(prop)}[\'"]',
+            html, re.I)
+    return unescape(m.group(1)).strip() if m else ""
+
+
+# ============================================================================
+# DETERMINISTIC PARSER 3 — labelled HTML nutrition table + text paragraphs
+# ============================================================================
+
+# Multilingual nutrition labels -> canonical key. Order matters: check
+# "saturated" style before plain "fat", "sugars" before "carbohydrate", etc.
+_NUTRI_LABELS = [
+    ("saturates_g", ["of which saturates", "saturated fat", "gesättigte",
+                     "davon gesättigte", "acides gras saturés", "dont acides gras saturés",
+                     "di cui acidi grassi saturi", "acidi grassi saturi",
+                     "waarvan verzadigd", "verzadigde vetzuren", "grasas saturadas",
+                     "de las cuales saturadas"]),
+    ("sugars_g", ["of which sugars", "davon zucker", "dont sucres", "di cui zuccheri",
+                  "waarvan suikers", "de los cuales azúcares", "azúcares", "sugars",
+                  "zucker", "sucres", "zuccheri", "suikers"]),
+    ("fat_g", ["fat", "fett", "matières grasses", "grassi", "vetten", "vet",
+               "grasas", "lipides"]),
+    ("carbohydrates_g", ["carbohydrate", "kohlenhydrate", "glucides", "carboidrati",
+                         "koolhydraten", "hidratos de carbono", "carbohidratos"]),
+    ("protein_g", ["protein", "eiweiß", "eiweiss", "protéines", "proteine",
+                   "eiwitten", "eiwit", "proteínas", "proteinas"]),
+    ("fiber_g", ["fibre", "fiber", "ballaststoffe", "fibres", "fibra", "fibre alimentari",
+                 "vezels", "vezel", "fibra alimentaria"]),
+    ("salt_g", ["salt", "salz", "sel", "sale", "zout", "sal"]),
+    ("energy_kj", ["energy", "energie", "énergie", "energia", "valore energetico",
+                   "brennwert", "valor energético"]),
+]
+
+_INGREDIENT_LABELS = ["ingredients", "zutaten", "ingrédients", "ingredienti",
+                      "ingrediënten", "ingredienten", "ingredientes"]
+_ALLERGEN_LABELS = ["allergens", "allergene", "allergènes", "allergeni",
+                    "allergenen", "alérgenos", "allergy advice", "allergie"]
+_MAYCONTAIN_LABELS = ["may contain", "kann spuren", "kann enthalten",
+                      "peut contenir", "può contenere", "kan sporen",
+                      "puede contener", "traces of", "spuren von"]
+
+
+def _clean_text(s: str) -> str:
+    s = unescape(s or "")
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def parse_html_nutrition(html: str) -> dict:
+    """Labelled-table + labelled-paragraph fallback parser (uses bs4 if present)."""
+    out = _blank_fields()
+    if not _BS4_OK:
+        return _parse_html_nutrition_regex(html, out)
+    try:
+        soup = BeautifulSoup(html, "html.parser")
+    except Exception:
+        return _parse_html_nutrition_regex(html, out)
+
+    for tag in soup(["script", "style", "noscript"]):
+        tag.decompose()
+
+    # ---- Nutrition from <table> rows ----------------------------------------
+    for table in soup.find_all("table"):
+        rows = table.find_all("tr")
+        for tr in rows:
+            cells = [_clean_text(c.get_text(" ")) for c in tr.find_all(["th", "td"])]
+            if len(cells) < 2:
+                continue
+            label = cells[0].lower()
+            # Prefer a value column whose header/text references "100"; else 2nd cell.
+            value_cell = _pick_per100_cell(cells)
+            _assign_nutri_label(label, value_cell, out)
+
+    # ---- Nutrition from definition lists / label:value pairs ----------------
+    text_blob = _clean_text(soup.get_text(" "))
+    _scan_inline_nutrition(text_blob, out)
+
+    # ---- Ingredients / allergens / may-contain paragraphs -------------------
+    _extract_labelled_paragraph(soup, text_blob, out)
+    return out
+
+
+def _pick_per100_cell(cells: list) -> str:
+    """Given a row's cells, return the value most likely to be the per-100 figure."""
+    # If any cell text mentions 100 alongside a number, that's not it (that's a
+    # header). We just take the first cell after the label that contains a digit.
+    for c in cells[1:]:
+        if re.search(r"\d", c):
+            return c
+    return cells[1] if len(cells) > 1 else ""
+
+
+def _assign_nutri_label(label: str, value: str, out: dict) -> None:
+    for key, variants in _NUTRI_LABELS:
+        if out[key]:
             continue
-        val = tag.get("content") or tag.get("value") or tag.get_text(" ")
-        if key == "net_weight_customer_facing":
-            fields.update(_parse_weight_to_fields(_to_str(val)))
-        else:
-            _set_field(fields, key, val)
-    return fields
+        if any(v in label for v in variants):
+            if key == "energy_kj":
+                v = _energy_to_kj(value)
+            else:
+                fv = _to_float(value)
+                v = _fmt_num(fv) if fv is not None else ""
+            if v:
+                out[key] = v
+            return
 
 
-def _label_to_field(label: str) -> Optional[str]:
-    lab = re.sub(r"\s+", " ", (label or "").strip().lower())
-    if not lab:
-        return None
-    # Nutrition rows first to prevent "of which sugars" from mapping to carbohydrates.
-    for field, aliases in sorted(NUTRIENT_LABELS.items(), key=lambda kv: -max(len(a) for a in kv[1])):
-        if any(a in lab for a in aliases):
-            return field
-    for field, aliases in LABEL_ALIASES.items():
-        if any(a in lab for a in aliases):
-            return field
+def _scan_inline_nutrition(text: str, out: dict) -> None:
+    """Catch 'Label 12,3 g' patterns in flat text when there was no table."""
+    low = text.lower()
+    for key, variants in _NUTRI_LABELS:
+        if out[key]:
+            continue
+        for v in variants:
+            m = re.search(re.escape(v) + r'[^0-9<]{0,25}(<?\s*\d[\d.,]*\s*(?:kj|kcal|g|mg|mcg)?)',
+                          low)
+            if m:
+                raw = m.group(1)
+                if key == "energy_kj":
+                    val = _energy_to_kj(raw)
+                else:
+                    fv = _to_float(raw)
+                    val = _fmt_num(fv) if fv is not None else ""
+                if val:
+                    out[key] = val
+                break
+
+
+def _extract_labelled_paragraph(soup, text_blob: str, out: dict) -> None:
+    low = text_blob.lower()
+    # ingredients need a real list; allergen / may-contain segments can be as
+    # short as a single word ("nuts"), so they get a lower length floor.
+    for key, labels, min_len in (
+            ("ingredients", _INGREDIENT_LABELS, 8),
+            ("may_contain", _MAYCONTAIN_LABELS, 3),
+            ("allergens", _ALLERGEN_LABELS, 3)):
+        if out[key]:
+            continue
+        for lab in labels:
+            idx = low.find(lab)
+            if idx == -1:
+                continue
+            # Grab the sentence/segment after the label up to a sensible stop.
+            after = text_blob[idx + len(lab): idx + len(lab) + 600]
+            after = re.sub(r'^[\s:：\-–—.]+', '', after)
+            seg = re.split(r'(?:\.\s|\n|Nutrition|Nährwerte|Valeurs|Valori|'
+                           r'Voedingswaarde|Información nutricional)', after, 1)[0]
+            seg = _clean_text(seg)
+            if len(seg) >= min_len:
+                out[key] = seg[:500]
+                break
+
+
+def _parse_html_nutrition_regex(html: str, out: dict) -> dict:
+    """bs4-free fallback: strip tags and scan flat text only."""
+    text = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+    text = _clean_text(re.sub(r"<[^>]+>", " ", text))
+    _scan_inline_nutrition(text, out)
+    _extract_labelled_paragraph(None, text, out)
+    return out
+
+
+# ============================================================================
+# PAGE FETCH + ROUTE A/B VERIFICATION
+# ============================================================================
+
+def _page_has_ean(html: str, ean: str) -> bool:
+    """Route-A test: EAN present in a labelled GTIN context (strong evidence)."""
+    stripped = ean.lstrip("0")
+    if re.search(rf'(gtin\d*|"sku"|itemprop=["\']gtin)[\s"\':=]+["\']?0*{re.escape(stripped)}',
+                 html, re.IGNORECASE):
+        return True
+    if re.search(rf'(ean|gtin|barcode|strichcode|streepjescode|'
+                 rf'codice\s*a\s*barre|c[oó]digo\s*de\s*barras|upc)'
+                 rf'[^0-9]{{0,30}}0*{re.escape(stripped)}', html, re.IGNORECASE):
+        return True
+    return False
+
+
+def _page_title_bits(html: str) -> str:
+    bits = []
+    for pat in (r'<meta[^>]+og:title[^>]+content=["\']([^"\']+)',
+                r'<title[^>]*>([^<]+)</title>',
+                r'<h1[^>]*>(.*?)</h1>'):
+        m = re.search(pat, html, re.I | re.S)
+        if m:
+            bits.append(re.sub(r"<[^>]+>", " ", m.group(1)))
+    return _clean_text(" ".join(bits))
+
+
+def verify_route(html: str, ean: str, anchors: list, gtins: set | None = None) -> str | None:
+    """Return 'A' (EAN confirmed), 'B' (name match >=80%, no weight conflict), or None."""
+    if _page_has_ean(html, ean):
+        return "A"
+    if gtins and (ean in gtins or ean.lstrip("0") in {g.lstrip("0") for g in gtins}):
+        return "A"
+    identity = _page_title_bits(html)
+    if identity and anchors:
+        ratio = _best_name_ratio(anchors, identity)
+        if ratio >= _NAME_MATCH_THRESHOLD and not _weights_conflict(anchors, identity):
+            return "B"
     return None
 
 
-def _extract_labelled_tables(soup, page_text: str) -> Dict[str, Any]:
-    fields: Dict[str, Any] = {}
-    # Attribute / nutrition tables.
-    for table in soup.find_all("table"):
-        headers = [_clean_text(c.get_text(" ")).lower() for c in table.find_all(["th", "td"], recursive=True)[:12]]
-        for row in table.find_all("tr"):
-            cells = [_clean_text(c.get_text(" ")) for c in row.find_all(["th", "td"])]
-            cells = [c for c in cells if c]
-            if len(cells) < 2:
-                continue
-            label = cells[0]
-            field = _label_to_field(label)
-            if not field:
-                continue
-            value_cells = cells[1:]
-            # Prefer per-100g / per-100ml value when headers expose columns.
-            chosen = value_cells[0]
-            row_header_text = " | ".join(headers)
-            if len(value_cells) > 1 and re.search(r"100\s*(g|ml)", row_header_text, re.I):
-                # Header cells often include first-column label, so align by offset best-effort.
-                for idx, h in enumerate(headers[1:1 + len(value_cells)]):
-                    if re.search(r"100\s*(g|ml)", h, re.I):
-                        chosen = value_cells[idx]
-                        break
-            if field in NUMERIC_FIELDS and field not in {"net_weight", "gross_weight"}:
-                _set_field(fields, field, chosen)
-            elif field == "net_weight_customer_facing":
-                fields.update(_parse_weight_to_fields(chosen))
-            else:
-                _set_field(fields, field, chosen)
-            if field in NUTRIENT_LABELS and re.search(r"100\s*(g|ml)", table.get_text(" "), re.I):
-                _set_field(fields, "nutritional_info", "per 100g/100ml")
-
-    # Definition lists and common spec rows.
-    for container in soup.find_all(["dl", "ul", "div"]):
-        text = _clean_text(container.get_text(" "))
-        if len(text) > 600:
-            continue
-        parts = re.split(r"\s{2,}|\n|\t", text)
-        if len(parts) >= 2:
-            field = _label_to_field(parts[0])
-            if field:
-                val = " ".join(parts[1:]).strip()
-                if field == "net_weight_customer_facing":
-                    fields.update(_parse_weight_to_fields(val))
-                elif field in NUMERIC_FIELDS:
-                    _set_field(fields, field, val)
-                else:
-                    _set_field(fields, field, val)
-
-    # Regex sections in visible text for free-text fields.
-    stop = r"(?=(?:\b(?:nutri|nutrition|nährwert|allergen|may contain|kann enthalten|manufacturer|hersteller|origin|herkunft|storage|aufbewahrung|preparation|zubereitung)\b\s*:)|$)"
-    for field, aliases in LABEL_ALIASES.items():
-        if field == "net_weight_customer_facing":
-            continue
-        for alias in aliases:
-            pat = rf"\b{re.escape(alias)}\b\s*[:：]\s*(.{{3,700}}?){stop}"
-            m = re.search(pat, page_text, re.I | re.S)
-            if m:
-                val = _clean_text(m.group(1))
-                if field == "organic_certification_id":
-                    cert = ORG_CERT_RE.search(val)
-                    if cert:
-                        _set_field(fields, field, cert.group(0).upper())
-                else:
-                    _set_field(fields, field, val)
-                break
-
-    # Certification and organic flags.
-    cert = ORG_CERT_RE.search(page_text)
-    if cert:
-        _set_field(fields, "organic_certification_id", cert.group(0).upper())
-        fields["organic_product"] = "Yes"
-    elif re.search(r"\b(bio|organic|ökologisch|oeko|eco)\b", page_text[:8000], re.I):
-        fields.setdefault("organic_product", "Yes")
-    else:
-        fields.setdefault("organic_product", "No")
-
-    # Weight if not found in tables.
-    if not fields.get("net_weight"):
-        fields.update(_parse_weight_to_fields(page_text[:5000]))
-
-    # Packaging / fragile.
-    packaging_hay = page_text[:10000].lower()
-    for packaging, pat in PACKAGING_PATTERNS:
-        if re.search(pat, packaging_hay, re.I):
-            fields.setdefault("packaging", packaging)
-            break
-    if fields.get("packaging") and re.search(r"glass|glas|jar", fields.get("packaging", ""), re.I):
-        fields.setdefault("fragile_item", "Yes")
-    elif fields.get("packaging"):
-        fields.setdefault("fragile_item", "No")
-
-    return fields
-
-
-def _parse_page_fields(html: str, page_text: str) -> Dict[str, Any]:
-    if not BS4_OK or not html:
-        return {}
-    soup = BeautifulSoup(html, "html.parser")
-    fields: Dict[str, Any] = {}
-
-    # Deterministic fallback order: JSON-LD -> microdata/OpenGraph -> labelled HTML.
-    for source_fields in (
-        _extract_from_jsonld(soup, html),
-        _extract_microdata_opengraph(soup),
-        _extract_labelled_tables(soup, page_text),
-    ):
-        for k, v in source_fields.items():
-            if _real_value(v) and not _real_value(fields.get(k)):
-                fields[k] = v
-
-    # Title/name fallback and weight from title are deterministic and useful.
-    if not fields.get("product_name"):
-        title = _page_title(soup)
-        if title:
-            fields["product_name"] = title
-    if fields.get("product_name") and not fields.get("net_weight"):
-        fields.update(_parse_weight_to_fields(fields["product_name"]))
-
-    return {k: v for k, v in fields.items() if k in FOOD_FIELDS and _real_value(v)}
-
-
-def _field_richness(fields: Dict[str, Any]) -> int:
-    food_core = [
-        "ingredients", "allergens", "energy_kj", "fat_g", "saturates_g", "carbohydrates_g",
-        "sugars_g", "protein_g", "fiber_g", "salt_g", "net_weight", "brand",
-    ]
-    return sum(2 if k in food_core else 1 for k, v in fields.items() if _real_value(v))
-
-
-def _page_base_score(page: VerifiedPage, market: str) -> int:
-    score = 100 if page.route == "A" else 65
-    if _is_goldmine_domain(page.final_url or page.url, market):
-        score += 20
-    if page.attempt.startswith("Attempt 2 brand"):
-        score += 15
-    if page.attempt.startswith("Attempt 3 goldmine"):
-        score += 10
-    score += min(_field_richness(page.fields), 30)
-    return score
-
-
-def _merge_page_fields(pages: List[VerifiedPage], market: str) -> Tuple[Dict[str, Any], Dict[str, str]]:
-    merged: Dict[str, Any] = {k: "" for k in FOOD_FIELDS}
-    winners: Dict[str, Tuple[int, Any, str]] = {}
-    for page in pages:
-        base = _page_base_score(page, market)
-        page.score = base
-        for k, v in page.fields.items():
-            if not _real_value(v):
-                continue
-            # Rich/high-trust source wins per field. Deterministic parsers only.
-            current = winners.get(k)
-            if current is None or base > current[0]:
-                winners[k] = (base, v, page.url)
-    provenance_by_field: Dict[str, str] = {}
-    for k, (_, v, url) in winners.items():
-        merged[k] = v
-        provenance_by_field[k] = url
-    return merged, provenance_by_field
-
-
-def _extract_llm_json(raw: str) -> Dict[str, Any]:
-    if not raw:
-        return {}
-    clean = raw.strip().replace("```json", "").replace("```", "").strip()
-    m = re.search(r"\{.*\}", clean, re.S)
-    if not m:
-        return {}
+async def _fetch_html(session, url: str, timeout: int = 10) -> str:
+    if not url or not url.startswith("http") or _is_excluded_domain(url):
+        return ""
     try:
-        return json.loads(m.group(0))
+        async with session.get(url, headers={"User-Agent": _UA}, timeout=timeout) as r:
+            if r.status != 200:
+                return ""
+            raw = await r.content.read(700_000)
+            return raw.decode("utf-8", errors="ignore")
     except Exception:
-        return {}
+        return ""
 
 
-def _llm_extract_free_text(page_text: str, ean: str, product_name: str, market: str, gemini_key: str, model: str, missing: Sequence[str]) -> Dict[str, Any]:
-    if not GENAI_OK or not gemini_key or not page_text or not missing:
+# ============================================================================
+# DETERMINISTIC EXTRACTION FOR ONE PAGE (all three parsers, one pass)
+# ============================================================================
+
+def extract_page_fields(html: str, ean: str) -> dict:
+    """Run JSON-LD -> microdata/OG -> HTML-table parsers and merge (earlier
+    parser wins per field). Returns canonical field dict (+ _gtins/_og_*)."""
+    jsonld = parse_jsonld(html, ean)
+    micro = parse_microdata_og(html)
+    table = parse_html_nutrition(html)
+
+    merged = _blank_fields()
+    gtins = set()
+    for src in (jsonld, micro, table):           # priority order
+        gtins |= src.get("_gtins", set())
+        for k in ALL_FIELD_KEYS:
+            if not merged[k] and src.get(k):
+                merged[k] = src[k]
+    merged["_gtins"] = gtins
+    merged["_og_title"] = micro.get("_og_title", "")
+    merged["_og_desc"] = micro.get("_og_desc", "")
+    return merged
+
+
+def page_visible_text(html: str, limit: int = 20000) -> str:
+    """Plain visible text of a page (for the Gemini free-text fallback)."""
+    if _BS4_OK:
+        try:
+            soup = BeautifulSoup(html, "html.parser")
+            for tag in soup(["script", "style", "noscript"]):
+                tag.decompose()
+            return _clean_text(soup.get_text(" "))[:limit]
+        except Exception:
+            pass
+    text = re.sub(r"<script.*?</script>", " ", html, flags=re.S | re.I)
+    text = re.sub(r"<style.*?</style>", " ", text, flags=re.S | re.I)
+    return _clean_text(re.sub(r"<[^>]+>", " ", text))[:limit]
+
+
+# ============================================================================
+# GEMINI FREE-TEXT FALLBACK  (text fields only — NEVER numbers, NEVER search)
+# ============================================================================
+
+# Only these messy free-text fields may be filled by the LLM fallback.
+_GEMINI_FALLBACK_FIELDS = ("ingredients", "allergens", "may_contain",
+                           "manufacturer_name", "manufacturer_address",
+                           "place_of_origin")
+
+
+def gemini_freetext_from_page(page_text: str, ean: str, product_name: str,
+                              market_code: str, gemini_key: str,
+                              want_fields: list) -> dict:
+    """
+    Last-resort extraction of unstructured TEXT fields from a single verified
+    page's text. Fed ONLY the page text, temperature 0, no search. Returns
+    {field_key: value|None}. Numbers are never requested here.
+    """
+    if not (_GENAI_OK and gemini_key and page_text and len(page_text) >= 200):
         return {}
-    missing = [f for f in missing if f in LLM_FALLBACK_FIELDS]
-    if not missing:
+    want = [f for f in want_fields if f in _GEMINI_FALLBACK_FIELDS]
+    if not want:
         return {}
-    schema = "\n".join(f'  "{f}": "value or null",' for f in missing)
-    page_excerpt = page_text[:22000]
-    prompt = f"""
-You are reading ONE fetched product page. Extract ONLY the requested fields from PAGE TEXT.
-Do not search. Do not use outside knowledge. Do not infer values. Return null when absent.
-Do not extract or invent numeric nutrition, GTIN, or weight values.
-Product reference: {product_name} / EAN {ean}. Target market: {market}.
-Return only a JSON object:
+    field_lines = "\n".join(f'    "{k}": "value or null",' for k in want)
+    prompt = f"""You are reading ONE product page's text. Extract ONLY the fields
+below and ONLY from the PAGE TEXT provided. Do NOT search. Do NOT use outside
+knowledge. If a field is not clearly present in this text, return null for it —
+never guess or infer. Translate text into the {market_code} market language,
+verbatim. Product for reference: {product_name} (EAN {ean}).
+
+Return ONLY a JSON object, no prose:
 {{
-{schema}
+{field_lines}
 }}
 
 PAGE TEXT:
-{page_excerpt}
+\"\"\"{page_text[:16000]}\"\"\"
 """
     try:
         client = genai.Client(api_key=gemini_key)
         resp = client.models.generate_content(
-            model=model,
+            model=EXTRACTION_MODEL,
             contents=[prompt],
-            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=1400),
+            config=types.GenerateContentConfig(temperature=0.0,
+                                                max_output_tokens=1536),
         )
-        raw = getattr(resp, "text", "") or ""
-        if not raw and getattr(resp, "candidates", None):
-            for part in (resp.candidates[0].content.parts if resp.candidates[0].content and resp.candidates[0].content.parts else []):
+        raw = ""
+        if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+            for part in resp.candidates[0].content.parts:
                 if getattr(part, "text", None):
                     raw += part.text
-        parsed = _extract_llm_json(raw)
-        return {k: v for k, v in parsed.items() if k in missing and _real_value(v)}
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return {}
+        parsed = json.loads(m.group(0))
+        out = {}
+        for k in want:
+            v = parsed.get(k)
+            if v in ("", "null", "None", None):
+                out[k] = None
+            else:
+                out[k] = _clean_text(str(v))[:500]
+        return out
     except Exception:
         return {}
 
 
-def _blank_fields() -> Dict[str, Any]:
-    return {k: "" for k in FOOD_FIELDS}
+# ============================================================================
+# DISCOVERY LADDER  (used only when candidate_pages is not supplied — e.g. tests)
+# Production app.py passes already-discovered pages, so this stays dormant there.
+# ============================================================================
+
+_GO_UPC_LOCK: asyncio.Lock | None = None
+_GO_UPC_LAST = [0.0]
+_SERP_SEM: asyncio.Semaphore | None = None
+_SERP_LOOP = None
 
 
-def _status_reason_for_no_verified(unreadable_count: int, candidates_count: int) -> str:
-    if unreadable_count:
-        return "page not readable"
-    if candidates_count:
-        return "no candidate page passed Route A/B verification"
-    return "no candidate page found"
+async def fetch_go_upc(session, ean: str, go_upc_key: str) -> dict | None:
+    """Tier 1A — Go-UPC barcode lookup (2 req/s). Registry data only."""
+    global _GO_UPC_LOCK
+    if not go_upc_key:
+        return None
+    if _GO_UPC_LOCK is None:
+        _GO_UPC_LOCK = asyncio.Lock()
+    async with _GO_UPC_LOCK:
+        now = asyncio.get_event_loop().time()
+        wait = 0.5 - (now - _GO_UPC_LAST[0])
+        if wait > 0:
+            await asyncio.sleep(wait)
+        _GO_UPC_LAST[0] = asyncio.get_event_loop().time()
+        try:
+            async with session.get(
+                f"https://go-upc.com/api/v1/code/{ean}",
+                headers={"Authorization": f"Bearer {go_upc_key}"},
+                timeout=10) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+                p = data.get("product") or {}
+                if not p or not p.get("name"):
+                    return None
+                if not barcode_matches(str(data.get("code", "")), ean):
+                    return None
+                return {
+                    "name": p.get("name", ""),
+                    "brand": p.get("brand", ""),
+                    "ingredients": (p.get("ingredients") or {}).get("text", "")
+                    if isinstance(p.get("ingredients"), dict) else "",
+                }
+        except Exception:
+            return None
 
 
-async def extract_food_data(
-    session,
-    ean: str,
-    ground_truth: str,
-    market: str,
-    registry_name: str = "",
-    keys: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    """Return deterministic food data from verified source pages only.
+async def _serp_get(session, params: dict, timeout: int = 15) -> dict | None:
+    global _SERP_SEM, _SERP_LOOP
+    loop = asyncio.get_running_loop()
+    if _SERP_SEM is None or _SERP_LOOP is not loop:
+        _SERP_SEM = asyncio.Semaphore(8)
+        _SERP_LOOP = loop
+    async with _SERP_SEM:
+        for attempt in range(3):
+            try:
+                async with session.get("https://serpapi.com/search",
+                                       params=params, timeout=timeout) as r:
+                    if r.status == 200:
+                        return await r.json()
+                    if r.status == 429 or r.status >= 500:
+                        if attempt < 2:
+                            await asyncio.sleep(3 * (attempt + 1))
+                            continue
+                    return None
+            except asyncio.TimeoutError:
+                if attempt < 2:
+                    await asyncio.sleep(1)
+                    continue
+                return None
+            except Exception:
+                return None
+    return None
 
-    Parameters
-    ----------
-    session:
-        An aiohttp ClientSession.
-    ean:
-        Queried GTIN/EAN.
-    ground_truth:
-        User-provided product name/weight/brand context.
-    market:
-        Market code such as DE, FR, UK.
-    registry_name:
-        Optional pre-resolved name from the calling app. If omitted, the module
-        tries Go-UPC and then EAN-Search according to the requested ladder.
-    keys:
-        {"serp_key", "ean_token", "go_upc_key", "gemini_key", "gemini_model",
-         "go_upc_data"}. `go_upc_data` may be passed from app.py to avoid a
-        duplicate Tier 1A request.
+
+async def discover_candidate_pages(session, ean, ground_truth, market,
+                                   registry_name, keys, go_upc_data) -> tuple:
     """
-    keys = keys or {}
-    serp_key = keys.get("serp_key") or keys.get("serpapi_key") or ""
-    ean_token = keys.get("ean_token") or keys.get("ean_search_token") or ""
-    go_upc_key = keys.get("go_upc_key") or keys.get("go_upc_api_key") or ""
-    gemini_key = keys.get("gemini_key") or keys.get("gemini_api_key") or ""
-    gemini_model = keys.get("gemini_model") or "gemini-2.5-flash"
-    go_upc_data = keys.get("go_upc_data") or None
+    Run the ladder (Attempts 2-5) and return (candidate_urls, resolved_name,
+    ean_verified). Tier 1A/1B name resolution is folded in via go_upc_data /
+    EAN-Search. SerpAPI is used for Attempts 2-5. Order is UNCHANGED from the
+    original fetch_basic_info.
+    """
+    serp_key = keys.get("serp", "")
+    ean_token = keys.get("ean_search", "")
+    gl = market.lower()
+    market_upper = market.upper()
+    urls: list = []
+    name = registry_name or ""
+    ean_verified = bool(go_upc_data)  # Tier 1A registry hit == barcode-verified
 
-    diag: List[str] = []
-    fields = _blank_fields()
-    source_links: List[str] = []
-    source_routes: Dict[str, str] = {}
-    provenance_by_field: Dict[str, str] = {}
+    clean_gt = strip_pack_notation(ground_truth) if ground_truth else ground_truth
 
-    # Tier 1A: Go-UPC name. If app.py already fetched it, reuse it.
-    registry_source = ""
-    if go_upc_data:
-        registry_source = "Go-UPC"
-        registry_name = registry_name or (go_upc_data.get("name") or "")
-        diag.append(f"✅ Tier 1A Go-UPC name: {registry_name or '(empty)'}")
-    elif go_upc_key:
-        go_upc_data = await _fetch_go_upc(session, ean, go_upc_key)
-        if go_upc_data:
-            registry_source = "Go-UPC"
-            registry_name = registry_name or (go_upc_data.get("name") or "")
-            diag.append(f"✅ Tier 1A Go-UPC name: {registry_name or '(empty)'}")
+    # Tier 1B: EAN-Search (only if Go-UPC gave nothing)
+    if not go_upc_data and ean_token:
+        try:
+            u = (f"https://api.ean-search.org/api?token={ean_token}"
+                 f"&op=barcode-lookup&ean={ean}&format=json")
+            async with session.get(u, timeout=6) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data and isinstance(data, list) and "error" not in data[0]:
+                        rb = str(data[0].get("barcode", data[0].get("ean", "")))
+                        if barcode_matches(rb, ean):
+                            ean_verified = True
+                            cn = data[0].get("name", "")
+                            if cn and not is_garbage_name(cn):
+                                name = name or cn
+        except Exception:
+            pass
 
-    # Go-UPC / EAN-Search are registry identity only. They seed the product name
-    # for discovery and Route B comparison, but they do NOT populate food fields.
-    # Ingredients, nutrition, weight, brand, manufacturer, and similar row values
-    # must come from verified source pages.
-    if go_upc_data and _real_value(go_upc_data.get("name")):
-        fields["product_name"] = _to_str(go_upc_data.get("name"))
+    def _add(link):
+        if link and link.startswith("http") and not _is_excluded_domain(link) \
+                and link not in urls:
+            urls.append(link)
 
-    # Tier 1B: EAN-Search only if Go-UPC empty.
-    if not registry_name and ean_token:
-        ean_data = await _fetch_ean_search(session, ean, ean_token)
-        if ean_data:
-            registry_source = "EAN-Search"
-            registry_name = ean_data.get("name") or ""
-            if registry_name:
-                fields["product_name"] = registry_name
-            diag.append(f"✅ Tier 1B EAN-Search name: {registry_name or '(empty)'}")
-        else:
-            diag.append("ℹ️ Tier 1B EAN-Search: empty")
+    if not serp_key:
+        return urls, name, ean_verified
 
-    clean_gt = _strip_pack_notation(ground_truth) if ground_truth else ""
-    anchors = [x for x in (clean_gt, registry_name) if _real_value(x)]
-    if not fields.get("product_name"):
-        fields["product_name"] = registry_name or clean_gt or f"Product with EAN {ean}"
+    # Attempt 2: brand-site
+    if clean_gt:
+        brand = extract_brand(clean_gt)
+        if brand:
+            data = await _serp_get(session, {"q": f"{brand} {ean}", "gl": gl,
+                                             "api_key": serp_key})
+            for res in (data or {}).get("organic_results", [])[:5]:
+                link = res.get("link", "")
+                dom = _domain_of(link)
+                if _is_excluded_domain(link):
+                    continue
+                if brand_matches_domain(brand, dom):
+                    _add(link)
+                    if not name:
+                        name = res.get("title", "").split("-")[0].split("|")[0].strip()
+                    break
 
-    candidates = await _discover_candidates(session, ean, ground_truth, market, registry_name, serp_key, diag)
-    diag.append(f"🔎 Candidate pages discovered: {len(candidates)}")
+    # Attempt 2.5: combined name + EAN
+    if clean_gt:
+        data = await _serp_get(session, {"q": f"{clean_gt} {ean}", "gl": gl,
+                                         "api_key": serp_key})
+        for res in (data or {}).get("organic_results", [])[:5]:
+            link = res.get("link", "")
+            if _is_excluded_domain(link):
+                continue
+            snip = res.get("snippet", "") or ""
+            if ean in snip or ean.lstrip("0") in snip:
+                _add(link)
+                if not name:
+                    t = res.get("title", "").split("-")[0].split("|")[0].strip()
+                    if not is_garbage_name(t):
+                        name = t
+                ean_verified = True
 
-    verified: List[VerifiedPage] = []
-    unreadable_count = 0
-    for cand in candidates:
-        if len(verified) >= MAX_VERIFIED_READS:
+    # Attempt 3: goldmine
+    goldmine = f"{GOLDMINE.get(market_upper, '')} OR {GLOBAL_SITES}".strip(" OR")
+    data = await _serp_get(session, {"q": f"{goldmine} {ean}", "gl": gl,
+                                     "api_key": serp_key})
+    org = (data or {}).get("organic_results", [])
+    if org and not name:
+        cand = org[0].get("title", "").split("-")[0].split("|")[0].strip()
+        if not is_garbage_name(cand):
+            name = cand
+    for res in org[:4]:
+        _add(res.get("link", ""))
+
+    # Attempt 4: bare GTIN
+    if len(urls) < 4:
+        data = await _serp_get(session, {"q": str(ean), "gl": gl, "api_key": serp_key})
+        for res in (data or {}).get("organic_results", [])[:4]:
+            if _result_matches_gt(res, clean_gt):
+                _add(res.get("link", ""))
+
+    # Attempt 5: name-based fallback
+    if clean_gt and len(urls) < 4:
+        gm = GOLDMINE.get(market_upper, "").strip()
+        for q in ([f'{gm} "{clean_gt}"'] if gm else []) + [f'"{clean_gt}"']:
+            data = await _serp_get(session, {"q": q, "gl": gl, "api_key": serp_key})
+            for res in (data or {}).get("organic_results", [])[:4]:
+                link = res.get("link", "")
+                if _is_excluded_domain(link):
+                    continue
+                title = res.get("title", "").split("-")[0].split("|")[0].strip()
+                if is_garbage_name(title):
+                    continue
+                _add(link)
+                if not name:
+                    name = title
+            if len(urls) >= 4:
+                break
+
+    return urls, name, ean_verified
+
+
+# ============================================================================
+# MAIN ENTRY POINT
+# ============================================================================
+
+async def extract_food_data(session, ean, ground_truth, market, registry_name,
+                            keys, *, go_upc_data=None, candidate_pages=None,
+                            ean_verified_hint=False):
+    """
+    Verify-then-read food extraction. See module docstring for the return shape.
+
+    session         : aiohttp.ClientSession
+    ean             : queried GTIN string
+    ground_truth    : user-supplied product description (may be "")
+    market          : market code, e.g. "DE"
+    registry_name   : Go-UPC / EAN-Search product name ("" if none)
+    keys            : {"serp","gemini","ean_search","go_upc"}
+    go_upc_data     : pre-fetched Go-UPC dict (optional; else module fetches it)
+    candidate_pages : pages already discovered by app.py (optional; else the
+                      module runs the ladder itself)
+    ean_verified_hint : whether the barcode was already registry-verified
+    """
+    diag: list = []
+    gemini_key = keys.get("gemini", "")
+    clean_gt = strip_pack_notation(ground_truth) if ground_truth else ground_truth
+
+    # Tier 1A registry (shared from app.py if provided).
+    if go_upc_data is None and keys.get("go_upc"):
+        go_upc_data = await fetch_go_upc(session, ean, keys["go_upc"])
+    reg_name = registry_name or (go_upc_data or {}).get("name", "") or ""
+    ean_verified = bool(ean_verified_hint or go_upc_data)
+
+    # ---- Candidate discovery -------------------------------------------------
+    resolved_name = reg_name
+    if candidate_pages:
+        candidates = [u for u in candidate_pages
+                      if u and u.startswith("http") and not _is_excluded_domain(u)]
+        diag.append(f"Using {len(candidates)} candidate page(s) from app.py.")
+    else:
+        candidates, resolved_name2, ev2 = await discover_candidate_pages(
+            session, ean, ground_truth, market, reg_name, keys, go_upc_data)
+        resolved_name = resolved_name or resolved_name2
+        ean_verified = ean_verified or ev2
+        diag.append(f"Ladder discovered {len(candidates)} candidate page(s).")
+
+    # De-dupe by domain, keep order, cap.
+    anchors = [a for a in (clean_gt, reg_name) if a]
+    seen_dom, ordered = set(), []
+    for u in candidates:
+        dom = _domain_of(u)
+        if dom and dom not in seen_dom:
+            seen_dom.add(dom)
+            ordered.append(u)
+    ordered = ordered[:MAX_CANDIDATES]
+
+    # ---- Verify + read each candidate ---------------------------------------
+    read_pages: list = []       # dicts: {url, route, fields, text}
+    source_routes: dict = {}
+    verified_any = False
+    readable_any = False
+
+    for url in ordered:
+        if len([p for p in read_pages if p["fields_nonempty"]]) >= MAX_READ_PAGES:
             break
-        html, final_url = await _fetch_html(session, cand.url)
-        if not html or len(html) < 200:
-            unreadable_count += 1
+        html = await _fetch_html(session, url)
+        if not html:
+            diag.append(f"unreadable (fetch failed): {_domain_of(url)}")
             continue
-        if not BS4_OK:
+        page_fields = extract_page_fields(html, ean)
+        route = verify_route(html, ean, anchors, page_fields.get("_gtins"))
+        if route is None:
+            diag.append(f"skip (neither EAN nor name match): {_domain_of(url)}")
             continue
-        soup = BeautifulSoup(html, "html.parser")
-        jsonld = _jsonld_blocks(soup)
-        title = _page_title(soup, cand.title)
-        identity = _extract_identity_text(soup, jsonld, cand.title)
-        text = _soup_text(BeautifulSoup(html, "html.parser"))
-        route = None
-        reason = ""
-        if _html_contains_ean(html, jsonld, ean):
-            route = "A"
-            reason = "EAN present on page"
+        verified_any = True
+        source_routes[url] = route
+        # A page is "readable" for grading purposes when the deterministic
+        # parsers pulled ANY real field out of it. A JS/cookie-walled shell
+        # returns markup with no product data -> nonempty is False -> the page
+        # counts as verified-but-not-readable (handled below).
+        nonempty = any(page_fields.get(k) for k in ALL_FIELD_KEYS)
+        if nonempty:
+            readable_any = True
+        read_pages.append({
+            "url": url, "route": route, "fields": page_fields,
+            "text": page_visible_text(html),
+            "readable": nonempty, "fields_nonempty": nonempty,
+        })
+        diag.append(f"verified Route {route} ({'read' if nonempty else 'thin'}): "
+                    f"{_domain_of(url)}")
+
+    # ---- Rank pages: Route A before B; goldmine before other; then order ----
+    def _rank(p):
+        return (0 if p["route"] == "A" else 1,
+                0 if _is_goldmine(p["url"]) else 1)
+    read_pages.sort(key=_rank)
+
+    # ---- Fill fields ACROSS verified pages (highest-trust wins per field) ----
+    fields = _blank_fields()
+    used_urls: list = []
+    for p in read_pages:
+        contributed = False
+        for k in ALL_FIELD_KEYS:
+            if not fields[k] and p["fields"].get(k):
+                fields[k] = p["fields"][k]
+                contributed = True
+        if contributed or p["fields_nonempty"]:
+            if p["url"] not in used_urls:
+                used_urls.append(p["url"])
+
+    # ---- Registry (Go-UPC) first-pass fill for genuinely-absent text fields --
+    registry_used = False
+    if go_upc_data:
+        if not fields["ingredients"] and go_upc_data.get("ingredients"):
+            fields["ingredients"] = _clean_text(go_upc_data["ingredients"])[:500]
+            registry_used = True
+        if not fields["brand"] and go_upc_data.get("brand"):
+            fields["brand"] = _clean_text(go_upc_data["brand"])
+            registry_used = True
+
+    # ---- Gemini last-resort for messy TEXT fields still missing --------------
+    gemini_used = False
+    if gemini_key:
+        missing_text = [k for k in _GEMINI_FALLBACK_FIELDS if not fields[k]]
+        if missing_text:
+            # Feed the richest readable verified page's text only.
+            best = next((p for p in read_pages if p["readable"] and p["text"]), None)
+            if best:
+                got = await asyncio.to_thread(
+                    gemini_freetext_from_page, best["text"], ean,
+                    resolved_name or reg_name, market, gemini_key, missing_text)
+                for k, v in (got or {}).items():
+                    if v and not fields[k]:
+                        fields[k] = v
+                        gemini_used = True
+
+    # ---- Grade + provenance --------------------------------------------------
+    has_route_a = any(p["route"] == "A" for p in read_pages if p["fields_nonempty"])
+    has_route_b = any(p["route"] == "B" for p in read_pages if p["fields_nonempty"])
+
+    if readable_any:
+        status = "success"
+        reliability = "H" if has_route_a else "M"
+        if registry_used or gemini_used:
+            provenance = "Verified page + fallback ⚠️"
         else:
-            ratio = _best_name_ratio(anchors, identity)
-            if ratio >= NAME_MATCH_THRESHOLD and not _weights_conflict(anchors, identity, text):
-                route = "B"
-                reason = f"name match {ratio:.0%}, no weight conflict"
-        if not route:
-            continue
-        page = VerifiedPage(
-            url=cand.url,
-            final_url=final_url,
-            route=route,
-            html=html,
-            text=text[:50000],
-            title=title,
-            attempt=cand.attempt,
-            domain=_domain(final_url or cand.url),
-            readable=(len(text) >= 500 or bool(jsonld)),
-            reason=reason,
-        )
-        page.fields = _parse_page_fields(html, text)
-        if page.readable:
-            # LLM fallback only for messy free-text fields, and only from this page text.
-            missing = [f for f in LLM_FALLBACK_FIELDS if not _real_value(page.fields.get(f))]
-            if missing and gemini_key:
-                llm_fields = await asyncio.to_thread(
-                    _llm_extract_free_text, page.text, ean, fields.get("product_name") or registry_name,
-                    market, gemini_key, gemini_model, missing,
-                )
-                for k, v in llm_fields.items():
-                    if _real_value(v) and k in LLM_FALLBACK_FIELDS:
-                        page.fields[k] = v
-        verified.append(page)
-        diag.append(f"✅ Verified Route {route}: {page.domain} ({reason}); fields={_field_richness(page.fields)}")
+            provenance = "Verified page"
+    elif verified_any:
+        # Pages verified (Route A/B) but none readable — JS/cookie wall etc.
+        status = "page_not_readable"
+        reliability = "L"
+        provenance = ("Registry only — page not readable ⚠️" if registry_used
+                      else "Page not readable")
+    else:
+        status = "no_source"
+        reliability = "L"
+        provenance = ("Registry only — no verified page ⚠️" if registry_used
+                      else "No verified source")
 
-    if not verified:
-        reason = _status_reason_for_no_verified(unreadable_count, len(candidates))
-        diag.append(f"❌ No readable verified page — {reason}")
-        # Keep registry first-pass fields for visibility, but explicitly fail validation.
-        return {
-            "fields": fields,
-            "source_links": [],
-            "source_routes": {},
-            "candidate_pages": [c.url for c in candidates[:10]],
-            "provenance": "page not readable" if unreadable_count else "no verified page",
-            "provenance_by_field": {},
-            "reliability": "L",
-            "status": "Failed Validation",
-            "is_exact_match": False,
-            "rejection_reason": "page_not_readable" if unreadable_count else "unconfirmed",
-            "diagnostic_log": "\n".join(diag),
-        }
-
-    # Sort verified reads so the links and field-level winners prefer highest trust/richness.
-    for page in verified:
-        page.score = _page_base_score(page, market)
-    verified.sort(key=lambda p: (p.route != "A", -p.score, p.domain))
-
-    merged_page_fields, provenance_by_field = _merge_page_fields(verified, market)
-    for k, v in merged_page_fields.items():
-        if _real_value(v):
-            fields[k] = v
-
-    # If page did not expose a product name, preserve registry/user identity.
-    if not fields.get("product_name"):
-        fields["product_name"] = registry_name or clean_gt or f"Product with EAN {ean}"
-
-    # Source links are verified pages only. These are the pages contributing data.
-    for page in verified:
-        link = page.final_url or page.url
-        if link not in source_links and not _is_excluded_domain(link):
-            source_links.append(link)
-            source_routes[link] = page.route
-    source_links = source_links[:5]
-
-    has_route_a = any(p.route == "A" for p in verified)
-    has_route_b = any(p.route == "B" for p in verified)
-    if has_route_a:
-        reliability = "H"
-    elif has_route_b:
+    # A name-only (Route-B) match can never be H even if flagged as such above.
+    if reliability == "H" and not has_route_a:
         reliability = "M"
-    else:
-        reliability = "L"
 
-    if not any(p.readable for p in verified):
-        # Should be rare because JSON-LD pages are treated as readable, but keep the
-        # explicit v1 JS/cookie-wall failure mode requested.
-        reliability = "L"
-        status = "Failed Validation"
-        provenance = "page not readable"
-        exact = False
-        rejection = "page_not_readable"
-    else:
-        status = "Success"
-        provenance = "Verified page" if len(source_links) == 1 else "Verified pages"
-        exact = True
-        rejection = ""
+    diag.append(f"status={status} reliability={reliability} "
+                f"pages_read={sum(1 for p in read_pages if p['fields_nonempty'])}")
 
-    if registry_source:
-        diag.append(f"ℹ️ Registry identity used as discovery context only: {registry_source}")
-    diag.append(f"📄 Food data provenance: {provenance}; reliability={reliability}")
+    # Trust-ordered source links = the pages that actually contributed data.
+    source_links = used_urls or [p["url"] for p in read_pages]
 
     return {
-        "fields": fields,
+        "fields": {k: fields[k] for k in ALL_FIELD_KEYS},
         "source_links": source_links,
-        "source_routes": source_routes,
-        "candidate_pages": [c.url for c in candidates[:10]],
+        "source_routes": {u: source_routes.get(u, "") for u in source_links},
         "provenance": provenance,
-        "provenance_by_field": provenance_by_field,
         "reliability": reliability,
         "status": status,
-        "is_exact_match": exact,
-        "rejection_reason": rejection,
-        "diagnostic_log": "\n".join(diag),
+        "name": resolved_name or reg_name or "",
+        "ean_verified": ean_verified,
+        "retailer_urls": ordered,
+        "diagnostics": diag,
     }
