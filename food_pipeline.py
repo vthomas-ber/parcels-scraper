@@ -89,7 +89,7 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 # Max verified pages to read and fill across (richest/highest-trust wins).
 MAX_READ_PAGES = 4
 # Max candidate pages to fetch+verify before giving up (keeps HTTP bounded).
-MAX_CANDIDATES = 8
+MAX_CANDIDATES = 12
 _NAME_MATCH_THRESHOLD = 0.80
 
 GOLDMINE = {
@@ -767,7 +767,14 @@ def _extract_labelled_paragraph(soup, text_blob: str, out: dict) -> None:
             # Strip a repeated inline label prefix ("Zutaten: ...", "Ingredients: ...").
             seg = re.sub(r'^(?:zutaten|ingredients?|ingr\u00e9dients?|ingredienti|'
                          r'ingredi\u00ebnten|ingredienten|ingredientes|enthaltene\s+allergene|'
-                         r'allergene?|allergens?)\s*[:：]?\s*', '', seg, flags=re.I)
+                         r'allergene?|allergens?|info[s]?)\s*[:：]?\s*', '', seg, flags=re.I)
+            # For allergen fields, reject "see the ingredient list" style pointers
+            # (they carry no allergen data, e.g. "Siehe Hervorhebungen im ...").
+            if key in ("allergens", "may_contain") and re.search(
+                    r'\b(siehe|see|voir|zie|vedi|ver|hervorhebung|zutatenverzeichnis|'
+                    r'ingredient list|ingredient statement|markering|as highlighted|'
+                    r'in bold|fett gedruckt|in grassetto)\b', seg, flags=re.I):
+                continue
             if len(seg) >= min_len:
                 out[key] = seg[:500]
                 break
@@ -1188,6 +1195,56 @@ async def fetch_openfoodfacts(session, ean: str, market: str) -> dict | None:
     return None
 
 
+# Per-market Google localisation so SERP results match what a human in that
+# market sees (gl=country, hl=interface language, google_domain=local Google).
+_SERP_LOCALE = {
+    "DE": ("de", "de", "google.de"),   "AT": ("at", "de", "google.at"),
+    "NL": ("nl", "nl", "google.nl"),   "BE": ("be", "nl", "google.be"),
+    "FR": ("fr", "fr", "google.fr"),   "IT": ("it", "it", "google.it"),
+    "ES": ("es", "es", "google.es"),   "DK": ("dk", "da", "google.dk"),
+    "UK": ("uk", "en", "google.co.uk"), "PL": ("pl", "pl", "google.pl"),
+}
+
+
+def _serp_locale(market: str):
+    return _SERP_LOCALE.get((market or "").upper(),
+                            ((market or "world").lower(), "en", "google.com"))
+
+
+async def _serp_ean_organic(session, ean, market, serp_key,
+                            ground_truth="", limit=8) -> list:
+    """
+    One (or two) localised Google *organic* searches for the bare EAN — this is
+    the "search the barcode on Google" step a human does, and the step that
+    surfaces the retailer pages (onfos, delitea, swedishness, ...) that actually
+    carry the nutrition table. App-side discovery is name-resolution-gated and
+    skips this once a registry names the product, which is the main coverage
+    hole; running it here guarantees data-bearing pages are always considered.
+
+    Returns a de-duplicated list of candidate URLs (excluded domains removed).
+    """
+    if not serp_key or not ean:
+        return []
+    gl, hl, gd = _serp_locale(market)
+    queries = [str(ean)]
+    if ground_truth:
+        gt = strip_pack_notation(ground_truth) or ground_truth
+        queries.append(f"{gt} {ean}")
+    urls: list = []
+    for q in queries:
+        data = await _serp_get(session, {
+            "engine": "google", "q": q, "gl": gl, "hl": hl,
+            "google_domain": gd, "num": 10, "api_key": serp_key})
+        for res in (data or {}).get("organic_results", [])[:limit]:
+            link = res.get("link", "")
+            if (link and link.startswith("http")
+                    and not _is_excluded_domain(link) and link not in urls):
+                urls.append(link)
+        if len(urls) >= limit:
+            break
+    return urls[:limit]
+
+
 async def _serp_get(session, params: dict, timeout: int = 15) -> dict | None:
     global _SERP_SEM, _SERP_LOOP
     loop = asyncio.get_running_loop()
@@ -1399,6 +1456,27 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         resolved_name = resolved_name or resolved_name2
         ean_verified = ean_verified or ev2
         diag.append(f"Ladder discovered {len(candidates)} candidate page(s).")
+
+    # ---- Always add a localised bare-EAN organic search ----------------------
+    # In production app.py passes candidate_pages, but its ladder is name-gated
+    # and can skip the "google the EAN" step, missing the very pages that carry
+    # the data. Run that search here so coverage no longer depends on whether a
+    # registry happened to name the product. (Standalone mode already does an
+    # EAN search inside discover_candidate_pages, so only supplement when app.py
+    # supplied the candidates.) One extra SERP call per uncached EAN.
+    off_complete = bool(off) and bool(off["fields"].get("ingredients")) and \
+        sum(1 for k in _NUTRI_KEYS if off["fields"].get(k)) >= 6
+    if candidate_pages and keys.get("serp") and not off_complete:
+        extra = await _serp_ean_organic(session, ean, market, keys["serp"],
+                                        ground_truth)
+        new = [u for u in extra if u not in candidates
+               and not _is_excluded_domain(u)]
+        if new:
+            candidates = candidates + new
+            diag.append(f"EAN organic search added {len(new)} candidate(s): "
+                        f"{', '.join(_domain_of(u) for u in new[:4])}")
+    elif off_complete:
+        diag.append("OFF complete — skipped supplementary EAN search.")
 
     # De-dupe by domain, keep order, cap.
     anchors = [a for a in (clean_gt, reg_name) if a]
