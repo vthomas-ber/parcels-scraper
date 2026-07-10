@@ -22,7 +22,7 @@ st.set_page_config(page_title="Food Data Researcher PRO", layout="wide")
 
 # Bump this on every deploy. It's shown in the sidebar so you can confirm at a
 # glance which build Render is actually running (deployment lag has bitten us).
-BUILD_VERSION = "2026-07-10b · SERP-first discovery + OFF-internal + plausibility"
+BUILD_VERSION = "2026-07-10c · SERP-first · no OFF · plausibility guard"
 
 # Styled DMF Excel export (color-coded clusters, legend sheet, hidden audit cols)
 try:
