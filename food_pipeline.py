@@ -416,6 +416,16 @@ def _blank_fields() -> dict:
     return {k: "" for k in ALL_FIELD_KEYS}
 
 
+def _num_or_none(v):
+    """Parse a formatted field string ('12', '0,5', '1.3') to float, else None."""
+    if v in (None, "", "None"):
+        return None
+    try:
+        return float(str(v).replace(",", "."))
+    except ValueError:
+        return None
+
+
 def _implausible_nutrition(fields: dict) -> str:
     """
     Last-line physics backstop against parser / decimal corruption. Returns a
@@ -1260,6 +1270,54 @@ def _serp_locale(market: str):
                             ((market or "world").lower(), "en", "google.com"))
 
 
+async def _serp_discover(session, ean, market, serp_key,
+                         ground_truth="", name="", limit=10) -> list:
+    """
+    SERP-FIRST discovery ladder. Runs live web search BEFORE any reliance on the
+    EAN databases, in priority order:
+        1. Goldmine-targeted   ({market goldmine site} {EAN})      [Search 1]
+        2. Bare-EAN organic    ({EAN})                             [google-the-barcode]
+        3. Name + EAN          ({name} {EAN})
+        3b. Goldmine + name    ({goldmine} "{name}")
+        4. Name only           ("{name}")
+    All localised (gl/hl/google_domain). Collects organic result URLs in this
+    order (deduped, excluded domains removed). The EAN databases (Go-UPC / OFF)
+    contribute ONLY the `name` seed here — they never gate or replace this.
+    """
+    if not serp_key or not ean:
+        return []
+    gl, hl, gd = _serp_locale(market)
+    gm = (GOLDMINE.get((market or "").upper(), "") or "").strip()
+    nm = (strip_pack_notation(name or ground_truth) or name or ground_truth or "").strip()
+
+    queries = []
+    if gm:
+        queries.append(f"{gm} {ean}")             # 1. goldmine + EAN
+    queries.append(str(ean))                      # 2. bare EAN
+    if nm:
+        queries.append(f"{nm} {ean}")             # 3. name + EAN
+        if gm:
+            queries.append(f'{gm} "{nm}"')        # 3b. goldmine + name
+        queries.append(f'"{nm}"')                 # 4. name only
+
+    urls: list = []
+
+    def _add(link):
+        if (link and link.startswith("http")
+                and not _is_excluded_domain(link) and link not in urls):
+            urls.append(link)
+
+    for q in queries:
+        data = await _serp_get(session, {
+            "engine": "google", "q": q, "gl": gl, "hl": hl,
+            "google_domain": gd, "num": 10, "api_key": serp_key})
+        for res in (data or {}).get("organic_results", [])[:6]:
+            _add(res.get("link", ""))
+        if len(urls) >= limit:
+            break
+    return urls[:limit]
+
+
 async def _serp_ean_organic(session, ean, market, serp_key,
                             ground_truth="", limit=8) -> list:
     """
@@ -1493,42 +1551,38 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         resolved_off_name = ""
         diag.append("OpenFoodFacts: no product.")
 
-    # ---- Candidate discovery -------------------------------------------------
+    # ---- Candidate discovery (SERP-FIRST) -----------------------------------
+    # Live web search leads. The EAN databases (Go-UPC / OFF) only seed the
+    # product name used to sharpen the goldmine/name queries — they no longer
+    # gate discovery, and they never supply displayed data.
     resolved_name = reg_name
+    seed_name = resolved_off_name or reg_name or ""
+
     if candidate_pages:
-        candidates = [u for u in candidate_pages
-                      if u and u.startswith("http") and not _is_excluded_domain(u)]
-        diag.append(f"Using {len(candidates)} candidate page(s) from app.py.")
+        app_candidates = [u for u in candidate_pages
+                          if u and u.startswith("http") and not _is_excluded_domain(u)]
     else:
-        candidates, resolved_name2, ev2 = await discover_candidate_pages(
+        app_candidates, resolved_name2, ev2 = await discover_candidate_pages(
             session, ean, ground_truth, market, reg_name, keys, go_upc_data)
         resolved_name = resolved_name or resolved_name2
         ean_verified = ean_verified or ev2
-        diag.append(f"Ladder discovered {len(candidates)} candidate page(s).")
 
-    # ---- Always add a localised bare-EAN organic search ----------------------
-    # In production app.py passes candidate_pages, but its ladder is name-gated
-    # and can skip the "google the EAN" step, missing the very pages that carry
-    # the data. Run that search here so coverage no longer depends on whether a
-    # registry happened to name the product. (Standalone mode already does an
-    # EAN search inside discover_candidate_pages, so only supplement when app.py
-    # supplied the candidates.) One extra SERP call per uncached EAN.
-    off_complete = bool(off) and bool(off["fields"].get("ingredients")) and \
-        sum(1 for k in _NUTRI_KEYS if off["fields"].get(k)) >= 6
-    if candidate_pages and keys.get("serp") and not off_complete:
-        extra = await _serp_ean_organic(session, ean, market, keys["serp"],
-                                        ground_truth)
-        new = [u for u in extra if u not in candidates
-               and not _is_excluded_domain(u)]
-        if new:
-            candidates = candidates + new
-            diag.append(f"EAN organic search added {len(new)} candidate(s): "
-                        f"{', '.join(_domain_of(u) for u in new[:4])}")
-    elif off_complete:
-        diag.append("OFF complete — skipped supplementary EAN search.")
+    serp_candidates = []
+    if keys.get("serp"):
+        serp_candidates = await _serp_discover(
+            session, ean, market, keys["serp"], ground_truth, name=seed_name)
+        diag.append(f"SERP-first discovery: {len(serp_candidates)} page(s) "
+                    f"({', '.join(_domain_of(u) for u in serp_candidates[:5])}).")
+
+    # SERP-discovered pages FIRST, then app/image-pipeline pages as backup.
+    candidates = serp_candidates + [u for u in app_candidates
+                                    if u not in serp_candidates]
+    diag.append(f"{len(candidates)} candidate page(s) "
+                f"({len(serp_candidates)} from SERP, "
+                f"{len(app_candidates)} from app/images).")
 
     # De-dupe by domain, keep order, cap.
-    anchors = [a for a in (clean_gt, reg_name) if a]
+    anchors = [a for a in (clean_gt, reg_name, resolved_off_name) if a]
     seen_dom, ordered = set(), []
     for u in candidates:
         dom = _domain_of(u)
@@ -1584,8 +1638,9 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                     got.add(k)
         return len(got)
 
-    off_hits = sum(1 for k in _NUTRI_KEYS if off and off["fields"].get(k))
-    if keys.get("serp") and (_nutri_hits(read_pages) + off_hits) < 4:
+    # Rescue search when the REAL pages read so far are data-thin. (OFF is not
+    # counted — it can't be displayed, so it can't rescue the row.)
+    if keys.get("serp") and _nutri_hits(read_pages) < 4:
         diag.append("thin data -> aggregator rescue search")
         try:
             rescue = await _serp_get(session, {
@@ -1619,25 +1674,16 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         except Exception:
             pass
 
-    # ---- Inject Open Food Facts as a verified, EAN-keyed source -------------
-    # OFF is matched on the exact barcode (so it's EAN-verified, not a name
-    # guess) but it is community-maintained, so it gets its own "OFF" tier: it
-    # grades M on its own, and a real retailer page (Route A) still outranks it
-    # for both field priority and the H grade.
-    if off:
-        off_fields = dict(off["fields"])
-        off_fields["_gtins"] = {re.sub(r"\D", "", ean)}
-        read_pages.append({
-            "url": off["url"], "route": "OFF", "fields": off_fields,
-            "text": "", "readable": True, "fields_nonempty": True,
-        })
-        source_routes[off["url"]] = "OFF"
-        verified_any = True
-        readable_any = True
+    # ---- Open Food Facts is INTERNAL-ONLY ------------------------------------
+    # OFF is NOT injected as a source and its values are NEVER displayed. It is
+    # used only (a) to resolve the product name/brand for discovery + Route-B
+    # matching (done above), and (b) below, as a private validation reference to
+    # catch extraction errors in the scraped retailer data. The results table
+    # shows only real retailer/manufacturer pages.
 
-    # ---- Rank pages: retailer-A before OFF before B; then trusted-data first -
+    # ---- Rank pages: EAN-verified (Route A) before name-matched (Route B) ----
     def _rank(p):
-        tier = {"A": 0, "OFF": 1, "B": 2}.get(p["route"], 3)
+        tier = {"A": 0, "B": 1}.get(p["route"], 2)
         return (tier, 0 if (_is_goldmine(p["url"]) or _is_aggregator(p["url"])) else 1)
     read_pages.sort(key=_rank)
 
@@ -1680,6 +1726,28 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                         fields[k] = v
                         gemini_used = True
 
+    # ---- INTERNAL Open Food Facts cross-check (never displayed) --------------
+    # OFF is a private reference: if a scraped nutrition value disagrees with
+    # OFF by a large factor, the scrape is almost certainly a parse error
+    # (e.g. a ×1000 decimal slip or a wrong-column grab). Blank the offending
+    # field rather than ship a wrong number. We do NOT copy OFF's value in —
+    # only the retailer page's own value is ever shown.
+    off_flags = []
+    if off and off.get("fields"):
+        for k in _NUTRI_KEYS:
+            sv, ov = _num_or_none(fields.get(k)), _num_or_none(off["fields"].get(k))
+            if sv is None or ov is None:
+                continue
+            hi, lo = max(sv, ov), min(sv, ov)
+            if lo <= 0:
+                lo = 0.01
+            if hi / lo >= 5:                 # >5× disagreement = scrape suspect
+                fields[k] = ""
+                off_flags.append(k)
+    if off_flags:
+        diag.append("scraped values cleared (disagree with OFF reference): "
+                    + ", ".join(off_flags))
+
     # ---- Last-line plausibility backstop (decimal / parse corruption) --------
     # If the nutrition is physically impossible, blank it rather than shipping
     # garbage as "verified". Text fields (ingredients, brand) are kept.
@@ -1689,23 +1757,17 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             fields[k] = ""
         diag.append(f"Nutrition blanked — implausible ({nutrition_flag}).")
 
-    # ---- Grade + provenance --------------------------------------------------
+    # ---- Grade + provenance (real pages only; OFF is never a source) ---------
     live = [p for p in read_pages if p["fields_nonempty"]]
     has_retailer_a = any(p["route"] == "A" for p in live)
-    has_off        = any(p["route"] == "OFF" for p in live)
     has_route_b    = any(p["route"] == "B" for p in live)
 
     if readable_any:
         status = "success"
-        # H only when a real retailer page carried the EAN. OFF (community DB,
-        # EAN-keyed) and name-only retailer matches cap at M.
+        # H only when a real retailer page carried the EAN; a name-only match
+        # caps at M.
         reliability = "H" if has_retailer_a else "M"
-        off_only = has_off and not has_retailer_a and not has_route_b
-        if off_only:
-            provenance = "Open Food Facts (community DB) ⚠️"
-        elif has_off:
-            provenance = "Verified page + Open Food Facts"
-        elif registry_used or gemini_used:
+        if registry_used or gemini_used:
             provenance = "Verified page + fallback ⚠️"
         else:
             provenance = "Verified page"
@@ -1721,7 +1783,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         provenance = ("Registry only — no verified page ⚠️" if registry_used
                       else "No verified source")
 
-    # A name-only (Route-B) or OFF-only match can never be H.
+    # A name-only (Route-B) match can never be H.
     if reliability == "H" and not has_retailer_a:
         reliability = "M"
 
