@@ -416,6 +416,55 @@ def _blank_fields() -> dict:
     return {k: "" for k in ALL_FIELD_KEYS}
 
 
+def _implausible_nutrition(fields: dict) -> str:
+    """
+    Last-line physics backstop against parser / decimal corruption. Returns a
+    reason string when the per-100 g nutrition is physically impossible, else "".
+
+    The key invariant: fat + carbohydrate + protein cannot exceed 100 g per
+    100 g. Decimal corruption (0.039 -> 39, 0.062 -> 62) inflates individual
+    macros so their sum blows past 100, which is how a tea ends up "reading"
+    39 g fat + 62 g protein. Real foods — even oils (100 g fat) or sugar
+    (100 g carb) or protein isolate (~90 g protein) — always satisfy this.
+    """
+    def val(k):
+        v = fields.get(k)
+        if v in (None, "", "None"):
+            return None
+        try:
+            return float(str(v).replace(",", "."))
+        except ValueError:
+            return None
+
+    fat, carb, prot = val("fat_g"), val("carbohydrates_g"), val("protein_g")
+    sat, sug, fib, salt = (val("saturates_g"), val("sugars_g"),
+                           val("fiber_g"), val("salt_g"))
+
+    macro_sum = sum(x for x in (fat, carb, prot) if x is not None)
+    if macro_sum > 100.5:                     # 0.5 g tolerance for rounding
+        return f"fat+carb+protein = {macro_sum:g} g/100 g (>100)"
+    if fat is not None and sat is not None and sat > fat + 0.5:
+        return "saturated fat exceeds total fat"
+    if carb is not None and sug is not None and sug > carb + 0.5:
+        return "sugars exceed total carbohydrate"
+    # Energy vs macros: 9·fat + 4·carb + 4·protein + 2·fibre should roughly match
+    # stated energy. A macro corrupted ×1000 implies far more energy than stated.
+    energy = val("energy_kj")
+    if energy is not None and energy > 0:
+        kcal = 9 * (fat or 0) + 4 * (carb or 0) + 4 * (prot or 0) + 2 * (fib or 0)
+        kj_from_macros = kcal * 4.184
+        if kj_from_macros > max(energy * 3, energy + 800):
+            return (f"macros imply ~{kj_from_macros:.0f} kJ but energy states "
+                    f"{energy:g} kJ")
+    for k, cap in (("fat_g", 100), ("carbohydrates_g", 100), ("protein_g", 92),
+                   ("sugars_g", 100), ("saturates_g", 100), ("fiber_g", 90),
+                   ("salt_g", 100), ("energy_kj", 4000)):
+        v = val(k)
+        if v is not None and v > cap:
+            return f"{k} = {v:g} exceeds {cap}/100 g"
+    return ""
+
+
 # ============================================================================
 # DETERMINISTIC PARSER 1 — JSON-LD  (application/ld+json)
 # ============================================================================
@@ -1631,6 +1680,15 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                         fields[k] = v
                         gemini_used = True
 
+    # ---- Last-line plausibility backstop (decimal / parse corruption) --------
+    # If the nutrition is physically impossible, blank it rather than shipping
+    # garbage as "verified". Text fields (ingredients, brand) are kept.
+    nutrition_flag = _implausible_nutrition(fields)
+    if nutrition_flag:
+        for k in _NUTRI_KEYS:
+            fields[k] = ""
+        diag.append(f"Nutrition blanked — implausible ({nutrition_flag}).")
+
     # ---- Grade + provenance --------------------------------------------------
     live = [p for p in read_pages if p["fields_nonempty"]]
     has_retailer_a = any(p["route"] == "A" for p in live)
@@ -1666,6 +1724,12 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
     # A name-only (Route-B) or OFF-only match can never be H.
     if reliability == "H" and not has_retailer_a:
         reliability = "M"
+
+    # Corrupt/implausible nutrition was blanked above — never present such a row
+    # as trustworthy, whatever the source was.
+    if nutrition_flag:
+        reliability = "L"
+        provenance = f"Nutrition failed plausibility check ⚠️ ({nutrition_flag})"
 
     diag.append(f"status={status} reliability={reliability} "
                 f"pages_read={sum(1 for p in read_pages if p['fields_nonempty'])}")
