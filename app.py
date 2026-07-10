@@ -202,7 +202,7 @@ VISION_MODEL = "gemini-2.5-flash-lite"
 
 # Bump this whenever the extraction prompt or cache schema changes significantly.
 # All rows stored under a lower version are treated as cache misses on first load.
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 # Minimum vision confidence score (0.0–1.0) required to display an image.
 # Candidates below this threshold are rejected; their URL is preserved in
@@ -3130,20 +3130,6 @@ with st.sidebar:
         ]
     )
     market_code = market_selection.split("(")[1].replace(")", "")
-
-    # ── Cache management ──────────────────────────────────────────────────────
-    st.divider()
-    st.caption(f"🗃️ Cache: {cache_count()} stored result(s)")
-    _c1, _c2 = st.columns(2)
-    with _c1:
-        if st.button("Clear this market", help=f"Remove cached results for {market_code} only"):
-            _n = cache_clear(market_code)
-            st.success(f"Cleared {_n} entr{'y' if _n == 1 else 'ies'} for {market_code}.")
-    with _c2:
-        if st.button("Clear all", help="Remove ALL cached results (all markets)"):
-            _n = cache_clear()
-            st.success(f"Cleared {_n} cached entr{'y' if _n == 1 else 'ies'}.")
-    st.caption("Tip: prefix a line with `REFRESH ` to force-refresh a single EAN.")
 
     if not EAN_TOKEN:
         st.warning("⚠️ EAN_SEARCH_TOKEN not found in environment variables.")
