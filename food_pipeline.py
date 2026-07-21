@@ -1062,6 +1062,14 @@ _RENDER_LOCK: asyncio.Lock | None = None
 _RENDER_SEM: asyncio.Semaphore | None = None
 _PLAYWRIGHT_CTX = None
 _RENDER_BROWSER = None
+# Set once, permanently, the first time a launch attempt fails or times out.
+# Without this, a broken/missing browser on the host gets RE-attempted (and
+# re-blocks the shared _RENDER_LOCK) on every single page that wants the
+# fallback — under Streamlit's synchronous per-session execution, a single
+# hung launch can stall the whole app's response long enough to look like a
+# 502 to Render's proxy, however much RAM/CPU the instance has.
+_RENDER_UNAVAILABLE = False
+_RENDER_LAUNCH_TIMEOUT_S = int(os.environ.get("JS_RENDER_LAUNCH_TIMEOUT_S", "25"))
 
 # Best-effort cookie/consent-banner dismissal. Many EU retailer sites gate
 # the underlying page content behind a consent click even after JS has
@@ -1078,28 +1086,55 @@ _CONSENT_SELECTORS = (
 )
 
 
+async def _launch_render_browser():
+    """The actual launch sequence, run under a wait_for() timeout by the caller."""
+    global _PLAYWRIGHT_CTX
+    _PLAYWRIGHT_CTX = await async_playwright().start()
+    launch_kwargs = {
+        "headless": True,
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+    }
+    # Optional override for environments (like sandboxed dev containers) that
+    # ship a pre-installed browser at a nonstandard path instead of the one
+    # `playwright install chromium` puts under ~/.cache/ms-playwright. Unset
+    # in normal deployment — Playwright finds its own installed browser
+    # automatically.
+    exe = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
+    if exe:
+        launch_kwargs["executable_path"] = exe
+    return await _PLAYWRIGHT_CTX.chromium.launch(**launch_kwargs)
+
+
 async def _get_render_browser():
-    """Lazily launch (once) and return the shared headless Chromium instance."""
-    global _RENDER_LOCK, _PLAYWRIGHT_CTX, _RENDER_BROWSER
+    """
+    Lazily launch (once) and return the shared headless Chromium instance, or
+    None if it's unavailable on this host. Bounded by _RENDER_LAUNCH_TIMEOUT_S
+    so a broken install can never hang instead of failing; a failure is
+    cached in _RENDER_UNAVAILABLE so it's detected ONCE per process, not
+    re-attempted (and re-blocking the shared lock) on every subsequent page.
+    """
+    global _RENDER_LOCK, _RENDER_BROWSER, _RENDER_UNAVAILABLE
+    if _RENDER_UNAVAILABLE:
+        return None
     if _RENDER_LOCK is None:
         _RENDER_LOCK = asyncio.Lock()
     async with _RENDER_LOCK:
+        if _RENDER_UNAVAILABLE:
+            return None
         if _RENDER_BROWSER is None:
-            _PLAYWRIGHT_CTX = await async_playwright().start()
-            launch_kwargs = {
-                "headless": True,
-                "args": ["--no-sandbox", "--disable-dev-shm-usage",
-                         "--disable-gpu"],
-            }
-            # Optional override for environments (like sandboxed dev
-            # containers) that ship a pre-installed browser at a nonstandard
-            # path instead of the one `playwright install chromium` puts
-            # under ~/.cache/ms-playwright. Unset in normal deployment —
-            # Playwright finds its own installed browser automatically.
-            exe = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
-            if exe:
-                launch_kwargs["executable_path"] = exe
-            _RENDER_BROWSER = await _PLAYWRIGHT_CTX.chromium.launch(**launch_kwargs)
+            try:
+                _RENDER_BROWSER = await asyncio.wait_for(
+                    _launch_render_browser(), timeout=_RENDER_LAUNCH_TIMEOUT_S)
+            except Exception as e:
+                _RENDER_UNAVAILABLE = True
+                # Visible in Render's runtime logs even though callers only
+                # ever see "" — this is the one place worth a hard print,
+                # since fetch_html_rendered's fail-soft contract would
+                # otherwise swallow this completely silently.
+                print(f"[js_render] Chromium unavailable — disabling the "
+                      f"JS-render fallback for this process ("
+                      f"{type(e).__name__}: {str(e)[:200]}).")
+                return None
         return _RENDER_BROWSER
 
 
@@ -1136,6 +1171,8 @@ async def fetch_html_rendered(url: str, timeout_ms: int = RENDER_TIMEOUT_MS) -> 
         context = None
         try:
             browser = await _get_render_browser()
+            if browser is None:
+                return ""   # unavailable on this host — _RENDER_UNAVAILABLE is now cached
             context = await browser.new_context(
                 user_agent=_UA,
                 extra_http_headers={"Accept-Language": _FETCH_HEADERS["Accept-Language"]},
