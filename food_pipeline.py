@@ -1086,13 +1086,32 @@ _CONSENT_SELECTORS = (
 )
 
 
+
+# Playwright/Chromium's default automation fingerprint (navigator.webdriver
+# = true, --enable-automation banner, etc.) is trivially detected by any
+# common WAF/anti-bot layer (Cloudflare, Akamai, DataDome, ...), which then
+# serves a challenge/block page INSTEAD of the real content — indistinguishable
+# from a genuine JS-rendering failure unless you know to look for it. These
+# are the standard, well-established mitigations (not a full stealth suite,
+# just the highest-value/lowest-risk ones): a launch flag that removes the
+# most obvious automation flag Blink itself exposes, and an init script that
+# patches the handful of properties most detection scripts actually check.
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+window.chrome = window.chrome || { runtime: {} };
+"""
+
+
 async def _launch_render_browser():
     """The actual launch sequence, run under a wait_for() timeout by the caller."""
     global _PLAYWRIGHT_CTX
     _PLAYWRIGHT_CTX = await async_playwright().start()
     launch_kwargs = {
         "headless": True,
-        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--disable-blink-features=AutomationControlled"],
     }
     # Optional override for environments (like sandboxed dev containers) that
     # ship a pre-installed browser at a nonstandard path instead of the one
@@ -1179,6 +1198,7 @@ async def fetch_html_rendered(url: str, timeout_ms: int = RENDER_TIMEOUT_MS) -> 
                 viewport={"width": 1366, "height": 900},
             )
             context.set_default_timeout(timeout_ms)
+            await context.add_init_script(_STEALTH_INIT_SCRIPT)
             page = await context.new_page()
             try:
                 await page.goto(url, timeout=timeout_ms, wait_until="networkidle")
@@ -1520,17 +1540,28 @@ async def _serp_discover(session, ean, market, serp_key,
         2. Bare-EAN organic    ({EAN})                             [google-the-barcode, WORLDWIDE]
         3. Name + EAN          ({name} {EAN})                      [WORLDWIDE]
         3b. Goldmine + name    ({goldmine} "{name}")                [LOCALISED]
-        4. Name only           ("{name}")                          [WORLDWIDE]
+        4. Name only, exact    ("{name}")                          [WORLDWIDE]
+        5. Name only, natural  ({name})                            [WORLDWIDE]
 
     The selected market is NOT a source filter. It only localises the two
     goldmine-site: queries (1, 3b) so the user's own market's trusted retailers
-    get a fair, language-appropriate shot. Queries 2-4 carry no site:
+    get a fair, language-appropriate shot. Queries 2-5 carry no site:
     restriction, so they deliberately run WITHOUT gl/hl/google_domain bias —
     a trusted (goldmine/brand) page in ANY country must be discoverable for a
     product sold anywhere (e.g. a BE-market EAN whose only clean data page is
     on an Italian retailer). Geo-biasing those queries silently suppressed
     exactly that case. Market only ever controls output LANGUAGE for
     allergens/may-contain (see translate_allergen_fields), never eligibility.
+
+    Query 5 exists because query 4's exact-phrase quoting is often too
+    strict: `ground_truth` is frequently a translated/localised product name
+    (e.g. a Dutch description of an Italian product) that won't appear
+    verbatim on ANY retailer's page, so the exact-phrase query returns
+    nothing even when the product is trivially findable — exactly what a
+    human typing the same words into Google *without* quotes gets right,
+    because Google's normal relevance ranking (word order/synonym flexible)
+    is what actually finds it, not a literal substring match.
+
     Collects organic result URLs in order (deduped, excluded domains removed).
     The Go-UPC registry contributes ONLY the `name` seed here — it never gates
     or replaces this.
@@ -1551,7 +1582,8 @@ async def _serp_discover(session, ean, market, serp_key,
         queries.append((f"{nm} {ean}", False))              # 3. name + EAN
         if gm:
             queries.append((f'{gm} "{nm}"', True))          # 3b. goldmine + name
-        queries.append((f'"{nm}"', False))                  # 4. name only
+        queries.append((f'"{nm}"', False))                  # 4. name only, exact phrase
+        queries.append((nm, False))                         # 5. name only, natural (no quotes)
 
     urls: list = []
 
