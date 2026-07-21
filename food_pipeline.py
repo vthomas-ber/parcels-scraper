@@ -61,6 +61,7 @@ import json
 import os
 import re
 from html import unescape
+from urllib.parse import urlsplit
 
 try:
     from bs4 import BeautifulSoup
@@ -1853,23 +1854,43 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                 f"({len(serp_candidates)} from SERP, "
                 f"{len(app_candidates)} from app/images).")
 
-    # De-dupe by domain, keep order, cap.
+    # De-dupe by domain, cap. When multiple candidates share a domain, keep
+    # the most specific one (longer URL path = more likely an actual product
+    # page, not a homepage/category listing) rather than whichever happened
+    # to come first in list order. Blind first-wins previously let a generic
+    # _serp_discover hit for a domain silently block out an already
+    # externally-verified, more specific product-page URL for that SAME
+    # domain from app.py's own pipeline (e.g. the brand's own EAN-confirmed
+    # product page) — the better URL was discarded before it was ever tried.
     anchors = [a for a in (clean_gt, reg_name) if a]
     brand_for_trust = extract_brand(clean_gt or "") or extract_brand(reg_name or "")
-    seen_dom, ordered = set(), []
+    by_domain: dict = {}
+    dom_order: list = []
     for u in candidates:
         dom = _domain_of(u)
-        if dom and dom not in seen_dom:
-            seen_dom.add(dom)
-            ordered.append(u)
+        if not dom:
+            continue
+        if dom not in by_domain:
+            by_domain[dom] = u
+            dom_order.append(dom)
+        else:
+            cur_path = urlsplit(by_domain[dom]).path
+            new_path = urlsplit(u).path
+            if len(new_path) > len(cur_path):
+                by_domain[dom] = u
+    ordered = [by_domain[d] for d in dom_order]
     ordered = ordered[:MAX_CANDIDATES]
+    seen_dom = set(dom_order[:MAX_CANDIDATES])  # used by the rescue pass below
 
-    # ---- Verify + read each candidate ---------------------------------------
-    read_pages: list = []       # dicts: {url, route, fields, text}
+    # ---- Pass 1: verify + read each candidate with a plain HTTP fetch -------
+    # No rendering here — this pass just establishes, cheaply, which
+    # candidates verify and which of those come back data-thin.
+    read_pages: list = []       # dicts: {url, route, fields, text, trusted, ...}
     source_routes: dict = {}
     verified_any = False
     readable_any = False
-    renders_done = 0   # bounds total JS-render fallback calls for this product
+    unverified: list = []       # (url, trusted) — plain fetch couldn't verify at
+                                 # all; lowest-priority render candidates (Pass 2).
 
     for url in ordered:
         if len([p for p in read_pages if p["fields_nonempty"]]) >= MAX_READ_PAGES:
@@ -1881,37 +1902,13 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                               trusted=trusted) if html else None)
         nonempty = any(page_fields.get(k) for k in ALL_FIELD_KEYS)
 
-        # JS-render fallback: the plain fetch either couldn't verify this
-        # candidate at all (route is None — could be a bot-blocked or
-        # cookie-gated response) or verified it but came back data-thin (a
-        # classic client-side-rendered page). Retry with a real browser and
-        # re-run the SAME deterministic parsers on the rendered DOM — bounded
-        # per-product (MAX_RENDERS_PER_PRODUCT) so a page-full of thin
-        # candidates can't blow up per-EAN latency.
-        rendered_used = False
-        if (route is None or not nonempty) and renders_done < MAX_RENDERS_PER_PRODUCT:
-            rendered_html = await fetch_html_rendered(url)
-            if rendered_html and rendered_html != html:
-                renders_done += 1
-                r_fields = extract_page_fields(rendered_html, ean)
-                r_route = verify_route(rendered_html, ean, anchors,
-                                       r_fields.get("_gtins"), trusted=trusted)
-                r_nonempty = any(r_fields.get(k) for k in ALL_FIELD_KEYS)
-                if r_route is not None and (route is None or r_nonempty):
-                    page_fields, route, nonempty, html = \
-                        r_fields, r_route, r_nonempty, rendered_html
-                    rendered_used = True
-
         if route is None:
             reason = "fetch failed" if not html else "neither EAN nor trusted-name match"
             diag.append(f"skip ({reason}): {_domain_of(url)}")
+            unverified.append((url, trusted))
             continue
         verified_any = True
         source_routes[url] = route
-        # A page is "readable" for grading purposes when the deterministic
-        # parsers pulled ANY real field out of it. A JS/cookie-walled shell
-        # returns markup with no product data -> nonempty is False -> the page
-        # counts as verified-but-not-readable (handled below).
         if nonempty:
             readable_any = True
         read_pages.append({
@@ -1920,8 +1917,68 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             "readable": nonempty, "fields_nonempty": nonempty,
         })
         diag.append(f"verified Route {route} ({'trusted' if trusted else 'untrusted'}, "
-                    f"{'read' if nonempty else 'thin'}"
-                    f"{', JS-rendered' if rendered_used else ''}): {_domain_of(url)}")
+                    f"{'read' if nonempty else 'thin'}): {_domain_of(url)}")
+
+    # ---- Pass 2: JS-render fallback, spent on the MOST PROMISING candidates -
+    # first. A page that already verified (EAN or trusted-name match) but
+    # came back data-thin is a near-certain client-side-rendered page AND we
+    # already know it's the right product — the highest-value render target
+    # by far. Previously the render budget was spent in plain candidate-list
+    # order, so early "fetch failed" domains (often simply irrelevant or
+    # network-blocked, which rendering won't fix either) could exhaust
+    # MAX_RENDERS_PER_PRODUCT before the loop ever reached a verified-but-thin
+    # trusted retailer later in the list. Priority here: trusted+thin, then
+    # untrusted+thin, then genuinely unverified candidates with any leftover
+    # budget.
+    renders_done = 0
+    if _PLAYWRIGHT_OK and JS_RENDER_ENABLED:
+        thin_pages = [p for p in read_pages if not p["fields_nonempty"]]
+        thin_pages.sort(key=lambda p: 0 if p["trusted"] else 1)
+        render_queue = [("verified", p) for p in thin_pages] + \
+                       [("unverified", u) for u in unverified]
+
+        for kind, item in render_queue:
+            if renders_done >= MAX_RENDERS_PER_PRODUCT:
+                break
+            if len([p for p in read_pages if p["fields_nonempty"]]) >= MAX_READ_PAGES:
+                break
+            url, trusted = (item["url"], item["trusted"]) if kind == "verified" else item
+
+            rendered_html = await fetch_html_rendered(url)
+            if not rendered_html:
+                continue
+            renders_done += 1
+            r_fields = extract_page_fields(rendered_html, ean)
+            r_route = verify_route(rendered_html, ean, anchors,
+                                   r_fields.get("_gtins"), trusted=trusted)
+            r_nonempty = any(r_fields.get(k) for k in ALL_FIELD_KEYS)
+
+            if kind == "verified":
+                p = item
+                if r_route is not None and r_nonempty:
+                    p["fields"], p["route"] = r_fields, r_route
+                    p["text"] = page_visible_text(rendered_html)
+                    p["readable"] = p["fields_nonempty"] = True
+                    source_routes[url] = r_route
+                    readable_any = True
+                    diag.append(f"JS-render rescue succeeded (was thin): {_domain_of(url)}")
+                else:
+                    diag.append(f"JS-render rescue found nothing new: {_domain_of(url)}")
+            else:
+                if r_route is not None:
+                    verified_any = True
+                    source_routes[url] = r_route
+                    if r_nonempty:
+                        readable_any = True
+                    read_pages.append({
+                        "url": url, "route": r_route, "fields": r_fields,
+                        "text": page_visible_text(rendered_html), "trusted": trusted,
+                        "readable": r_nonempty, "fields_nonempty": r_nonempty,
+                    })
+                    diag.append(f"JS-render rescue verified Route {r_route} "
+                                f"({'read' if r_nonempty else 'thin'}): {_domain_of(url)}")
+                else:
+                    diag.append(f"JS-render rescue still unverified: {_domain_of(url)}")
 
     # ---- Rescue pass: if the pages so far gave thin nutrition, run ONE -------
     # aggregator-targeted bare-EAN search (codecheck / fddb / digit-eyes / ...)
