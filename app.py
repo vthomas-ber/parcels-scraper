@@ -949,10 +949,13 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
     # miss. Accept a result when the EAN appears in the SNIPPET (Google indexed
     # the GTIN on-page — Tier A-grade evidence) or the page itself confirms it.
     if not product_name and serp_key and _clean_ground_truth:
-        diagnostic_log.append("🔍 Combined name+EAN query...")
+        diagnostic_log.append("🔍 Combined name+EAN query (worldwide, no market bias)...")
         try:
+            # No site: restriction here, so no gl bias either — a page carrying
+            # this EAN is equally valid evidence in any country; the market
+            # selection must not suppress it from the results Google returns.
             data_c = await _serp_get(session, serp_url,
-                params={"q": f"{_clean_ground_truth} {ean}", "gl": gl, "api_key": serp_key})
+                params={"q": f"{_clean_ground_truth} {ean}", "api_key": serp_key})
             organic_c = data_c.get("organic_results", []) if data_c else []
             for res in organic_c[:5]:
                 link = res.get("link", "")
@@ -1009,10 +1012,11 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
     # never ran when goldmine returned junk. Now fires whenever the name is
     # still unresolved after Attempt 3.
     if not product_name and serp_key:
-        diagnostic_log.append("⚠️ Name still unresolved — bare GTIN global fallback (low confidence)...")
+        diagnostic_log.append("⚠️ Name still unresolved — bare GTIN global fallback (worldwide, low confidence)...")
         try:
+            # No site: restriction — no gl bias, for the same reason as Attempt 2.5.
             data2 = await _serp_get(session, serp_url,
-                params={"q": str(ean), "gl": gl, "api_key": serp_key})
+                params={"q": str(ean), "api_key": serp_key})
             if _serp_error(data2):
                 search_failed = True
                 diagnostic_log.append(f"❌ SERP_FAILED Bare GTIN: HTTP {_serp_error(data2)}")
@@ -1049,14 +1053,19 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
     if not product_name and serp_key and _clean_ground_truth:
         diagnostic_log.append(f"🔍 Name-based fallback: searching by ground truth '{_clean_ground_truth[:60]}'...")
         _name_goldmine = GOLDMINE.get(market_upper, "").strip()
-        _name_queries  = [q for q in (
-            f'{_name_goldmine} "{_clean_ground_truth}"' if _name_goldmine else "",
-            f'"{_clean_ground_truth}"',
+        # (query, localize) — the goldmine-restricted query is market-localized;
+        # the bare-name query has no site: restriction, so it runs worldwide
+        # (same reasoning as Attempts 2.5/4 above).
+        _name_queries = [q for q in (
+            (f'{_name_goldmine} "{_clean_ground_truth}"', True) if _name_goldmine else None,
+            (f'"{_clean_ground_truth}"', False),
         ) if q]
         try:
-            for _nq in _name_queries:
-                data3 = await _serp_get(session, serp_url,
-                    params={"q": _nq, "gl": gl, "api_key": serp_key})
+            for _nq, _localize in _name_queries:
+                _nq_params = {"q": _nq, "api_key": serp_key}
+                if _localize:
+                    _nq_params["gl"] = gl
+                data3 = await _serp_get(session, serp_url, params=_nq_params)
                 if _serp_error(data3):
                     search_failed = True
                     diagnostic_log.append(f"❌ SERP_FAILED Name fallback: HTTP {_serp_error(data3)}")
@@ -2407,10 +2416,11 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
             diag.log(f"⚠️ Goldmine failed: {e}")
 
     if serp_key and (not retailer_urls or not product_name):
-        diag.log("🔍 Global GTIN search for retailer URLs...")
+        diag.log("🔍 Global GTIN search for retailer URLs (worldwide, no market bias)...")
         try:
+            # No site: restriction — no gl bias (see Attempts 2.5/4 in fetch_basic_info).
             data    = await _serp_get(session, serp_url,
-                params={"q": str(ean), "gl": gl, "api_key": serp_key})
+                params={"q": str(ean), "api_key": serp_key})
             organic = data.get("organic_results", []) if data else []
             if organic:
                 if not product_name:
@@ -2443,15 +2453,20 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     if serp_key and _clean_gt and (not product_name or not retailer_urls):
         diag.log(f"🔍 Name-based fallback: '{_clean_gt[:60]}'...")
         _nb_goldmine = GOLDMINE.get(market_upper, "").strip()
-        _nb_queries  = [q for q in (
-            f'{_clean_gt} {ean}',                                  # combined — strongest
-            f'{_nb_goldmine} "{_clean_gt}"' if _nb_goldmine else "",
-            f'"{_clean_gt}"',
+        # (query, localize) — only the goldmine site:-restricted query is
+        # market-localized; the unrestricted queries run worldwide so a
+        # trusted page in another market isn't geo-biased away.
+        _nb_queries = [q for q in (
+            (f'{_clean_gt} {ean}', False),                         # combined — strongest
+            (f'{_nb_goldmine} "{_clean_gt}"', True) if _nb_goldmine else None,
+            (f'"{_clean_gt}"', False),
         ) if q]
         try:
-            for _nq in _nb_queries:
-                data_nb = await _serp_get(session, serp_url,
-                    params={"q": _nq, "gl": gl, "api_key": serp_key})
+            for _nq, _localize in _nb_queries:
+                _nb_params = {"q": _nq, "api_key": serp_key}
+                if _localize:
+                    _nb_params["gl"] = gl
+                data_nb = await _serp_get(session, serp_url, params=_nb_params)
                 organic_nb = data_nb.get("organic_results", []) if data_nb else []
                 found_here = False
                 for res in organic_nb[:4]:
@@ -3398,10 +3413,7 @@ if "results_df" in st.session_state:
         "Brand",
         "Status",
         "Info Reliability",
-        "Link Basis",
-        "Data Provenance",
         "Reliability Reasoning",
-        "Chain of Thought",
         "Category L1",
         "Category L2",
         "Category L3",
@@ -3446,6 +3458,11 @@ if "results_df" in st.session_state:
     existing_ordered = [c for c in column_order if c in df.columns]
     remaining        = [c for c in df.columns if c not in column_order]
     df               = df[existing_ordered + remaining]
+
+    # Always hidden from the main results view (still computed and still in
+    # the Excel export's hidden audit clusters — just not shown here).
+    df = df.drop(columns=["Link Basis", "Data Provenance", "Chain of Thought"],
+                  errors="ignore")
 
     st.subheader("📊 Results")
 
