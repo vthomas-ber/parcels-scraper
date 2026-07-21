@@ -1192,6 +1192,71 @@ PAGE TEXT:
 
 
 # ============================================================================
+# MARKET-LANGUAGE LOCALISATION FOR ALLERGENS / MAY-CONTAIN
+# The selected market is NOT a source filter (discovery is deliberately
+# market-agnostic — see _serp_discover). Its only remaining job is choosing
+# the OUTPUT LANGUAGE for the allergens / may-contain fields, since those are
+# the fields a market's own compliance/labelling process actually reads.
+# Ingredients and every other text field are left exactly as extracted —
+# translating those risks altering a manufacturer's exact wording.
+# ============================================================================
+
+_MARKET_LANGUAGE_NAME = {
+    "de": "German", "nl": "Dutch", "fr": "French", "it": "Italian",
+    "es": "Spanish", "da": "Danish", "en": "English", "pl": "Polish",
+}
+_ALLERGEN_LOCALIZE_FIELDS = ("allergens", "may_contain")
+
+
+def translate_allergen_fields(fields: dict, market: str, gemini_key: str) -> dict:
+    """
+    Translate ONLY allergens/may_contain into the selected market's language,
+    verbatim (temperature 0, no content added/removed/inferred) — a pure
+    localisation pass over whatever language the winning source happened to
+    be in. Returns `fields` unchanged on any failure (fail-safe, not
+    fail-blank: an untranslated value is still correct data).
+    """
+    if not (_GENAI_OK and gemini_key):
+        return fields
+    want = {k: fields[k] for k in _ALLERGEN_LOCALIZE_FIELDS if fields.get(k)}
+    if not want:
+        return fields
+    _, hl, _ = _serp_locale(market)
+    lang_name = _MARKET_LANGUAGE_NAME.get(hl, "English")
+    prompt = f"""Translate ONLY the JSON values below into {lang_name}, verbatim.
+Do not add, remove, infer, or otherwise change any information — translate the
+language only. If a value is already in {lang_name}, return it unchanged.
+Return ONLY a JSON object with the same keys, no prose:
+{json.dumps(want, ensure_ascii=False)}
+"""
+    try:
+        client = genai.Client(api_key=gemini_key)
+        resp = client.models.generate_content(
+            model=EXTRACTION_MODEL,
+            contents=[prompt],
+            config=types.GenerateContentConfig(temperature=0.0, max_output_tokens=512),
+        )
+        raw = ""
+        if resp.candidates and resp.candidates[0].content and resp.candidates[0].content.parts:
+            for part in resp.candidates[0].content.parts:
+                if getattr(part, "text", None):
+                    raw += part.text
+        raw = raw.strip().replace("```json", "").replace("```", "").strip()
+        m = re.search(r"\{.*\}", raw, re.S)
+        if not m:
+            return fields
+        translated = json.loads(m.group(0))
+        out = dict(fields)
+        for k in want:
+            v = translated.get(k)
+            if v and isinstance(v, str):
+                out[k] = _clean_text(v)[:500]
+        return out
+    except Exception:
+        return fields
+
+
+# ============================================================================
 # DISCOVERY LADDER  (used only when candidate_pages is not supplied — e.g. tests)
 # Production app.py passes already-discovered pages, so this stays dormant there.
 # ============================================================================
@@ -1259,14 +1324,24 @@ async def _serp_discover(session, ean, market, serp_key,
     """
     SERP-FIRST discovery ladder. Runs live web search BEFORE any reliance on the
     EAN databases, in priority order:
-        1. Goldmine-targeted   ({market goldmine site} {EAN})      [Search 1]
-        2. Bare-EAN organic    ({EAN})                             [google-the-barcode]
-        3. Name + EAN          ({name} {EAN})
-        3b. Goldmine + name    ({goldmine} "{name}")
-        4. Name only           ("{name}")
-    All localised (gl/hl/google_domain). Collects organic result URLs in this
-    order (deduped, excluded domains removed). The Go-UPC registry
-    contribute ONLY the `name` seed here — they never gate or replace this.
+        1. Goldmine-targeted   ({market goldmine site} {EAN})      [Search 1, LOCALISED]
+        2. Bare-EAN organic    ({EAN})                             [google-the-barcode, WORLDWIDE]
+        3. Name + EAN          ({name} {EAN})                      [WORLDWIDE]
+        3b. Goldmine + name    ({goldmine} "{name}")                [LOCALISED]
+        4. Name only           ("{name}")                          [WORLDWIDE]
+
+    The selected market is NOT a source filter. It only localises the two
+    goldmine-site: queries (1, 3b) so the user's own market's trusted retailers
+    get a fair, language-appropriate shot. Queries 2-4 carry no site:
+    restriction, so they deliberately run WITHOUT gl/hl/google_domain bias —
+    a trusted (goldmine/brand) page in ANY country must be discoverable for a
+    product sold anywhere (e.g. a BE-market EAN whose only clean data page is
+    on an Italian retailer). Geo-biasing those queries silently suppressed
+    exactly that case. Market only ever controls output LANGUAGE for
+    allergens/may-contain (see translate_allergen_fields), never eligibility.
+    Collects organic result URLs in order (deduped, excluded domains removed).
+    The Go-UPC registry contributes ONLY the `name` seed here — it never gates
+    or replaces this.
     """
     if not serp_key or not ean:
         return []
@@ -1274,15 +1349,17 @@ async def _serp_discover(session, ean, market, serp_key,
     gm = (GOLDMINE.get((market or "").upper(), "") or "").strip()
     nm = (strip_pack_notation(name or ground_truth) or name or ground_truth or "").strip()
 
+    # (query, localize) — localize=True adds the market's gl/hl/google_domain;
+    # localize=False runs worldwide, unbiased.
     queries = []
     if gm:
-        queries.append(f"{gm} {ean}")             # 1. goldmine + EAN
-    queries.append(str(ean))                      # 2. bare EAN
+        queries.append((f"{gm} {ean}", True))              # 1. goldmine + EAN
+    queries.append((str(ean), False))                       # 2. bare EAN
     if nm:
-        queries.append(f"{nm} {ean}")             # 3. name + EAN
+        queries.append((f"{nm} {ean}", False))              # 3. name + EAN
         if gm:
-            queries.append(f'{gm} "{nm}"')        # 3b. goldmine + name
-        queries.append(f'"{nm}"')                 # 4. name only
+            queries.append((f'{gm} "{nm}"', True))          # 3b. goldmine + name
+        queries.append((f'"{nm}"', False))                  # 4. name only
 
     urls: list = []
 
@@ -1291,10 +1368,11 @@ async def _serp_discover(session, ean, market, serp_key,
                 and not _is_excluded_domain(link) and link not in urls):
             urls.append(link)
 
-    for q in queries:
-        data = await _serp_get(session, {
-            "engine": "google", "q": q, "gl": gl, "hl": hl,
-            "google_domain": gd, "num": 10, "api_key": serp_key})
+    for q, localize in queries:
+        params = {"engine": "google", "q": q, "num": 10, "api_key": serp_key}
+        if localize:
+            params.update({"gl": gl, "hl": hl, "google_domain": gd})
+        data = await _serp_get(session, params)
         for res in (data or {}).get("organic_results", [])[:6]:
             _add(res.get("link", ""))
         if len(urls) >= limit:
@@ -1616,9 +1694,9 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
     if keys.get("serp") and _nutri_hits(read_pages) < 4:
         diag.append("thin data -> aggregator rescue search")
         try:
+            # Aggregators (codecheck/fddb/etc.) are pan-market — no gl bias.
             rescue = await _serp_get(session, {
-                "q": f"{_DATA_AGGREGATOR_QUERY} {ean}",
-                "gl": (market or "us").lower(), "api_key": keys["serp"]})
+                "q": f"{_DATA_AGGREGATOR_QUERY} {ean}", "api_key": keys["serp"]})
             rescue_urls = [r.get("link", "") for r in
                            (rescue or {}).get("organic_results", [])[:6]]
             for url in rescue_urls:
@@ -1702,6 +1780,11 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                     if v and not fields[k]:
                         fields[k] = v
                         gemini_used = True
+
+    # ---- Market-language localisation for allergens / may-contain -----------
+    # Market selection controls ONLY this — never which sources are eligible.
+    if gemini_key:
+        fields = translate_allergen_fields(fields, market, gemini_key)
 
     # ---- Last-line plausibility backstop (decimal / parse corruption) --------
     # The physics check is now the sole corruption guard (OFF is not queried).
