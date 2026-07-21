@@ -3576,7 +3576,7 @@ if "results_df" in st.session_state:
             rerun_progress = st.progress(0.0)
             rerun_status   = st.empty()
             with st.spinner(f"Re-running {len(rerun_inputs)} EAN(s)..."):
-                rerun_data, _ = asyncio.run(
+                rerun_data, rerun_diags = asyncio.run(
                     run_main(rerun_inputs, SERP_KEY, GEMINI_KEY, EAN_TOKEN, GO_UPC_KEY,
                              market_code, taxonomy_text, rerun_progress, rerun_status)
                 )
@@ -3584,7 +3584,12 @@ if "results_df" in st.session_state:
                 if "Cached" not in rerun_df.columns:
                     rerun_df["Cached"] = "🔄 Fresh"
                 rerun_df.insert(0, "Re-run?", False)
+                # EAN -> fresh diagnostics, so the "Image pipeline diagnostics"
+                # panel below reflects THIS re-run, not stale text from
+                # whatever the original run found for that row.
+                rerun_diag_by_ean = dict(zip(rerun_df["GTIN / EAN"], rerun_diags))
                 base_df = st.session_state["results_df"].copy()
+                base_diags = list(st.session_state.get("image_diags", []))
                 for _, fresh_row in rerun_df.iterrows():
                     mask = base_df["GTIN / EAN"] == fresh_row["GTIN / EAN"]
                     if mask.any():
@@ -3592,7 +3597,11 @@ if "results_df" in st.session_state:
                         for col in fresh_row.index:
                             if col in base_df.columns:
                                 base_df.at[idx, col] = fresh_row[col]
+                        new_diag = rerun_diag_by_ean.get(fresh_row["GTIN / EAN"])
+                        if new_diag is not None and idx < len(base_diags):
+                            base_diags[idx] = new_diag
                 st.session_state["results_df"] = base_df
+                st.session_state["image_diags"] = base_diags
                 st.success(f"✅ Re-run complete for {len(rerun_eans)} EAN(s). Scroll up to see updated results.")
                 st.rerun()
 
