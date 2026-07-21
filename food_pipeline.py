@@ -1086,13 +1086,32 @@ _CONSENT_SELECTORS = (
 )
 
 
+
+# Playwright/Chromium's default automation fingerprint (navigator.webdriver
+# = true, --enable-automation banner, etc.) is trivially detected by any
+# common WAF/anti-bot layer (Cloudflare, Akamai, DataDome, ...), which then
+# serves a challenge/block page INSTEAD of the real content — indistinguishable
+# from a genuine JS-rendering failure unless you know to look for it. These
+# are the standard, well-established mitigations (not a full stealth suite,
+# just the highest-value/lowest-risk ones): a launch flag that removes the
+# most obvious automation flag Blink itself exposes, and an init script that
+# patches the handful of properties most detection scripts actually check.
+_STEALTH_INIT_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+window.chrome = window.chrome || { runtime: {} };
+"""
+
+
 async def _launch_render_browser():
     """The actual launch sequence, run under a wait_for() timeout by the caller."""
     global _PLAYWRIGHT_CTX
     _PLAYWRIGHT_CTX = await async_playwright().start()
     launch_kwargs = {
         "headless": True,
-        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+        "args": ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
+                  "--disable-blink-features=AutomationControlled"],
     }
     # Optional override for environments (like sandboxed dev containers) that
     # ship a pre-installed browser at a nonstandard path instead of the one
@@ -1179,6 +1198,7 @@ async def fetch_html_rendered(url: str, timeout_ms: int = RENDER_TIMEOUT_MS) -> 
                 viewport={"width": 1366, "height": 900},
             )
             context.set_default_timeout(timeout_ms)
+            await context.add_init_script(_STEALTH_INIT_SCRIPT)
             page = await context.new_page()
             try:
                 await page.goto(url, timeout=timeout_ms, wait_until="networkidle")
