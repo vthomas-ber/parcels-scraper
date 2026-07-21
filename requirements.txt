@@ -7,3 +7,4 @@ Pillow
 imagehash
 openpyxl
 beautifulsoup4
+playwright

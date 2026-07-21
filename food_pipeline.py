@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 from html import unescape
 
@@ -76,6 +77,17 @@ try:
 except ImportError:  # pragma: no cover
     _GENAI_OK = False
 
+# playwright is only needed for the JS-render fallback (pages that verify but
+# come back data-thin via a plain HTTP GET — client-side-rendered content a
+# aiohttp fetch can never see). Import lazily so the deterministic parsers
+# (and everything else) keep working without it installed; see
+# fetch_html_rendered's docstring for the deployment step this needs.
+try:
+    from playwright.async_api import async_playwright
+    _PLAYWRIGHT_OK = True
+except ImportError:  # pragma: no cover
+    _PLAYWRIGHT_OK = False
+
 
 # ============================================================================
 # CONFIG (kept in sync with app.py — see module docstring)
@@ -91,6 +103,25 @@ MAX_READ_PAGES = 4
 # Max candidate pages to fetch+verify before giving up (keeps HTTP bounded).
 MAX_CANDIDATES = 12
 _NAME_MATCH_THRESHOLD = 0.80
+
+# ---- JS-render fallback (headless Chromium via Playwright) -----------------
+# A plain aiohttp GET can't see content a page builds with client-side JS
+# (common on modern "drive"/click-and-collect storefronts) — such a page
+# verifies (EAN/name matches) but extract_page_fields finds nothing, which
+# grades as "page_not_readable". This fallback re-fetches ONLY those specific
+# thin/unverified pages with a real browser and re-runs the SAME deterministic
+# parsers on the rendered DOM. It is an order of magnitude slower/heavier than
+# a plain GET, so it is bounded on every axis: a small number of renders per
+# product, a small global concurrency cap (many EANs run in parallel), and an
+# env-var kill switch so it can be turned off instantly without a redeploy if
+# it strains a memory-constrained host.
+JS_RENDER_ENABLED = os.environ.get("ENABLE_JS_RENDER", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+RENDER_MAX_CONCURRENT = int(os.environ.get("JS_RENDER_MAX_CONCURRENT", "2"))
+RENDER_TIMEOUT_MS = int(os.environ.get("JS_RENDER_TIMEOUT_MS", "15000"))
+# Per extract_food_data() call — caps worst-case added latency/cost per EAN
+# even if every candidate page happens to be JS-rendered.
+MAX_RENDERS_PER_PRODUCT = 3
 
 GOLDMINE = {
     "FR": ("site:carrefour.fr OR site:auchan.fr OR site:coursesu.com "
@@ -1018,6 +1049,130 @@ async def _fetch_html(session, url: str, timeout: int = 15) -> str:
 
 
 # ============================================================================
+# JS-RENDER FALLBACK (headless Chromium, via Playwright)
+# ============================================================================
+
+# A single browser process is launched lazily and reused for the lifetime of
+# the app (launching Chromium per-page would dwarf the cost of everything
+# else this pipeline does). _RENDER_LOCK serialises the one-time launch;
+# _RENDER_SEM bounds how many pages may be rendering AT ONCE across every
+# concurrent extract_food_data() call, which is the number that actually
+# controls memory/CPU pressure on the host.
+_RENDER_LOCK: asyncio.Lock | None = None
+_RENDER_SEM: asyncio.Semaphore | None = None
+_PLAYWRIGHT_CTX = None
+_RENDER_BROWSER = None
+
+# Best-effort cookie/consent-banner dismissal. Many EU retailer sites gate
+# the underlying page content behind a consent click even after JS has
+# otherwise finished rendering; this is a small, non-exhaustive set of the
+# most common patterns (OneTrust's id is extremely widely used).
+_CONSENT_SELECTORS = (
+    "#onetrust-accept-btn-handler",
+    "button:has-text('Accept all')", "button:has-text('Accept All')",
+    "button:has-text('Accept')", "button:has-text('Alle akzeptieren')",
+    "button:has-text('Akzeptieren')", "button:has-text('Tout accepter')",
+    "button:has-text('Accetta tutto')", "button:has-text('Accetta')",
+    "button:has-text('Alles accepteren')", "button:has-text('Akkoord')",
+    "button:has-text('Aceptar todo')", "button:has-text('Aceptar')",
+)
+
+
+async def _get_render_browser():
+    """Lazily launch (once) and return the shared headless Chromium instance."""
+    global _RENDER_LOCK, _PLAYWRIGHT_CTX, _RENDER_BROWSER
+    if _RENDER_LOCK is None:
+        _RENDER_LOCK = asyncio.Lock()
+    async with _RENDER_LOCK:
+        if _RENDER_BROWSER is None:
+            _PLAYWRIGHT_CTX = await async_playwright().start()
+            launch_kwargs = {
+                "headless": True,
+                "args": ["--no-sandbox", "--disable-dev-shm-usage",
+                         "--disable-gpu"],
+            }
+            # Optional override for environments (like sandboxed dev
+            # containers) that ship a pre-installed browser at a nonstandard
+            # path instead of the one `playwright install chromium` puts
+            # under ~/.cache/ms-playwright. Unset in normal deployment —
+            # Playwright finds its own installed browser automatically.
+            exe = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
+            if exe:
+                launch_kwargs["executable_path"] = exe
+            _RENDER_BROWSER = await _PLAYWRIGHT_CTX.chromium.launch(**launch_kwargs)
+        return _RENDER_BROWSER
+
+
+async def fetch_html_rendered(url: str, timeout_ms: int = RENDER_TIMEOUT_MS) -> str:
+    """
+    Headless-browser fallback fetch for pages whose content is built by
+    client-side JavaScript — the "JS/cookie wall" case a plain aiohttp GET
+    (_fetch_html) cannot read. This is a FALLBACK ONLY: callers should use it
+    exclusively for candidates that already came back unverified or
+    data-thin from the fast path, never as the primary fetch, since it is
+    roughly an order of magnitude slower and heavier per page.
+
+    Bounded by RENDER_MAX_CONCURRENT (global, across every EAN being
+    processed concurrently) so this can't exhaust memory on a small host.
+    Returns "" on any failure — same fail-closed contract as _fetch_html.
+
+    DEPLOYMENT NOTE: requires `playwright install chromium` (or
+    `--with-deps chromium`) to have been run wherever this app is deployed —
+    `pip install playwright` alone only installs the Python client, not the
+    browser binary. See requirements.txt / README for the build-step change
+    this needs on Render. Fails soft (JS_RENDER_ENABLED / _PLAYWRIGHT_OK
+    checks) if that step hasn't been done, so its absence degrades this one
+    fallback rather than breaking the app.
+    """
+    global _RENDER_SEM
+    if not (_PLAYWRIGHT_OK and JS_RENDER_ENABLED):
+        return ""
+    if not url or not url.startswith("http") or _is_excluded_domain(url):
+        return ""
+    if _RENDER_SEM is None:
+        _RENDER_SEM = asyncio.Semaphore(RENDER_MAX_CONCURRENT)
+
+    async with _RENDER_SEM:
+        context = None
+        try:
+            browser = await _get_render_browser()
+            context = await browser.new_context(
+                user_agent=_UA,
+                extra_http_headers={"Accept-Language": _FETCH_HEADERS["Accept-Language"]},
+                viewport={"width": 1366, "height": 900},
+            )
+            context.set_default_timeout(timeout_ms)
+            page = await context.new_page()
+            try:
+                await page.goto(url, timeout=timeout_ms, wait_until="networkidle")
+            except Exception:
+                # networkidle can time out on pages with long-poll/analytics
+                # traffic even though the actual product content already
+                # rendered — a partially-settled DOM is still far better than
+                # giving up, so fall through rather than aborting the fetch.
+                pass
+            for sel in _CONSENT_SELECTORS:
+                try:
+                    btn = page.locator(sel).first
+                    if await btn.is_visible(timeout=800):
+                        await btn.click(timeout=800)
+                        await page.wait_for_timeout(400)
+                        break
+                except Exception:
+                    continue
+            html = await page.content()
+            return (html or "")[:_MAX_HTML_BYTES]
+        except Exception:
+            return ""
+        finally:
+            if context is not None:
+                try:
+                    await context.close()
+                except Exception:
+                    pass
+
+
+# ============================================================================
 # DETERMINISTIC EXTRACTION FOR ONE PAGE (all three parsers, one pass)
 # ============================================================================
 
@@ -1645,20 +1800,42 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
     source_routes: dict = {}
     verified_any = False
     readable_any = False
+    renders_done = 0   # bounds total JS-render fallback calls for this product
 
     for url in ordered:
         if len([p for p in read_pages if p["fields_nonempty"]]) >= MAX_READ_PAGES:
             break
         html = await _fetch_html(session, url)
-        if not html:
-            diag.append(f"unreadable (fetch failed): {_domain_of(url)}")
-            continue
-        page_fields = extract_page_fields(html, ean)
         trusted = is_trusted_page(url, brand_for_trust)
-        route = verify_route(html, ean, anchors, page_fields.get("_gtins"),
-                             trusted=trusted)
+        page_fields = extract_page_fields(html, ean) if html else _blank_fields()
+        route = (verify_route(html, ean, anchors, page_fields.get("_gtins"),
+                              trusted=trusted) if html else None)
+        nonempty = any(page_fields.get(k) for k in ALL_FIELD_KEYS)
+
+        # JS-render fallback: the plain fetch either couldn't verify this
+        # candidate at all (route is None — could be a bot-blocked or
+        # cookie-gated response) or verified it but came back data-thin (a
+        # classic client-side-rendered page). Retry with a real browser and
+        # re-run the SAME deterministic parsers on the rendered DOM — bounded
+        # per-product (MAX_RENDERS_PER_PRODUCT) so a page-full of thin
+        # candidates can't blow up per-EAN latency.
+        rendered_used = False
+        if (route is None or not nonempty) and renders_done < MAX_RENDERS_PER_PRODUCT:
+            rendered_html = await fetch_html_rendered(url)
+            if rendered_html and rendered_html != html:
+                renders_done += 1
+                r_fields = extract_page_fields(rendered_html, ean)
+                r_route = verify_route(rendered_html, ean, anchors,
+                                       r_fields.get("_gtins"), trusted=trusted)
+                r_nonempty = any(r_fields.get(k) for k in ALL_FIELD_KEYS)
+                if r_route is not None and (route is None or r_nonempty):
+                    page_fields, route, nonempty, html = \
+                        r_fields, r_route, r_nonempty, rendered_html
+                    rendered_used = True
+
         if route is None:
-            diag.append(f"skip (neither EAN nor trusted-name match): {_domain_of(url)}")
+            reason = "fetch failed" if not html else "neither EAN nor trusted-name match"
+            diag.append(f"skip ({reason}): {_domain_of(url)}")
             continue
         verified_any = True
         source_routes[url] = route
@@ -1666,7 +1843,6 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         # parsers pulled ANY real field out of it. A JS/cookie-walled shell
         # returns markup with no product data -> nonempty is False -> the page
         # counts as verified-but-not-readable (handled below).
-        nonempty = any(page_fields.get(k) for k in ALL_FIELD_KEYS)
         if nonempty:
             readable_any = True
         read_pages.append({
@@ -1675,7 +1851,8 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             "readable": nonempty, "fields_nonempty": nonempty,
         })
         diag.append(f"verified Route {route} ({'trusted' if trusted else 'untrusted'}, "
-                    f"{'read' if nonempty else 'thin'}): {_domain_of(url)}")
+                    f"{'read' if nonempty else 'thin'}"
+                    f"{', JS-rendered' if rendered_used else ''}): {_domain_of(url)}")
 
     # ---- Rescue pass: if the pages so far gave thin nutrition, run ONE -------
     # aggregator-targeted bare-EAN search (codecheck / fddb / digit-eyes / ...)
@@ -1707,17 +1884,29 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                     continue
                 seen_dom.add(dom)
                 html = await _fetch_html(session, url)
-                if not html:
-                    continue
-                pf = extract_page_fields(html, ean)
                 rescue_trusted = is_trusted_page(url, brand_for_trust)
-                route = verify_route(html, ean, anchors, pf.get("_gtins"),
-                                     trusted=rescue_trusted)
+                pf = extract_page_fields(html, ean) if html else _blank_fields()
+                route = (verify_route(html, ean, anchors, pf.get("_gtins"),
+                                      trusted=rescue_trusted) if html else None)
+                ne = any(pf.get(k) for k in ALL_FIELD_KEYS)
+
+                rescue_rendered = False
+                if (route is None or not ne) and renders_done < MAX_RENDERS_PER_PRODUCT:
+                    rendered_html = await fetch_html_rendered(url)
+                    if rendered_html and rendered_html != html:
+                        renders_done += 1
+                        r_pf = extract_page_fields(rendered_html, ean)
+                        r_route = verify_route(rendered_html, ean, anchors,
+                                               r_pf.get("_gtins"), trusted=rescue_trusted)
+                        r_ne = any(r_pf.get(k) for k in ALL_FIELD_KEYS)
+                        if r_route is not None and (route is None or r_ne):
+                            pf, route, ne, html = r_pf, r_route, r_ne, rendered_html
+                            rescue_rendered = True
+
                 if route is None:
                     continue
                 verified_any = True
                 source_routes[url] = route
-                ne = any(pf.get(k) for k in ALL_FIELD_KEYS)
                 if ne:
                     readable_any = True
                 read_pages.append({"url": url, "route": route, "fields": pf,
@@ -1725,6 +1914,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                                    "trusted": rescue_trusted,
                                    "readable": ne, "fields_nonempty": ne})
                 diag.append(f"rescue Route {route} ({'trusted' if rescue_trusted else 'untrusted'}, "
+                            f"{'JS-rendered, ' if rescue_rendered else ''}"
                             f"{'read' if ne else 'thin'}): {dom}")
         except Exception:
             pass
