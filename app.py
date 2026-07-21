@@ -1056,9 +1056,14 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
         # (query, localize) — the goldmine-restricted query is market-localized;
         # the bare-name query has no site: restriction, so it runs worldwide
         # (same reasoning as Attempts 2.5/4 above).
+        # Unquoted natural-language query added at the end: ground_truth is
+        # often a translated/localised name that won't appear as an exact
+        # phrase on any real page, so the quoted query can return nothing
+        # even when a human typing the same words unquoted finds it trivially.
         _name_queries = [q for q in (
             (f'{_name_goldmine} "{_clean_ground_truth}"', True) if _name_goldmine else None,
             (f'"{_clean_ground_truth}"', False),
+            (_clean_ground_truth, False),
         ) if q]
         try:
             for _nq, _localize in _name_queries:
@@ -2456,10 +2461,15 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
         # (query, localize) — only the goldmine site:-restricted query is
         # market-localized; the unrestricted queries run worldwide so a
         # trusted page in another market isn't geo-biased away.
+        # Unquoted natural-language query added at the end: ground_truth is
+        # often a translated/localised name that won't appear as an exact
+        # phrase on any real page (see the identical comment in
+        # fetch_basic_info's Attempt 5).
         _nb_queries = [q for q in (
             (f'{_clean_gt} {ean}', False),                         # combined — strongest
             (f'{_nb_goldmine} "{_clean_gt}"', True) if _nb_goldmine else None,
             (f'"{_clean_gt}"', False),
+            (_clean_gt, False),
         ) if q]
         try:
             for _nq, _localize in _nb_queries:
@@ -2823,6 +2833,25 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
     return selected, diag, source_links, retailer_urls, source_routes
 
 
+def _format_energy_kj_kcal(kj_str: str) -> str:
+    """
+    Nutrition labels always show energy in BOTH units — a kJ-only cell isn't
+    usable on its own. The internal `energy_kj` field stays a pure numeric
+    kJ string throughout food_pipeline.py (the plausibility backstop and
+    cross-source corroboration both need a clean float to do math on); this
+    formats the display value only, at row-assembly time.
+    """
+    if not kj_str:
+        return ""
+    try:
+        kj = float(str(kj_str).replace(",", "."))
+    except ValueError:
+        return str(kj_str)
+    kcal = kj / 4.184
+    kcal_fmt = str(int(round(kcal))) if abs(kcal - round(kcal)) < 0.05 else f"{kcal:.1f}"
+    return f"{kj_str} kJ / {kcal_fmt} kcal"
+
+
 # ============================================================================
 # ORCHESTRATION: run Path A + Path B in parallel, merge results
 # ============================================================================
@@ -3171,7 +3200,7 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
             "Manufacturer Name": data.get("manufacturer_name", ""),
             "Place of Origin": data.get("place_of_origin", ""),
             "Organic Certification ID": data.get("organic_certification_id", ""),
-            "Energy (kJ)": data.get("energy_kj", ""),
+            "Energy (kJ)": _format_energy_kj_kcal(data.get("energy_kj", "")),
             "Fat (g)": data.get("fat_g", ""),
             "Of Which Saturated Fatty Acids (g)": data.get("saturates_g", ""),
             "Carbohydrates (g)": data.get("carbohydrates_g", ""),
