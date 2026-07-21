@@ -94,42 +94,71 @@ _NAME_MATCH_THRESHOLD = 0.80
 
 GOLDMINE = {
     "FR": ("site:carrefour.fr OR site:auchan.fr OR site:coursesu.com "
-           "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr"),
+           "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr "
+           "OR site:cora.fr OR site:casino.fr OR site:magasins-u.com "
+           "OR site:grandfrais.com"),
     "UK": ("site:ocado.com OR site:waitrose.com OR site:asda.com "
-           "OR site:tesco.com OR site:sainsburys.co.uk OR site:morrisons.com"),
-    "NL": "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl",
+           "OR site:tesco.com OR site:sainsburys.co.uk OR site:morrisons.com "
+           "OR site:iceland.co.uk OR site:boots.com OR site:coop.co.uk "
+           "OR site:aldi.co.uk OR site:marksandspencer.com"),
+    "NL": ("site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl "
+           "OR site:coop.nl OR site:vomar.nl OR site:hoogvliet.com"),
     "BE": ("site:delhaize.be OR site:colruyt.be OR site:carrefour.be "
-           "OR site:spar.be OR site:lidl.be"),
+           "OR site:spar.be OR site:lidl.be OR site:okay.be OR site:aldi.be"),
     "DE": ("site:rewe.de OR site:edeka.de OR site:kaufland.de "
            "OR site:dm.de OR site:rossmann.de OR site:metro.de "
-           "OR site:budni.de OR site:ecoinform.de"),
+           "OR site:budni.de OR site:ecoinform.de OR site:netto-online.de "
+           "OR site:netto-marken-discount.de OR site:globus.de "
+           "OR site:denns-biomarkt.de"),
     "AT": ("site:billa.at OR site:spar.at OR site:gurkerl.at "
-           "OR site:hofer.at OR site:mpreis.at"),
+           "OR site:hofer.at OR site:mpreis.at OR site:interspar.at "
+           "OR site:unimarkt.at OR site:adeg.at"),
     "DK": ("site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk "
-           "OR site:coop.dk OR site:salling.dk"),
+           "OR site:coop.dk OR site:salling.dk OR site:netto.dk "
+           "OR site:foetex.dk OR site:bilkatogo.dk OR site:meny.dk"),
     "IT": ("site:carrefour.it OR site:conad.it OR site:coop.it "
-           "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it"),
+           "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it "
+           "OR site:pampanorama.it OR site:iper.it OR site:naturasi.it "
+           "OR site:tigros.it"),
     "ES": ("site:carrefour.es OR site:mercadona.es OR site:dia.es "
-           "OR site:alcampo.es OR site:eroski.es OR site:lidl.es"),
+           "OR site:alcampo.es OR site:eroski.es OR site:lidl.es "
+           "OR site:consum.es OR site:caprabo.es OR site:ahorramas.com "
+           "OR site:condis.es"),
     "PL": ("site:carrefour.pl OR site:auchan.pl OR site:frisco.pl "
-           "OR site:lidl.pl OR site:kaufland.pl"),
+           "OR site:lidl.pl OR site:kaufland.pl OR site:netto.pl "
+           "OR site:dino-polska.pl"),
 }
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
 
 # Approved / goldmine domains are the "prime read targets" — pages on these
-# rank higher when filling fields across multiple verified pages.
+# rank higher when filling fields across multiple verified pages, and are the
+# TIER-1 domains for reliability grading (see _is_trusted_domain below).
+# Kept in sync with the GOLDMINE query dict above — every domain referenced
+# in a GOLDMINE site: clause must also appear here.
 _GOLDMINE_DOMAINS = frozenset({
     "ocado.com", "waitrose.com", "asda.com", "tesco.com", "sainsburys.co.uk",
-    "morrisons.com", "carrefour.fr", "auchan.fr", "coursesu.com", "leclerc.fr",
-    "intermarche.fr", "monoprix.fr", "carrefour.it", "conad.it", "coop.it",
-    "esselunga.it", "eurospin.it", "lidl.it", "rewe.de", "edeka.de",
-    "kaufland.de", "dm.de", "rossmann.de", "metro.de", "budni.de",
-    "ecoinform.de", "ah.nl", "jumbo.com", "plus.nl", "dirk.nl", "delhaize.be",
-    "colruyt.be", "carrefour.be", "spar.be", "lidl.be", "billa.at", "spar.at",
-    "gurkerl.at", "hofer.at", "mpreis.at", "nemlig.com", "rema1000.dk",
-    "coop.dk", "salling.dk", "carrefour.es", "mercadona.es", "dia.es",
-    "alcampo.es", "eroski.es", "lidl.es", "carrefour.pl", "auchan.pl",
-    "frisco.pl", "lidl.pl", "kaufland.pl",
+    "morrisons.com", "iceland.co.uk", "boots.com", "coop.co.uk", "aldi.co.uk",
+    "marksandspencer.com",
+    "carrefour.fr", "auchan.fr", "coursesu.com", "leclerc.fr",
+    "intermarche.fr", "monoprix.fr", "cora.fr", "casino.fr", "magasins-u.com",
+    "grandfrais.com",
+    "carrefour.it", "conad.it", "coop.it", "esselunga.it", "eurospin.it",
+    "lidl.it", "pampanorama.it", "iper.it", "naturasi.it", "tigros.it",
+    "rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de",
+    "budni.de", "ecoinform.de", "netto-online.de", "netto-marken-discount.de",
+    "globus.de", "denns-biomarkt.de",
+    "ah.nl", "jumbo.com", "plus.nl", "dirk.nl", "coop.nl", "vomar.nl",
+    "hoogvliet.com",
+    "delhaize.be", "colruyt.be", "carrefour.be", "spar.be", "lidl.be",
+    "okay.be", "aldi.be",
+    "billa.at", "spar.at", "gurkerl.at", "hofer.at", "mpreis.at",
+    "interspar.at", "unimarkt.at", "adeg.at",
+    "nemlig.com", "rema1000.dk", "coop.dk", "salling.dk", "netto.dk",
+    "foetex.dk", "bilkatogo.dk", "meny.dk",
+    "carrefour.es", "mercadona.es", "dia.es", "alcampo.es", "eroski.es",
+    "lidl.es", "consum.es", "caprabo.es", "ahorramas.com", "condis.es",
+    "carrefour.pl", "auchan.pl", "frisco.pl", "lidl.pl", "kaufland.pl",
+    "netto.pl", "dino-polska.pl",
 })
 
 _EXCLUDED_DOMAIN_TOKENS = (
@@ -285,6 +314,50 @@ def _is_goldmine(url: str) -> bool:
 def _is_aggregator(url: str) -> bool:
     dom = _domain_of(url)
     return any(dom == g or dom.endswith("." + g) for g in _AGGREGATOR_DOMAINS)
+
+
+def is_trusted_page(url: str, brand: str = "") -> bool:
+    """
+    Tier-1 trust = a goldmine (approved retailer) domain OR the brand's own
+    official site. This is the gate for reliability High and for which
+    identity-match methods are acceptable (EAN-only / name+EAN / name+weight
+    only are all fine from a trusted domain; an untrusted domain needs the
+    EAN actually confirmed on the page — see verify_route).
+    """
+    if _is_goldmine(url):
+        return True
+    if brand:
+        return brand_matches_domain(brand, _domain_of(url))
+    return False
+
+
+# Distinct non-tier-1 domains that must independently agree on a field's
+# value before that field counts as Medium reliability; a single such
+# source, uncorroborated, stays Low.
+MEDIUM_CORROBORATION_MIN = 2
+
+
+def _values_agree(key: str, a: str, b: str) -> bool:
+    """Do two independently-extracted values for the same field agree closely
+    enough to count as corroboration? Numeric fields compare parsed floats
+    with a small tolerance (decimal/rounding noise); text fields compare
+    normalised strings, falling back to significant-token overlap so minor
+    formatting differences (punctuation, ordering) don't block a real match."""
+    if not a or not b:
+        return False
+    if key in _NUTRI_KEYS or key in ("net_weight", "gross_weight"):
+        fa, fb = _to_float(a), _to_float(b)
+        if fa is None or fb is None:
+            return False
+        return abs(fa - fb) <= max(0.5, 0.03 * max(abs(fa), abs(fb)))
+    na = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", a.lower())).strip()
+    nb = re.sub(r"\s+", " ", re.sub(r"[^\w\s]", " ", b.lower())).strip()
+    if na == nb:
+        return True
+    ta, tb = _sig_tokens(a), _sig_tokens(b)
+    if not ta or not tb:
+        return False
+    return len(ta & tb) / max(len(ta), len(tb)) >= 0.8
 
 
 def _result_matches_gt(res: dict, ground_truth: str) -> bool:
@@ -879,12 +952,25 @@ def _page_title_bits(html: str) -> str:
     return _clean_text(" ".join(bits))
 
 
-def verify_route(html: str, ean: str, anchors: list, gtins: set | None = None) -> str | None:
-    """Return 'A' (EAN confirmed), 'B' (name match >=80%, no weight conflict), or None."""
+def verify_route(html: str, ean: str, anchors: list, gtins: set | None = None,
+                  trusted: bool = False) -> str | None:
+    """
+    Return 'A' (EAN confirmed), 'B' (name match >=80%, no weight conflict), or None.
+
+    Policy: EAN-only and name+EAN matches (Route A) are strong enough to accept
+    from ANY domain. A name(+weight)-only match with NO EAN on the page
+    (Route B) is comparatively weak evidence, so it is only accepted from a
+    `trusted` domain (goldmine retailer or the brand's own site) — an
+    untrusted/general-web page that merely shares ~80% of its title tokens
+    with the product name is too easily a different SKU/variant and must not
+    be treated as verified.
+    """
     if _page_has_ean(html, ean):
         return "A"
     if gtins and (ean in gtins or ean.lstrip("0") in {g.lstrip("0") for g in gtins}):
         return "A"
+    if not trusted:
+        return None
     identity = _page_title_bits(html)
     if identity and anchors:
         ratio = _best_name_ratio(anchors, identity)
@@ -1467,6 +1553,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
 
     # De-dupe by domain, keep order, cap.
     anchors = [a for a in (clean_gt, reg_name) if a]
+    brand_for_trust = extract_brand(clean_gt or "") or extract_brand(reg_name or "")
     seen_dom, ordered = set(), []
     for u in candidates:
         dom = _domain_of(u)
@@ -1489,9 +1576,11 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             diag.append(f"unreadable (fetch failed): {_domain_of(url)}")
             continue
         page_fields = extract_page_fields(html, ean)
-        route = verify_route(html, ean, anchors, page_fields.get("_gtins"))
+        trusted = is_trusted_page(url, brand_for_trust)
+        route = verify_route(html, ean, anchors, page_fields.get("_gtins"),
+                             trusted=trusted)
         if route is None:
-            diag.append(f"skip (neither EAN nor name match): {_domain_of(url)}")
+            diag.append(f"skip (neither EAN nor trusted-name match): {_domain_of(url)}")
             continue
         verified_any = True
         source_routes[url] = route
@@ -1504,11 +1593,11 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             readable_any = True
         read_pages.append({
             "url": url, "route": route, "fields": page_fields,
-            "text": page_visible_text(html),
+            "text": page_visible_text(html), "trusted": trusted,
             "readable": nonempty, "fields_nonempty": nonempty,
         })
-        diag.append(f"verified Route {route} ({'read' if nonempty else 'thin'}): "
-                    f"{_domain_of(url)}")
+        diag.append(f"verified Route {route} ({'trusted' if trusted else 'untrusted'}, "
+                    f"{'read' if nonempty else 'thin'}): {_domain_of(url)}")
 
     # ---- Rescue pass: if the pages so far gave thin nutrition, run ONE -------
     # aggregator-targeted bare-EAN search (codecheck / fddb / digit-eyes / ...)
@@ -1543,7 +1632,9 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                 if not html:
                     continue
                 pf = extract_page_fields(html, ean)
-                route = verify_route(html, ean, anchors, pf.get("_gtins"))
+                rescue_trusted = is_trusted_page(url, brand_for_trust)
+                route = verify_route(html, ean, anchors, pf.get("_gtins"),
+                                     trusted=rescue_trusted)
                 if route is None:
                     continue
                 verified_any = True
@@ -1553,8 +1644,10 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                     readable_any = True
                 read_pages.append({"url": url, "route": route, "fields": pf,
                                    "text": page_visible_text(html),
+                                   "trusted": rescue_trusted,
                                    "readable": ne, "fields_nonempty": ne})
-                diag.append(f"rescue Route {route} ({'read' if ne else 'thin'}): {dom}")
+                diag.append(f"rescue Route {route} ({'trusted' if rescue_trusted else 'untrusted'}, "
+                            f"{'read' if ne else 'thin'}): {dom}")
         except Exception:
             pass
 
@@ -1563,10 +1656,14 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
     # table comes from a real retailer/manufacturer page discovered via SERP.
     # (Its domains are also in _EXCLUDED_DOMAIN_TOKENS as a safety net.)
 
-    # ---- Rank pages: EAN-verified (Route A) before name-matched (Route B) ----
+    # ---- Rank pages: trusted (goldmine/brand) domains first — they set the ----
+    # row's grade and should win field-value contests; then EAN-verified
+    # (Route A) before name-matched (Route B, only possible on a trusted page);
+    # aggregators (clean structured tables) break remaining ties.
     def _rank(p):
-        tier = {"A": 0, "B": 1}.get(p["route"], 2)
-        return (tier, 0 if (_is_goldmine(p["url"]) or _is_aggregator(p["url"])) else 1)
+        return (0 if p["trusted"] else 1,
+                {"A": 0, "B": 1}.get(p["route"], 2),
+                0 if _is_aggregator(p["url"]) else 1)
     read_pages.sort(key=_rank)
 
     # ---- Fill fields ACROSS verified pages (highest-trust wins per field) ----
@@ -1582,15 +1679,13 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             if p["url"] not in used_urls:
                 used_urls.append(p["url"])
 
-    # ---- Registry (Go-UPC) first-pass fill for genuinely-absent text fields --
+    # ---- Go-UPC / EAN-Search registry: SEED ONLY, never a field source -------
+    # Policy: every value shown in the table must trace back to a verified,
+    # SerpAPI-discovered page. The barcode registries are used upstream only
+    # to resolve an identity (name/brand token, ean_verified flag) that seeds
+    # the SerpAPI queries — they must NOT write ingredients/brand/etc. directly
+    # into `fields`, since that data would have no source link behind it.
     registry_used = False
-    if go_upc_data:
-        if not fields["ingredients"] and go_upc_data.get("ingredients"):
-            fields["ingredients"] = _clean_text(go_upc_data["ingredients"])[:500]
-            registry_used = True
-        if not fields["brand"] and go_upc_data.get("brand"):
-            fields["brand"] = _clean_text(go_upc_data["brand"])
-            registry_used = True
 
     # ---- Gemini last-resort for messy TEXT fields still missing --------------
     gemini_used = False
@@ -1618,17 +1713,40 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             fields[k] = ""
         diag.append(f"Nutrition blanked — implausible ({nutrition_flag}).")
 
-    # ---- Grade + provenance (real pages only; OFF is never a source) ---------
+    # ---- Grade + provenance: trust-tier + cross-source corroboration --------
+    # High   — at least one shown field was read from a TRUSTED page (the
+    #          brand's own site, or a tier-1/goldmine retailer). EAN-only,
+    #          name+EAN, or name+weight-only matches are all acceptable
+    #          evidence there (see verify_route / is_trusted_page).
+    # Medium — no trusted page contributed, but a field's value is
+    #          independently corroborated by >= MEDIUM_CORROBORATION_MIN
+    #          distinct non-tier-1 domains (each necessarily EAN-verified —
+    #          untrusted domains can only reach Route A; see verify_route).
+    # Low    — only a single non-tier-1 source backs the data, uncorroborated.
     live = [p for p in read_pages if p["fields_nonempty"]]
-    has_retailer_a = any(p["route"] == "A" for p in live)
-    has_route_b    = any(p["route"] == "B" for p in live)
+    has_trusted_contributor = any(p["trusted"] for p in live)
+
+    def _field_corroborated(k: str) -> bool:
+        val = fields.get(k)
+        if not val:
+            return False
+        agreeing_domains = {
+            _domain_of(p["url"]) for p in live
+            if not p["trusted"] and _values_agree(k, val, p["fields"].get(k, ""))
+        }
+        return len(agreeing_domains) >= MEDIUM_CORROBORATION_MIN
+
+    has_corroborated_field = any(_field_corroborated(k) for k in ALL_FIELD_KEYS)
 
     if readable_any:
         status = "success"
-        # H only when a real retailer page carried the EAN; a name-only match
-        # caps at M.
-        reliability = "H" if has_retailer_a else "M"
-        if registry_used or gemini_used:
+        if has_trusted_contributor:
+            reliability = "H"
+        elif has_corroborated_field:
+            reliability = "M"
+        else:
+            reliability = "L"
+        if gemini_used:
             provenance = "Verified page + fallback ⚠️"
         else:
             provenance = "Verified page"
@@ -1636,17 +1754,11 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         # Pages verified (Route A/B) but none readable — JS/cookie wall etc.
         status = "page_not_readable"
         reliability = "L"
-        provenance = ("Registry only — page not readable ⚠️" if registry_used
-                      else "Page not readable")
+        provenance = "Page not readable"
     else:
         status = "no_source"
         reliability = "L"
-        provenance = ("Registry only — no verified page ⚠️" if registry_used
-                      else "No verified source")
-
-    # A name-only (Route-B) match can never be H.
-    if reliability == "H" and not has_retailer_a:
-        reliability = "M"
+        provenance = "No verified source"
 
     # Corrupt/implausible nutrition was blanked above — never present such a row
     # as trustworthy, whatever the source was.

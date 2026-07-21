@@ -35,7 +35,7 @@ except ImportError:
 # Replaces run_gemini_sync's grounded-search food extraction: food fields now
 # come from the SAME verified pages that populate the Source columns.
 try:
-    from food_pipeline import extract_food_data
+    from food_pipeline import extract_food_data, ALL_FIELD_KEYS
     FOOD_PIPELINE_OK = True
 except ImportError:
     FOOD_PIPELINE_OK = False
@@ -79,8 +79,37 @@ def init_cache():
             con.execute(f"ALTER TABLE ean_cache ADD COLUMN {col} {defn}")
         except sqlite3.OperationalError:
             pass  # column already present — nothing to do
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """)
     con.commit()
     con.close()
+
+
+def get_setting(key: str, default: str = "") -> str:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        row = con.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        con.close()
+        return row[0] if row else default
+    except Exception:
+        return default
+
+
+def set_setting(key: str, value: str) -> None:
+    try:
+        con = sqlite3.connect(DB_PATH)
+        con.execute(
+            "INSERT OR REPLACE INTO app_settings (key, value) VALUES (?, ?)",
+            (key, value)
+        )
+        con.commit()
+        con.close()
+    except Exception:
+        pass
 
 
 def _cache_key(ean: str, ground_truth: str = "") -> str:
@@ -195,7 +224,10 @@ def cache_clear(market: str | None = None) -> int:
 # Update model strings here when migrating — never scatter them across the file.
 # ============================================================================
 
-# Food data extraction: uses Google Search grounding + full JSON output
+# Categorization/tagging + free-text fallback extraction. NOT used for search
+# or grounding anywhere — every call is fed pre-fetched page text or already-
+# extracted fields only ("no web access" / "do not search" in the prompt).
+# All page/source discovery goes through SerpAPI exclusively; see food_pipeline.py.
 EXTRACTION_MODEL = "gemini-2.5-flash"
 
 # Image identity verification: vision-only, no grounding needed, must be cheap & fast
@@ -348,40 +380,6 @@ def should_cache(status: str) -> bool:
     A cache miss is always safer than a stale wrong answer.
     """
     return status == "Success"
-
-
-# Approved source domains — the only domains we will display as clickable
-# Source 1-5 links.  Any URL whose domain is not in this set is cleared.
-# Derived from GOLDMINE retailers + common brand/barcode lookup sites.
-_APPROVED_SOURCE_DOMAINS: frozenset[str] = frozenset({
-    # UK
-    "ocado.com", "waitrose.com", "asda.com", "tesco.com",
-    "sainsburys.co.uk", "morrisons.com",
-    # FR
-    "carrefour.fr", "auchan.fr", "coursesu.com",
-    "leclerc.fr", "intermarche.fr", "monoprix.fr",
-    # IT
-    "carrefour.it", "conad.it", "coop.it",
-    "esselunga.it", "eurospin.it", "lidl.it",
-    # DE
-    "rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de",
-    "budni.de", "ecoinform.de",   # drugstore chain + structured organic/GTIN database
-    # NL
-    "ah.nl", "jumbo.com", "plus.nl", "dirk.nl",
-    # BE
-    "delhaize.be", "colruyt.be", "carrefour.be", "spar.be", "lidl.be",
-    # AT
-    "billa.at", "spar.at", "gurkerl.at", "hofer.at", "mpreis.at",
-    # DK
-    "nemlig.com", "rema1000.dk", "coop.dk", "salling.dk",
-    # ES
-    "carrefour.es", "mercadona.es", "dia.es",
-    "alcampo.es", "eroski.es", "lidl.es",
-    # PL
-    "carrefour.pl", "auchan.pl", "frisco.pl", "lidl.pl", "kaufland.pl",
-    # Barcode / product databases
-    "barcodelookup.com", "go-upc.com",
-})
 
 
 def _is_displayable_url(url: str) -> bool:
@@ -568,27 +566,97 @@ async def fetch_go_upc(session, ean: str, go_upc_key: str) -> dict | None:
 
 GOLDMINE = {
     "FR": ("site:carrefour.fr OR site:auchan.fr OR site:coursesu.com "
-           "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr"),
+           "OR site:leclerc.fr OR site:intermarche.fr OR site:monoprix.fr "
+           "OR site:cora.fr OR site:casino.fr OR site:magasins-u.com "
+           "OR site:grandfrais.com"),
     "UK": ("site:ocado.com OR site:waitrose.com OR site:asda.com "
-           "OR site:tesco.com OR site:sainsburys.co.uk OR site:morrisons.com"),
-    "NL": "site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl",
+           "OR site:tesco.com OR site:sainsburys.co.uk OR site:morrisons.com "
+           "OR site:iceland.co.uk OR site:boots.com OR site:coop.co.uk "
+           "OR site:aldi.co.uk OR site:marksandspencer.com"),
+    "NL": ("site:ah.nl OR site:jumbo.com OR site:plus.nl OR site:dirk.nl "
+           "OR site:coop.nl OR site:vomar.nl OR site:hoogvliet.com"),
     "BE": ("site:delhaize.be OR site:colruyt.be OR site:carrefour.be "
-           "OR site:spar.be OR site:lidl.be"),
+           "OR site:spar.be OR site:lidl.be OR site:okay.be OR site:aldi.be"),
     "DE": ("site:rewe.de OR site:edeka.de OR site:kaufland.de "
            "OR site:dm.de OR site:rossmann.de OR site:metro.de "
-           "OR site:budni.de OR site:ecoinform.de"),
+           "OR site:budni.de OR site:ecoinform.de OR site:netto-online.de "
+           "OR site:netto-marken-discount.de OR site:globus.de "
+           "OR site:denns-biomarkt.de"),
     "AT": ("site:billa.at OR site:spar.at OR site:gurkerl.at "
-           "OR site:hofer.at OR site:mpreis.at"),
+           "OR site:hofer.at OR site:mpreis.at OR site:interspar.at "
+           "OR site:unimarkt.at OR site:adeg.at"),
     "DK": ("site:nemlig.com OR site:matsmart.dk OR site:rema1000.dk "
-           "OR site:coop.dk OR site:salling.dk"),
+           "OR site:coop.dk OR site:salling.dk OR site:netto.dk "
+           "OR site:foetex.dk OR site:bilkatogo.dk OR site:meny.dk"),
     "IT": ("site:carrefour.it OR site:conad.it OR site:coop.it "
-           "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it"),
+           "OR site:esselunga.it OR site:eurospin.it OR site:lidl.it "
+           "OR site:pampanorama.it OR site:iper.it OR site:naturasi.it "
+           "OR site:tigros.it"),
     "ES": ("site:carrefour.es OR site:mercadona.es OR site:dia.es "
-           "OR site:alcampo.es OR site:eroski.es OR site:lidl.es"),
+           "OR site:alcampo.es OR site:eroski.es OR site:lidl.es "
+           "OR site:consum.es OR site:caprabo.es OR site:ahorramas.com "
+           "OR site:condis.es"),
     "PL": ("site:carrefour.pl OR site:auchan.pl OR site:frisco.pl "
-           "OR site:lidl.pl OR site:kaufland.pl"),
+           "OR site:lidl.pl OR site:kaufland.pl OR site:netto.pl "
+           "OR site:dino-polska.pl"),
 }
 GLOBAL_SITES = "site:billigkaffee.eu OR site:fivestartrading-holland.eu"
+
+# Tier-1 ("goldmine") domains for reliability grading and identity-match
+# gating. Kept in sync with the GOLDMINE query dict above and its mirror in
+# food_pipeline.py — every domain referenced in a GOLDMINE site: clause must
+# also appear here.
+_GOLDMINE_DOMAINS = frozenset({
+    "ocado.com", "waitrose.com", "asda.com", "tesco.com", "sainsburys.co.uk",
+    "morrisons.com", "iceland.co.uk", "boots.com", "coop.co.uk", "aldi.co.uk",
+    "marksandspencer.com",
+    "carrefour.fr", "auchan.fr", "coursesu.com", "leclerc.fr",
+    "intermarche.fr", "monoprix.fr", "cora.fr", "casino.fr", "magasins-u.com",
+    "grandfrais.com",
+    "carrefour.it", "conad.it", "coop.it", "esselunga.it", "eurospin.it",
+    "lidl.it", "pampanorama.it", "iper.it", "naturasi.it", "tigros.it",
+    "rewe.de", "edeka.de", "kaufland.de", "dm.de", "rossmann.de", "metro.de",
+    "budni.de", "ecoinform.de", "netto-online.de", "netto-marken-discount.de",
+    "globus.de", "denns-biomarkt.de",
+    "ah.nl", "jumbo.com", "plus.nl", "dirk.nl", "coop.nl", "vomar.nl",
+    "hoogvliet.com",
+    "delhaize.be", "colruyt.be", "carrefour.be", "spar.be", "lidl.be",
+    "okay.be", "aldi.be",
+    "billa.at", "spar.at", "gurkerl.at", "hofer.at", "mpreis.at",
+    "interspar.at", "unimarkt.at", "adeg.at",
+    "nemlig.com", "rema1000.dk", "coop.dk", "salling.dk", "netto.dk",
+    "foetex.dk", "bilkatogo.dk", "meny.dk",
+    "carrefour.es", "mercadona.es", "dia.es", "alcampo.es", "eroski.es",
+    "lidl.es", "consum.es", "caprabo.es", "ahorramas.com", "condis.es",
+    "carrefour.pl", "auchan.pl", "frisco.pl", "lidl.pl", "kaufland.pl",
+    "netto.pl", "dino-polska.pl",
+})
+
+
+def _domain_of(url: str) -> str:
+    return url.split("/")[2] if url.startswith("http") and "/" in url[8:] else \
+        (url.split("/")[2] if url.startswith("http") else "")
+
+
+def _is_goldmine_domain(url: str) -> bool:
+    dom = _domain_of(url).lower()
+    return any(dom == g or dom.endswith("." + g) for g in _GOLDMINE_DOMAINS)
+
+
+def _is_trusted_source(url: str, brand: str = "") -> bool:
+    """
+    Tier-1 trust = goldmine (approved retailer) domain OR the brand's own
+    official site. Used to gate which identity-match methods are acceptable
+    (rule: EAN-only / name+EAN / name+weight-only all acceptable ONLY when
+    trusted; untrusted domains require an EAN actually found on the page).
+    """
+    if _is_goldmine_domain(url):
+        return True
+    if brand:
+        dom = _domain_of(url)
+        if _brand_matches_domain(brand, dom):
+            return True
+    return False
 
 # ============================================================================
 # PATH A: FOOD EXTRACTION PIPELINE
@@ -951,9 +1019,18 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
             organic2 = data2.get("organic_results", []) if data2 else []
             if organic2:
                 candidate = organic2[0].get("title", "").split("-")[0].split("|")[0].strip()
-                if not is_garbage_name(candidate) and _result_matches_gt(organic2[0], _clean_ground_truth):
+                top_link  = organic2[0].get("link", "")
+                # Same policy as Attempt 5: a snippet-level EAN association with no
+                # domain trust and no weight check is too weak to name the product
+                # from — only accept when the hit is on a trusted (goldmine/brand)
+                # domain and the weight/volume doesn't conflict.
+                if (not is_garbage_name(candidate)
+                        and _result_matches_gt(organic2[0], _clean_ground_truth)
+                        and _is_trusted_source(top_link, _extract_brand(_clean_ground_truth))
+                        and not _weights_conflict([_clean_ground_truth], candidate)):
                     product_name = candidate
-                    diagnostic_log.append(f"✅ Found Name via bare GTIN fallback (unverified): {product_name}")
+                    diagnostic_log.append(
+                        f"✅ Found Name via bare GTIN fallback (trusted source, unverified EAN): {product_name}")
                 new_urls2 = [res.get("link") for res in organic2[:4] if "link" in res
                              and not _is_excluded_domain(res.get("link", ""))
                              and _result_matches_gt(res, _clean_ground_truth)]
@@ -998,17 +1075,24 @@ async def fetch_basic_info(session, ean, serp_key, ean_token, market_code,
                             retailer_urls.insert(0, link)
                         diagnostic_log.append(f"✅ Name-fallback EAN-VERIFIED on page: {title}")
                         break
-                    # Fuzzy acceptance: ≥60% of significant ground-truth tokens
-                    # present in the result title → accept as unverified.
+                    # Name(+weight)-only acceptance — NO EAN on page. Per policy this
+                    # is only acceptable evidence from a TRUSTED source (goldmine
+                    # retailer or the brand's own site); an untrusted/general-web
+                    # domain with no EAN confirmation is too weak and is skipped, so
+                    # a same-brand-different-SKU page can no longer silently become
+                    # the resolved identity.
+                    if not _is_trusted_source(link, _extract_brand(_clean_ground_truth)):
+                        continue
                     gt_tokens = {t.lower() for t in _clean_ground_truth.split() if len(t) > 3}
                     if gt_tokens:
                         hit_ratio = sum(1 for t in gt_tokens if t in title.lower()) / len(gt_tokens)
-                        if hit_ratio >= 0.6:
-                            product_name = title      # unverified — reliability gate handles it
+                        if hit_ratio >= 0.6 and not _weights_conflict([_clean_ground_truth], title):
+                            product_name = title      # trusted, name(+weight)-matched
                             if link not in retailer_urls:
                                 retailer_urls.append(link)
                             diagnostic_log.append(
-                                f"⚠️ Name-fallback fuzzy match (unverified, {hit_ratio:.0%} token overlap): {title}")
+                                f"⚠️ Name-fallback trusted-source match ({hit_ratio:.0%} token overlap, "
+                                f"no weight conflict): {title}")
                             break
                 if product_name:
                     break
@@ -2331,9 +2415,13 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
             if organic:
                 if not product_name:
                     candidate = organic[0].get("title", "").split("-")[0].split("|")[0].strip()
-                    if not is_garbage_name(candidate) and _result_matches_gt(organic[0], _clean_gt):
+                    top_link  = organic[0].get("link", "")
+                    if (not is_garbage_name(candidate)
+                            and _result_matches_gt(organic[0], _clean_gt)
+                            and _is_trusted_source(top_link, brand_for_verify)
+                            and not _weights_conflict([_clean_gt], candidate)):
                         product_name = candidate
-                        diag.log(f"✅ Global GTIN name (unverified): {product_name}")
+                        diag.log(f"✅ Global GTIN name (trusted source, unverified EAN): {product_name}")
                 new_urls = [
                     res.get("link") for res in organic[:5]
                     if "link" in res and not _is_excluded_domain(res.get("link", ""))
@@ -2381,15 +2469,22 @@ async def fetch_display_images(session, ean, serp_key, ean_token, market_code,
                         diag.log(f"✅ Name-fallback page EAN-VERIFIED: {link[:80]}")
                         found_here = True
                         break
+                    # Name(+weight)-only match, no EAN on page: only acceptable from
+                    # a trusted (goldmine/brand) domain, and only when the weight/
+                    # volume doesn't conflict — otherwise a different-variant page
+                    # can silently become the identity used for image verification.
+                    if not _is_trusted_source(link, brand_for_verify):
+                        continue
                     gt_tokens = {t.lower() for t in _clean_gt.split() if len(t) > 3}
                     if gt_tokens:
                         hit_ratio = sum(1 for t in gt_tokens if t in title.lower()) / len(gt_tokens)
-                        if hit_ratio >= 0.6:
+                        if hit_ratio >= 0.6 and not _weights_conflict([_clean_gt], title):
                             if not product_name:
                                 product_name = title
                             if link not in retailer_urls:
                                 retailer_urls.append(link)
-                            diag.log(f"⚠️ Name-fallback fuzzy match ({hit_ratio:.0%}): {link[:80]}")
+                            diag.log(f"⚠️ Name-fallback trusted-source match "
+                                     f"({hit_ratio:.0%}, no weight conflict): {link[:80]}")
                             found_here = True
                             break
                 if found_here:
@@ -2861,7 +2956,21 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 display_urls.append(u)
             else:
                 image_diag.log(f"⚠️ Image URL dropped from output (ephemeral CDN): {u[:80]}")
-        imgs          = (display_urls + ["", ""])[:2]
+        imgs = (display_urls + ["", ""])[:2]
+
+        # ── Liveness gate: a page being VERIFIED at extraction time doesn't
+        # guarantee it's still reachable when someone views/exports this row.
+        # Re-check every candidate Image Source Link right now and drop dead
+        # ones so an exported link is never a 404.
+        if source_links:
+            _alive = await asyncio.gather(
+                *[_url_alive(session, u) for u in source_links])
+            _dead_img_srcs = [u for u, ok in zip(source_links, _alive) if not ok]
+            if _dead_img_srcs:
+                image_diag.log(
+                    f"⚠️ {len(_dead_img_srcs)} Image Source Link candidate(s) dropped "
+                    f"— no longer live: {', '.join(_domain_of(u) for u in _dead_img_srcs[:5])}")
+            source_links = [u for u, ok in zip(source_links, _alive) if ok]
         img_src_links = (source_links + ["", ""])[:2]
 
         # ── Path A: deterministic-first food extraction (verify-then-read) ────
@@ -2921,17 +3030,34 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
 
         # ── Merge: deterministic food fields OVERRIDE Gemini-derived attributes.
         # Numbers, ingredients, allergens, manufacturer and origin are read from
-        # the page and must never be overwritten by an LLM guess.
-        data = dict(cat)
-        for _k, _v in food_fields.items():
-            if _v:
-                data[_k] = _v
-            else:
-                data.setdefault(_k, "")
+        # the page and must never be overwritten by an LLM guess. The
+        # categorization prompt is told not to emit these keys, but an LLM can
+        # still add them despite instruction — strip them out before merging so
+        # a hallucinated value can never survive with no source link behind it
+        # (setdefault alone doesn't protect against a key the categorizer
+        # already populated).
+        data = {k: v for k, v in cat.items() if k not in ALL_FIELD_KEYS}
+        for _k in ALL_FIELD_KEYS:
+            data[_k] = food_fields.get(_k, "")
 
         # ── Source 1-N = the VERIFIED pages the food data was read from ───────
         _verified_srcs = list(dict.fromkeys(
             [u for u in food_srcs if u and _is_displayable_url(u)]))
+
+        # ── Liveness gate: same reasoning as the Image Source Link check above
+        # — a page verified during extraction can still have gone dead by the
+        # time this row is viewed or exported. Drop any Source link that no
+        # longer resolves rather than shipping a link that 404s.
+        if _verified_srcs:
+            _alive_food = await asyncio.gather(
+                *[_url_alive(session, u) for u in _verified_srcs])
+            _dead_food_srcs = [u for u, ok in zip(_verified_srcs, _alive_food) if not ok]
+            if _dead_food_srcs:
+                image_diag.log(
+                    f"⚠️ {len(_dead_food_srcs)} food Source link(s) dropped — no "
+                    f"longer live: {', '.join(_domain_of(u) for u in _dead_food_srcs[:5])}")
+            _verified_srcs = [u for u, ok in zip(_verified_srcs, _alive_food) if ok]
+
         srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
 
         # ── Link Basis — how each shown link was verified (A=EAN, B=name) ────
@@ -2955,34 +3081,39 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         audit_sources = " | ".join(_audit_candidates)
 
         # ── Status + reliability come from the PIPELINE verification, not Gemini
-        #   success           → readable verified page(s): H (Route A)/M (Route B)
+        #   success           → H: a trusted (brand/goldmine) page contributed;
+        #                       M: only non-tier-1 sources, but >=2 of them agree;
+        #                       L: a single non-tier-1 source, uncorroborated.
         #   page_not_readable → verified but JS/cookie-walled: Failed Validation/L
         #   no_source         → no verified page at all: Failed Validation/L
         if food_status == "success":
             final_status = "Success"
             reliability  = food_reliab
-            if link_basis == "EAN-verified":
+            if reliability == "H":
                 reliability_reasoning = (
-                    f"EAN {ean} confirmed on the verified retailer page(s); food "
-                    f"data read directly from {', '.join(_verified_srcs[:2])}.")
-            elif link_basis.startswith("Name-matched"):
+                    f"Confirmed by a trusted source (the brand's own site or a "
+                    f"tier-1 retailer) — {', '.join(_verified_srcs[:2])}.")
+            elif reliability == "M":
                 reliability_reasoning = (
-                    f"Product confirmed by name match (>=80%) on "
-                    f"{', '.join(_verified_srcs[:2])}; barcode not on page, so "
-                    f"capped at M. Data read from that page.")
+                    f"No trusted (brand/tier-1) source found; the value(s) shown "
+                    f"are corroborated across >=2 independent retailer pages — "
+                    f"{', '.join(_verified_srcs[:2])}.")
             else:
-                reliability_reasoning = "Data read from verified source(s)."
+                reliability_reasoning = (
+                    f"Only a single non-tier-1 source backs this data, with no "
+                    f"corroboration from another retailer — {', '.join(_verified_srcs[:2])}. "
+                    f"Verify manually before upload.")
         else:
             final_status = "Failed Validation"
             reliability  = "L"
             if food_status == "page_not_readable":
                 reliability_reasoning = (
-                    "Verified page(s) found but not readable (JS/cookie wall). "
-                    "Any values shown are first-pass registry data — verify manually.")
+                    "Verified page(s) found but not readable (JS/cookie wall) — "
+                    "no field is shown without a readable source behind it.")
             else:
                 reliability_reasoning = (
-                    "No verified source page could be read for this EAN. "
-                    "Any values shown are unconfirmed — verify manually.")
+                    "No verified source page could be read for this EAN — "
+                    "no field is shown without a readable source behind it.")
 
         # ── Assemble the row ──────────────────────────────────────────────────
         row = {
@@ -3115,14 +3246,22 @@ init_cache()
 with st.sidebar:
     st.header("⚙️ Settings")
     st.caption(f"build: {BUILD_VERSION}")
+    _market_options = [
+        "Belgium (BE)", "Denmark (DK)", "Germany (DE)", "Austria (AT)",
+        "Netherlands (NL)", "France (FR)", "Italy (IT)", "Spain (ES)",
+        "United Kingdom (UK)", "Poland (PL)"
+    ]
+    # Remember the last market used (persisted in cache.db, survives across
+    # sessions/reloads — plain st.session_state would not, since a fresh
+    # browser session gets a fresh session_state).
+    _last_market = get_setting("last_market", _market_options[0])
+    _default_idx = (_market_options.index(_last_market)
+                    if _last_market in _market_options else 0)
     market_selection = st.selectbox(
-        "Target Market",
-        [
-            "Belgium (BE)", "Denmark (DK)", "Germany (DE)", "Austria (AT)",
-            "Netherlands (NL)", "France (FR)", "Italy (IT)", "Spain (ES)",
-            "United Kingdom (UK)", "Poland (PL)"
-        ]
+        "Target Market", _market_options, index=_default_idx
     )
+    if market_selection != _last_market:
+        set_setting("last_market", market_selection)
     market_code = market_selection.split("(")[1].replace(")", "")
 
     if not EAN_TOKEN:
@@ -3146,42 +3285,44 @@ The system will automatically find the EAN (8-14 digits) anywhere in the line. A
 with st.expander("ℹ️ How to read the results — reliability grades, status & links", expanded=True):
     st.markdown(
         "**Info Reliability**\n"
-        "- **H (High)** — product confirmed by a Tier-1 source or the EAN was "
-        "verified on the product page. Safe to upload.\n"
-        "- **M (Medium)** — data from a real retailer/brand page, but the barcode "
-        "wasn't independently confirmed. Usually fine; spot-check if critical.\n"
-        "- **L (Low)** — weak or single-source data, or automated checks disagreed. "
-        "Verify against the source link before upload.\n\n"
+        "- **H (High)** — details came from the brand's own website or a tier-1 trusted "
+        "retailer (Goldmine). Strong, trustworthy source. Safe to upload.\n"
+        "- **M (Medium)** — details came from other (non-tier-1) retailers, but the same "
+        "value was independently confirmed on 2+ of them. Reasonable, cross-checked.\n"
+        "- **L (Low)** — details came from only one non-tier-1 source, with no "
+        "corroboration. Thin — verify against the source link before upload.\n\n"
         "**Status**\n"
         "- **Success** — food data was read from a verified source page; use the H/M/L grade to judge confidence.\n"
         "- **Failed Validation** — a page was found but couldn't be read (JS/cookie wall) or no verified page "
-        "was found; any values shown are unconfirmed registry data — verify before upload.\n"
+        "was found. No field is ever shown without a readable source behind it — a blank cell here means "
+        "genuinely nothing was found, not a hidden fallback value.\n"
         "- **Search Failed** — a lookup was rate-limited; re-run the row.\n\n"
-        "**Links** — Source links are shown **only** when the pipeline fetched the page "
-        "and confirmed it belongs to the product, so a shown link always points at the correct item. "
-        "The food data in the row is read from those same verified pages. "
+        "**Links** — Source links are shown **only** when the pipeline fetched the page, confirmed it "
+        "belongs to the product, AND re-confirmed the page is still live right now — so a shown link "
+        "always points at the correct item and shouldn't 404. The food data in the row is read from "
+        "those same verified pages, never from a barcode-registry API (Go-UPC/EAN-Search are only used "
+        "to help resolve an identity that sharpens the search — never as a data source for a shown field). "
         "The **Link Basis** column tells you how it was confirmed:\n"
         "- **EAN-verified** — the barcode was found on the page (strongest).\n"
-        "- **Name-matched ⚠️** — the page matched the product name (≥80%) but carried no barcode; "
-        "the row is capped at **M** because a name match is weaker than a barcode match. "
-        "Common for brand/organic shops that don't publish EANs.\n"
+        "- **Name-matched ⚠️** — the page matched the product name (≥80%, no weight/variant conflict) but "
+        "carried no barcode. Only accepted from a trusted (brand/tier-1) domain — on any other domain, "
+        "identity requires the barcode to actually be on the page. Common for brand/organic shops that "
+        "don't publish EANs.\n"
         "Unverified candidates are kept in the hidden *Source Candidates (audit)* column "
         "(toggle it on above the results table).\n\n"
         "**Data Provenance** — where the food data was read from:\n"
         "- **Verified page** — every field was read directly from the linked source page(s). "
         "The numbers match the Source columns.\n"
         "- **Verified page + fallback ⚠️** — most fields were read from the linked page; a few absent "
-        "ones were filled from the barcode registry or a text-only extraction. Those cells are weaker.\n"
+        "ones were filled by a text-only Gemini extraction fed that same page's text (never a search). "
+        "Those cells are weaker.\n"
         "- **Nutrition failed plausibility check ⚠️** — extracted nutrition was physically impossible "
         "(e.g. macros summing above 100 g/100 g) or disagreed with an internal reference; it was "
         "blanked and the row dropped to **L**.\n"
-        "- **Registry only — page not readable ⚠️** / **Page not readable** — a page was verified as the "
-        "right product but couldn't be read (JS/cookie wall); any values come from the barcode registry.\n"
-        "- **Registry only — no verified page ⚠️** / **No verified source** — no verified page could be read; "
-        "data is unconfirmed (these rows grade **L** and show *Failed Validation*).\n\n"
-        "_Open Food Facts is used only internally — to help find pages and to sanity-check extracted "
-        "numbers. OFF data and OFF links never appear in this table; every shown value comes from a "
-        "cited retailer/manufacturer page._"
+        "- **Page not readable** — a page was verified as the right product but couldn't be read "
+        "(JS/cookie wall); no field is shown from it.\n"
+        "- **No verified source** — no verified page could be read at all; "
+        "data is unconfirmed (these rows grade **L** and show *Failed Validation*)."
     )
 
 ean_input = st.text_area("Insert Data (EANs + Optional Name/Weight/Brand):")
