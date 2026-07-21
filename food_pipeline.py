@@ -1118,10 +1118,22 @@ async def _launch_render_browser():
     # ship a pre-installed browser at a nonstandard path instead of the one
     # `playwright install chromium` puts under ~/.cache/ms-playwright. Unset
     # in normal deployment — Playwright finds its own installed browser
-    # automatically.
+    # automatically. Mutually exclusive with `channel` below (Playwright
+    # rejects both being set), so only one of the two branches applies.
     exe = os.environ.get("PLAYWRIGHT_CHROMIUM_PATH")
     if exe:
         launch_kwargs["executable_path"] = exe
+    else:
+        # Recent Playwright versions default headless=True to a SEPARATE,
+        # smaller "chromium-headless-shell" binary rather than reusing the
+        # regular chromium build. `playwright install chromium` doesn't
+        # necessarily fetch that extra component, which fails as
+        # "Executable doesn't exist at .../chromium_headless_shell-.../..."
+        # even though the real chromium binary is present. channel="chromium"
+        # forces the full binary to run in headless mode instead, so this
+        # only ever depends on the one thing `playwright install chromium`
+        # unambiguously installs.
+        launch_kwargs["channel"] = "chromium"
     return await _PLAYWRIGHT_CTX.chromium.launch(**launch_kwargs)
 
 
