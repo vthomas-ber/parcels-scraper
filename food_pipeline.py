@@ -103,7 +103,18 @@ _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 MAX_READ_PAGES = 4
 # Max candidate pages to fetch+verify before giving up (keeps HTTP bounded).
 MAX_CANDIDATES = 12
-_NAME_MATCH_THRESHOLD = 0.80
+# Name-match bar for Route B (name-only match, no EAN on page). Route B is
+# only reachable at all on a `trusted` domain (goldmine retailer or the
+# brand's own site — see verify_route's `if not trusted: return None` gate),
+# so this bar is deliberately much looser than a general-web match would
+# warrant. Rationale: a brand's own product page often titles things
+# differently from our canonical anchor name (e.g. drops the brand prefix,
+# adds a flavour/marketing suffix), so a strict 80% bar under-matches real
+# hits there. This is safe to keep loose because the source is already
+# known-good AND _weights_conflict() still runs as a hard veto — a name
+# that's a loose match AND has a conflicting pack size/weight is rejected
+# regardless.
+_NAME_MATCH_THRESHOLD_TRUSTED = 0.55
 
 # ---- JS-render fallback (headless Chromium via Playwright) -----------------
 # A plain aiohttp GET can't see content a page builds with client-side JS
@@ -523,6 +534,17 @@ def _blank_fields() -> dict:
     return {k: "" for k in ALL_FIELD_KEYS}
 
 
+def _has_substantive_content(fields: dict) -> bool:
+    """True if a page's extracted fields carry real product data, not just one
+    incidental field (e.g. a stray/misparsed net_weight — see the
+    mineralpavani.it false-"Success" case, where a single bogus weight match
+    with no ingredients or nutrition made a data-thin page look "read").
+    Requires ingredients text, or at least 2 of the 8 nutrition numbers."""
+    if fields.get("ingredients"):
+        return True
+    return sum(1 for k in _NUTRI_KEYS if fields.get(k)) >= 2
+
+
 def _num_or_none(v):
     """Parse a formatted field string ('12', '0,5', '1.3') to float, else None."""
     if v in (None, "", "None"):
@@ -779,7 +801,7 @@ def _meta(html: str, prop: str) -> str:
 # Multilingual nutrition labels -> canonical key. Order matters: check
 # "saturated" style before plain "fat", "sugars" before "carbohydrate", etc.
 _NUTRI_LABELS = [
-    ("saturates_g", ["of which saturates", "saturated fat", "gesättigte",
+    ("saturates_g", ["of which saturates", "of which saturated", "saturated fat", "gesättigte",
                      "davon gesättigte", "acides gras saturés", "dont acides gras saturés",
                      "di cui acidi grassi saturi", "acidi grassi saturi",
                      "waarvan verzadigd", "verzadigde vetzuren", "grasas saturadas",
@@ -840,6 +862,16 @@ def parse_html_nutrition(html: str) -> dict:
             value_cell = _pick_per100_cell(cells)
             _assign_nutri_label(label, value_cell, out)
 
+    # ---- Nutrition from parallel sibling <div> label/value "columns" --------
+    # Some page builders (e.g. GemPages/Shopify sections, seen on
+    # drinkcoldfever.com) lay the nutrition panel out as two sibling <div>s —
+    # one holding a stack of <p> labels ("Energy", "Fat", "of which
+    # saturates", ...), the other holding a parallel stack of <p> values —
+    # instead of a real <table>. Neither the <table> parser above nor the
+    # flat-text scanner below can pair these up, since the label and value
+    # text nodes aren't adjacent in the DOM or in get_text() order.
+    _parse_label_value_columns(soup, out)
+
     # ---- Nutrition from definition lists / label:value pairs ----------------
     text_blob = _clean_text(soup.get_text(" "))
     _scan_inline_nutrition(text_blob, out)
@@ -847,6 +879,41 @@ def parse_html_nutrition(html: str) -> dict:
     # ---- Ingredients / allergens / may-contain paragraphs -------------------
     _extract_labelled_paragraph(soup, text_blob, out)
     return out
+
+
+def _parse_label_value_columns(soup, out: dict) -> None:
+    """Detect and pair up a "label column" / "value column" div pair: a div
+    whose direct <p> children are mostly recognised nutrition labels, paired
+    positionally with the next sibling div holding the same number of <p>
+    children (the values)."""
+    all_variants = [v for _, variants in _NUTRI_LABELS for v in variants]
+
+    def _is_label_text(t: str) -> bool:
+        t = t.lower().strip()
+        return bool(t) and any(v in t for v in all_variants)
+
+    for div in soup.find_all("div"):
+        labels = [c for c in div.find_all("p", recursive=False)]
+        if len(labels) < 3:
+            continue
+        label_texts = [_clean_text(c.get_text(" ")) for c in labels]
+        label_hits = sum(1 for t in label_texts if _is_label_text(t))
+        if label_hits < max(2, len(label_texts) // 2):
+            continue
+
+        value_div = None
+        for sib in div.find_next_siblings("div"):
+            sib_values = sib.find_all("p", recursive=False)
+            if len(sib_values) == len(labels):
+                value_div = sib_values
+                break
+        if value_div is None:
+            continue
+
+        value_texts = [_clean_text(c.get_text(" ")) for c in value_div]
+        for label, value in zip(label_texts, value_texts):
+            if _is_label_text(label) and re.search(r"\d", value):
+                _assign_nutri_label(label.lower(), value, out)
 
 
 def _pick_per100_cell(cells: list) -> str:
@@ -1006,7 +1073,7 @@ def verify_route(html: str, ean: str, anchors: list, gtins: set | None = None,
     identity = _page_title_bits(html)
     if identity and anchors:
         ratio = _best_name_ratio(anchors, identity)
-        if ratio >= _NAME_MATCH_THRESHOLD and not _weights_conflict(anchors, identity):
+        if ratio >= _NAME_MATCH_THRESHOLD_TRUSTED and not _weights_conflict(anchors, identity):
             return "B"
     return None
 
@@ -1912,7 +1979,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
         page_fields = extract_page_fields(html, ean) if html else _blank_fields()
         route = (verify_route(html, ean, anchors, page_fields.get("_gtins"),
                               trusted=trusted) if html else None)
-        nonempty = any(page_fields.get(k) for k in ALL_FIELD_KEYS)
+        nonempty = _has_substantive_content(page_fields)
 
         if route is None:
             reason = "fetch failed" if not html else "neither EAN nor trusted-name match"
@@ -1963,7 +2030,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
             r_fields = extract_page_fields(rendered_html, ean)
             r_route = verify_route(rendered_html, ean, anchors,
                                    r_fields.get("_gtins"), trusted=trusted)
-            r_nonempty = any(r_fields.get(k) for k in ALL_FIELD_KEYS)
+            r_nonempty = _has_substantive_content(r_fields)
 
             if kind == "verified":
                 p = item
@@ -2026,7 +2093,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                 pf = extract_page_fields(html, ean) if html else _blank_fields()
                 route = (verify_route(html, ean, anchors, pf.get("_gtins"),
                                       trusted=rescue_trusted) if html else None)
-                ne = any(pf.get(k) for k in ALL_FIELD_KEYS)
+                ne = _has_substantive_content(pf)
 
                 rescue_rendered = False
                 if (route is None or not ne) and renders_done < MAX_RENDERS_PER_PRODUCT:
@@ -2036,7 +2103,7 @@ async def extract_food_data(session, ean, ground_truth, market, registry_name,
                         r_pf = extract_page_fields(rendered_html, ean)
                         r_route = verify_route(rendered_html, ean, anchors,
                                                r_pf.get("_gtins"), trusted=rescue_trusted)
-                        r_ne = any(r_pf.get(k) for k in ALL_FIELD_KEYS)
+                        r_ne = _has_substantive_content(r_pf)
                         if r_route is not None and (route is None or r_ne):
                             pf, route, ne, html = r_pf, r_route, r_ne, rendered_html
                             rescue_rendered = True
