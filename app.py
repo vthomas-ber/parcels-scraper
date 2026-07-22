@@ -433,32 +433,6 @@ def _is_durable_url(url: str) -> bool:
     return not any(t in u for t in _EPHEMERAL_URL_TOKENS)
 
 
-async def _url_alive(session, url: str) -> bool:
-    """
-    Lightweight liveness check applied to final output links only.
-    HEAD first; some CDNs block HEAD (403/405), so fall back to a GET whose
-    body we never read. Fails open on network errors is NOT wanted here —
-    a link we cannot verify is a link we should not ship, so fail closed.
-    """
-    if not url or not url.startswith("http"):
-        return False
-    _ua = {"User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/122.0.0.0 Safari/537.36")}
-    try:
-        async with session.head(url, headers=_ua, timeout=6,
-                                allow_redirects=True) as r:
-            if r.status < 400:
-                return True
-            if r.status in (403, 405):        # HEAD blocked — verify with GET
-                async with session.get(url, headers=_ua, timeout=6,
-                                       allow_redirects=True) as g:
-                    return g.status < 400
-            return False
-    except Exception:
-        return False
-
-
 async def _false_coro() -> bool:
     """Awaitable False — placeholder for empty slots in gather() batches."""
     return False
@@ -3002,19 +2976,17 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
                 image_diag.log(f"⚠️ Image URL dropped from output (ephemeral CDN): {u[:80]}")
         imgs = (display_urls + ["", ""])[:2]
 
-        # ── Liveness gate: a page being VERIFIED at extraction time doesn't
-        # guarantee it's still reachable when someone views/exports this row.
-        # Re-check every candidate Image Source Link right now and drop dead
-        # ones so an exported link is never a 404.
-        if source_links:
-            _alive = await asyncio.gather(
-                *[_url_alive(session, u) for u in source_links])
-            _dead_img_srcs = [u for u, ok in zip(source_links, _alive) if not ok]
-            if _dead_img_srcs:
-                image_diag.log(
-                    f"⚠️ {len(_dead_img_srcs)} Image Source Link candidate(s) dropped "
-                    f"— no longer live: {', '.join(_domain_of(u) for u in _dead_img_srcs[:5])}")
-            source_links = [u for u, ok in zip(source_links, _alive) if ok]
+        # NOTE: no separate liveness re-check here. Every URL in source_links
+        # was already fetched successfully (a real GET, full browser-like
+        # headers) by classify_page() moments ago in this same request — that
+        # IS the liveness proof. An earlier version re-probed each link with a
+        # HEAD-first request carrying only a bare User-Agent header, which
+        # anti-bot protection (Cloudflare etc.) is more likely to flag than
+        # the original full-header GET that just succeeded; that false
+        # negative was silently dropping good links (data extracted fine, but
+        # the Source column came back empty). A page going dead in the few
+        # seconds between the two calls is not a real-world failure mode
+        # worth re-probing for.
         img_src_links = (source_links + ["", ""])[:2]
 
         # ── Path A: deterministic-first food extraction (verify-then-read) ────
@@ -3088,20 +3060,13 @@ async def process_ean(sem, session, item, serp_key, gemini_key, ean_token,
         _verified_srcs = list(dict.fromkeys(
             [u for u in food_srcs if u and _is_displayable_url(u)]))
 
-        # ── Liveness gate: same reasoning as the Image Source Link check above
-        # — a page verified during extraction can still have gone dead by the
-        # time this row is viewed or exported. Drop any Source link that no
-        # longer resolves rather than shipping a link that 404s.
-        if _verified_srcs:
-            _alive_food = await asyncio.gather(
-                *[_url_alive(session, u) for u in _verified_srcs])
-            _dead_food_srcs = [u for u, ok in zip(_verified_srcs, _alive_food) if not ok]
-            if _dead_food_srcs:
-                image_diag.log(
-                    f"⚠️ {len(_dead_food_srcs)} food Source link(s) dropped — no "
-                    f"longer live: {', '.join(_domain_of(u) for u in _dead_food_srcs[:5])}")
-            _verified_srcs = [u for u, ok in zip(_verified_srcs, _alive_food) if ok]
-
+        # NOTE: no separate liveness re-check here — same reasoning as the
+        # Image Source Link above. Every URL in _verified_srcs is a page
+        # extract_food_data() already fetched and read real field data from,
+        # seconds ago, in this same request; that fetch (full browser-like
+        # headers) is itself the liveness proof and a stronger signal than a
+        # follow-up HEAD/GET probe, which can be bot-blocked even when the
+        # page is perfectly reachable.
         srcs = (_verified_srcs + ["", "", "", "", ""])[:5]
 
         # ── Link Basis — how each shown link was verified (A=EAN, B=name) ────
