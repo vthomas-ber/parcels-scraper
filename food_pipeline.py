@@ -496,7 +496,7 @@ def _sodium_to_salt(raw) -> str:
 # Plausible per-100g/ml ranges. Values outside these are almost always a
 # mis-parse (a price, an RDA %, a pack count) and are rejected rather than shown.
 _NUTRI_BOUNDS = {
-    "energy_kj": (10, 4000),      # water ~0, pure fat ~3700 kJ
+    "energy_kj": (0, 4000),        # genuinely 0 for water/black coffee/black tea
     "fat_g": (0, 100),
     "saturates_g": (0, 100),
     "carbohydrates_g": (0, 100),
